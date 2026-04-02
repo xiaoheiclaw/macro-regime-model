@@ -8,3 +8,7 @@ SCRIPTS_DIR = os.path.join(PROJECT_ROOT, "scripts")
 
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(ANALYSIS_DIR, exist_ok=True)
+
+# TimesFM external tool paths
+TIMESFM_PYTHON = "/Users/xiaohei/.openclaw/workspace-quant/timesfm-env/bin/python"
+TIMESFM_SCRIPT = "/Users/xiaohei/.openclaw/workspace-quant/scripts/timesfm_predict.py"

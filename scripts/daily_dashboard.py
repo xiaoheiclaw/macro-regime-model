@@ -30,6 +30,19 @@ if result.returncode != 0:
     print(f"Pipeline failed:\n{result.stderr}")
     sys.exit(1)
 
+# ── Step 1b: Run TimesFM views (optional, non-blocking) ──
+print("\n" + "=" * 60)
+print("Running TimesFM predictions...")
+tfm_result = subprocess.run(
+    [sys.executable, os.path.join(SCRIPTS_DIR, "timesfm_views.py")],
+    capture_output=True, text=True,
+    timeout=660,
+)
+if tfm_result.returncode == 0:
+    print(tfm_result.stdout)
+else:
+    print(f"⚠ TimesFM failed (non-critical):\n{tfm_result.stderr[-500:]}")
+
 # ── Step 2: Quick regime snapshot ───────────────────────
 df = load_merged()
 

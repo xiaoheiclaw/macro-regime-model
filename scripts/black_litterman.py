@@ -55,53 +55,60 @@ delta = 2.5
 Pi = delta * Sigma.values @ w_mkt
 
 # ── Scenario Views ──────────────────────────────────────
-# 4 scenarios from our analysis
-SCENARIOS = {
-    "A: 冲突降级 (油回落)": {
-        "prob": 0.15,
-        "views": {
-            "WTI_crude": -0.25,     # oil drops 25%
-            "US10Y_yield": 0.15,    # bonds rally (yield down)
-            "SPX": 0.10,            # stocks recover
-            "Gold": -0.05,          # gold flat/down
-            "BTC": 0.05,            # crypto mild up
-            "DXY": 0.03,            # dollar stable
-        }
-    },
-    "B: 冲突持续 + 美财政刺激": {
-        "prob": 0.35,
-        "views": {
-            "WTI_crude": 0.10,
-            "US10Y_yield": 0.05,    # bonds mixed (fiscal vs recession)
-            "SPX": -0.05,
-            "Gold": 0.20,           # gold rallies
-            "BTC": 0.15,            # crypto up
-            "DXY": -0.08,           # dollar weakens
-        }
-    },
-    "C: 冲突升级 + 无财政": {
-        "prob": 0.20,
-        "views": {
-            "WTI_crude": 0.30,
-            "US10Y_yield": -0.10,   # bonds sell off (supply + panic)
-            "SPX": -0.20,
-            "Gold": 0.10,
-            "BTC": -0.15,           # crypto crashes (risk-off)
-            "DXY": 0.10,            # dollar safe haven
-        }
-    },
-    "D: 全球财政联动 (文章核心)": {
-        "prob": 0.30,
-        "views": {
-            "WTI_crude": 0.05,
-            "US10Y_yield": 0.08,    # bonds mild rally
-            "SPX": 0.00,
-            "Gold": 0.30,           # gold big rally
-            "BTC": 0.25,            # crypto big rally
-            "DXY": -0.15,           # dollar weakens significantly
-        }
-    },
-}
+# Try to load TimesFM-generated views; fall back to manual scenarios
+_timesfm_path = os.path.join(DATA_DIR, "timesfm_views.json")
+_use_timesfm = False
+
+if os.path.exists(_timesfm_path):
+    import time as _time
+    _age_hours = (_time.time() - os.path.getmtime(_timesfm_path)) / 3600
+    if _age_hours < 24:
+        with open(_timesfm_path) as _f:
+            _tfm = json.load(_f)
+        _scenario = _tfm["scenario"]
+        SCENARIOS = {_scenario["name"]: {"prob": _scenario["prob"], "views": _scenario["views"]}}
+        # Use TimesFM confidence to build Omega later
+        _tfm_confidence = _scenario.get("confidence", {})
+        _use_timesfm = True
+        print(f"✓ Using TimesFM views (age: {_age_hours:.1f}h)")
+    else:
+        print(f"⚠ TimesFM views stale ({_age_hours:.0f}h old), using manual scenarios")
+
+if not _use_timesfm:
+    _tfm_confidence = {}
+
+# Manual scenarios (used as fallback when TimesFM views unavailable)
+if not _use_timesfm:
+    SCENARIOS = {
+        "A: 冲突降级 (油回落)": {
+            "prob": 0.15,
+            "views": {
+                "WTI_crude": -0.25, "US10Y_yield": 0.15, "SPX": 0.10,
+                "Gold": -0.05, "BTC": 0.05, "DXY": 0.03,
+            }
+        },
+        "B: 冲突持续 + 美财政刺激": {
+            "prob": 0.35,
+            "views": {
+                "WTI_crude": 0.10, "US10Y_yield": 0.05, "SPX": -0.05,
+                "Gold": 0.20, "BTC": 0.15, "DXY": -0.08,
+            }
+        },
+        "C: 冲突升级 + 无财政": {
+            "prob": 0.20,
+            "views": {
+                "WTI_crude": 0.30, "US10Y_yield": -0.10, "SPX": -0.20,
+                "Gold": 0.10, "BTC": -0.15, "DXY": 0.10,
+            }
+        },
+        "D: 全球财政联动 (文章核心)": {
+            "prob": 0.30,
+            "views": {
+                "WTI_crude": 0.05, "US10Y_yield": 0.08, "SPX": 0.00,
+                "Gold": 0.30, "BTC": 0.25, "DXY": -0.15,
+            }
+        },
+    }
 
 # ── Black-Litterman implementation ──────────────────────
 def black_litterman(Pi, Sigma, P, Q, Omega, tau=0.05):
@@ -151,14 +158,20 @@ weighted_returns = np.sum(all_views_returns, axis=0)
 P = np.eye(n_assets)
 Q = weighted_returns
 
-# View uncertainty (proportional to disagreement across scenarios)
-scenario_rets = np.array([
-    [SCENARIOS[s]["views"].get(a, 0) for a in available]
-    for s in SCENARIOS
-])
-scenario_probs = np.array([SCENARIOS[s]["prob"] for s in SCENARIOS])
-view_var = np.average((scenario_rets - weighted_returns) ** 2, weights=scenario_probs, axis=0)
-Omega = np.diag(view_var + 0.001)  # add small regularization
+# View uncertainty
+if _use_timesfm and _tfm_confidence:
+    # TimesFM: use q10-q90 band width as uncertainty (wider band = less confident)
+    view_var = np.array([_tfm_confidence.get(a, 0.05) ** 2 for a in available])
+    Omega = np.diag(view_var + 0.001)
+else:
+    # Manual scenarios: proportional to disagreement across scenarios
+    scenario_rets = np.array([
+        [SCENARIOS[s]["views"].get(a, 0) for a in available]
+        for s in SCENARIOS
+    ])
+    scenario_probs = np.array([SCENARIOS[s]["prob"] for s in SCENARIOS])
+    view_var = np.average((scenario_rets - weighted_returns) ** 2, weights=scenario_probs, axis=0)
+    Omega = np.diag(view_var + 0.001)
 
 # Run BL
 bl_returns, bl_cov = black_litterman(Pi, Sigma.values, P, Q, Omega)
