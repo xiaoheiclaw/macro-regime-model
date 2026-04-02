@@ -1,0 +1,11 @@
+data/
+analysis/
+__pycache__/
+*.pyc
+*.bak
+.DS_Store
+*.egg-info/
+.venv/
+.venv/
+.pytest_cache/
+uv.lock
