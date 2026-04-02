@@ -205,8 +205,10 @@ try:
         report.append("")
 
     sm3 = res3.smoothed_marginal_probabilities
-    rp3 = pd.DataFrame(sm3 if isinstance(sm3, np.ndarray) else sm3.values,
-                       index=yield_level.index, columns=[f"P_R{i}" for i in range(2)])
+    sm3_arr = sm3 if isinstance(sm3, np.ndarray) else sm3.values
+    # AR(1) model drops the first observation, so probabilities have N-1 rows
+    idx = yield_level.index[-sm3_arr.shape[0]:]
+    rp3 = pd.DataFrame(sm3_arr, index=idx, columns=[f"P_R{i}" for i in range(2)])
     curr3 = rp3.iloc[-1]
     report.append(f"### Current: Regime {curr3.values.argmax()} (P={curr3.max():.1%})")
     report.append("")
