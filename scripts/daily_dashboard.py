@@ -49,35 +49,45 @@ df = load_merged()
 latest = df.iloc[-1]
 prev = df.iloc[-2] if len(df) > 1 else latest
 
-# Key metrics
+# Key metrics — dual window (20d = early warning, 60d = confirmation)
 oil_ret = df["WTI_crude"].pct_change()
 yield_chg = df["US10Y_yield"].diff()
 corr_ob_20 = oil_ret.rolling(20).corr(yield_chg).iloc[-1]
+corr_ob_60 = oil_ret.rolling(60).corr(yield_chg).iloc[-1]
 
 spx_ret = df["SPX"].pct_change() if "SPX" in df.columns else pd.Series()
 corr_sb_20 = spx_ret.rolling(20).corr(yield_chg).iloc[-1] if len(spx_ret) > 20 else np.nan
+corr_sb_60 = spx_ret.rolling(60).corr(yield_chg).iloc[-1] if len(spx_ret) > 60 else np.nan
 
 gold_ret = df["Gold"].pct_change()
 btc_ret = df["BTC"].pct_change()
 corr_gb_20 = gold_ret.rolling(20).corr(btc_ret).iloc[-1]
 
-# Regime score (simple composite)
+# Regime score (dual-window: 20d triggers warning, 60d confirms)
 score = 0
 signals = []
 
 # Oil-Bond: positive = inflation, negative = growth/fiscal
+# 20d triggers → 1 point; 60d confirms → full 2 points
 if pd.notna(corr_ob_20):
     if corr_ob_20 < -0.2:
-        score += 2; signals.append(f"Oil-Bond脱钩 ({corr_ob_20:.2f})")
+        if pd.notna(corr_ob_60) and corr_ob_60 < -0.2:
+            score += 2; signals.append(f"Oil-Bond脱钩🔴 (20d:{corr_ob_20:.2f} 60d:{corr_ob_60:.2f})")
+        else:
+            score += 1; signals.append(f"Oil-Bond脱钩🟡 (20d:{corr_ob_20:.2f} 60d:{corr_ob_60:.2f})")
     elif corr_ob_20 < 0.1:
-        score += 1; signals.append(f"Oil-Bond弱化 ({corr_ob_20:.2f})")
+        score += 1; signals.append(f"Oil-Bond弱化 (20d:{corr_ob_20:.2f})")
 
 # SPX-Bond: negative = risk-off regime
+# 20d triggers → 1 point; 60d confirms → full 2 points
 if pd.notna(corr_sb_20):
     if corr_sb_20 < -0.3:
-        score += 2; signals.append(f"股债避险 ({corr_sb_20:.2f})")
+        if pd.notna(corr_sb_60) and corr_sb_60 < -0.3:
+            score += 2; signals.append(f"股债避险🔴 (20d:{corr_sb_20:.2f} 60d:{corr_sb_60:.2f})")
+        else:
+            score += 1; signals.append(f"股债避险🟡 (20d:{corr_sb_20:.2f} 60d:{corr_sb_60:.2f})")
     elif corr_sb_20 < 0:
-        score += 1; signals.append(f"股债弱避险 ({corr_sb_20:.2f})")
+        score += 1; signals.append(f"股债弱避险 (20d:{corr_sb_20:.2f})")
 
 # VIX
 vix = latest.get("VIX", 20)
@@ -125,9 +135,9 @@ summary = f"""📊 **Regime Dashboard {pd.Timestamp.now().strftime('%Y-%m-%d')}*
 
 **日变动:** {' | '.join(changes)}
 
-**关键相关性 (20d):**
-• Oil↔Bond: {corr_ob_20:.2f} {'⚡脱钩' if corr_ob_20 < 0 else '通胀传导'}
-• SPX↔Bond: {f"{corr_sb_20:.2f}" if pd.notna(corr_sb_20) else "N/A"} {"⚡避险" if pd.notna(corr_sb_20) and corr_sb_20 < -0.2 else "增长"}
+**关键相关性 (20d / 60d):**
+• Oil↔Bond: {corr_ob_20:.2f} / {corr_ob_60:.2f} {'⚡脱钩确认' if corr_ob_20 < 0 and pd.notna(corr_ob_60) and corr_ob_60 < 0 else '⚡脱钩预警' if corr_ob_20 < 0 else '通胀传导'}
+• SPX↔Bond: {f"{corr_sb_20:.2f}" if pd.notna(corr_sb_20) else "N/A"} / {f"{corr_sb_60:.2f}" if pd.notna(corr_sb_60) else "N/A"} {"⚡避险确认" if pd.notna(corr_sb_20) and corr_sb_20 < -0.2 and pd.notna(corr_sb_60) and corr_sb_60 < -0.2 else "⚡避险预警" if pd.notna(corr_sb_20) and corr_sb_20 < -0.2 else "增长"}
 • Gold↔BTC: {corr_gb_20:.2f} {'💰贬值交易' if corr_gb_20 > 0.3 else '分化'}
 
 **水位:**
