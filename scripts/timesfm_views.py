@@ -5,7 +5,7 @@ TimesFM → Black-Litterman Views Bridge
 Calls TimesFM CLI to predict multi-asset prices, then converts predictions
 into Black-Litterman compatible views JSON at data/timesfm_views.json.
 """
-import os, sys, json, subprocess
+import os, sys, json, subprocess, csv
 from datetime import datetime
 from pathlib import Path
 
@@ -163,6 +163,19 @@ def main():
     with open(OUTPUT_PATH, "w") as f:
         json.dump(output, f, indent=2, ensure_ascii=False)
     print(f"\n✓ Saved to {OUTPUT_PATH}")
+
+    # Append to prediction history (for Layer 1 scorecard)
+    history_path = os.path.join(DATA_DIR, "timesfm_views_history.csv")
+    today = datetime.now().strftime("%Y-%m-%d")
+    write_header = not os.path.exists(history_path)
+    with open(history_path, "a", newline="") as f:
+        w = csv.writer(f)
+        if write_header:
+            w.writerow(["date", "asset", "predicted_return", "confidence_band"])
+        for asset, view in output["scenario"]["views"].items():
+            conf = output["scenario"]["confidence"].get(asset, 0)
+            w.writerow([today, asset, view, conf])
+    print(f"✓ Appended to {history_path}")
 
     return output
 

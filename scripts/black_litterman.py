@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from lib.paths import DATA_DIR, ANALYSIS_DIR
 from lib.data_loader import load_merged
 from lib.universe import ASSETS, ASSET_NAMES, MARKET_WEIGHTS
+from lib.tuning import load_tuning_params
 
 # ── Load data ───────────────────────────────────────────
 df = load_merged()
@@ -159,10 +160,12 @@ P = np.eye(n_assets)
 Q = weighted_returns
 
 # View uncertainty
+_tp = load_tuning_params()
+_omega_scale = _tp.get("omega_scale", 1.0)
 if _use_timesfm and _tfm_confidence:
     # TimesFM: use q10-q90 band width as uncertainty (wider band = less confident)
     view_var = np.array([_tfm_confidence.get(a, 0.05) ** 2 for a in available])
-    Omega = np.diag(view_var + 0.001)
+    Omega = np.diag(view_var * _omega_scale + 0.001)
 else:
     # Manual scenarios: proportional to disagreement across scenarios
     scenario_rets = np.array([

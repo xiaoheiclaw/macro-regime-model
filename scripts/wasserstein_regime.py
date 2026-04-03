@@ -27,6 +27,7 @@ warnings.filterwarnings("ignore")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from lib.paths import DATA_DIR, ANALYSIS_DIR
+from lib.tuning import load_tuning_params
 
 # ── paths ──────────────────────────────────────────────────────────────────
 MERGED   = os.path.join(DATA_DIR, "merged_data.csv")
@@ -284,9 +285,10 @@ ens["wkm_P_R1"] = wkm_df.loc[common_dates, "wkm_P_R1"]
 ens["markov_regime"] = (ens["markov_P_R1"] > 0.5).astype(int)
 ens["wkm_regime"] = wkm_df.loc[common_dates, "wkm_regime"]
 
-# Ensemble: weighted average (Markov 0.6, WKM 0.4)
-W_MARKOV = 0.6
-W_WKM = 0.4
+# Ensemble: weighted average (from tuning_params or defaults)
+_ew = load_tuning_params()["ensemble_weights"]
+W_MARKOV = _ew["markov"]
+W_WKM = _ew["wkm"]
 ens["ens_P_R0"] = W_MARKOV * ens["markov_P_R0"] + W_WKM * ens["wkm_P_R0"]
 ens["ens_P_R1"] = W_MARKOV * ens["markov_P_R1"] + W_WKM * ens["wkm_P_R1"]
 ens["ens_regime"] = (ens["ens_P_R1"] > 0.5).astype(int)

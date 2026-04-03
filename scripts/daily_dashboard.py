@@ -13,6 +13,7 @@ warnings.filterwarnings("ignore")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from lib.paths import DATA_DIR, ANALYSIS_DIR, SCRIPTS_DIR
 from lib.data_loader import load_merged
+from lib.tuning import load_tuning_params
 
 today = pd.Timestamp.now().strftime("%Y%m%d")
 
@@ -43,7 +44,18 @@ if tfm_result.returncode == 0:
 else:
     print(f"⚠ TimesFM failed (non-critical):\n{tfm_result.stderr[-500:]}")
 
+# ── Step 1c: Run prediction scorecard (Layer 1, non-blocking) ──
+print("\n" + "=" * 60)
+print("Running prediction scorecard...")
+sc_result = subprocess.run(
+    [sys.executable, os.path.join(SCRIPTS_DIR, "prediction_scorecard.py")],
+    capture_output=True, text=True, timeout=60,
+)
+print(sc_result.stdout if sc_result.returncode == 0 else f"⚠ Scorecard: {sc_result.stderr[-300:]}")
+
 # ── Step 2: Quick regime snapshot ───────────────────────
+tp = load_tuning_params()
+ct = tp["correlation_thresholds"]
 df = load_merged()
 
 latest = df.iloc[-1]
@@ -70,25 +82,28 @@ signals_short = []
 signals_long = []
 
 # Oil-Bond: positive = inflation, negative = growth/fiscal
+ob_dec = ct["oil_bond_decouple"]  # default -0.2
+ob_weak = ct["oil_bond_weak"]     # default 0.1
 if pd.notna(corr_ob_20):
-    if corr_ob_20 < -0.2:
+    if corr_ob_20 < ob_dec:
         score_short += 2; signals_short.append(f"Oil-Bond脱钩 ({corr_ob_20:.2f})")
-    elif corr_ob_20 < 0.1:
+    elif corr_ob_20 < ob_weak:
         score_short += 1; signals_short.append(f"Oil-Bond弱化 ({corr_ob_20:.2f})")
 if pd.notna(corr_ob_60):
-    if corr_ob_60 < -0.2:
+    if corr_ob_60 < ob_dec:
         score_long += 2; signals_long.append(f"Oil-Bond脱钩 ({corr_ob_60:.2f})")
-    elif corr_ob_60 < 0.1:
+    elif corr_ob_60 < ob_weak:
         score_long += 1; signals_long.append(f"Oil-Bond弱化 ({corr_ob_60:.2f})")
 
 # SPX-Bond: negative = risk-off regime
+sb_ro = ct["spx_bond_riskoff"]  # default -0.3
 if pd.notna(corr_sb_20):
-    if corr_sb_20 < -0.3:
+    if corr_sb_20 < sb_ro:
         score_short += 2; signals_short.append(f"股债避险 ({corr_sb_20:.2f})")
     elif corr_sb_20 < 0:
         score_short += 1; signals_short.append(f"股债弱避险 ({corr_sb_20:.2f})")
 if pd.notna(corr_sb_60):
-    if corr_sb_60 < -0.3:
+    if corr_sb_60 < sb_ro:
         score_long += 2; signals_long.append(f"股债避险 ({corr_sb_60:.2f})")
     elif corr_sb_60 < 0:
         score_long += 1; signals_long.append(f"股债弱避险 ({corr_sb_60:.2f})")
@@ -100,8 +115,9 @@ if pd.notna(vix) and vix > 30:
     score_long += 1; signals_long.append(f"VIX高压 ({vix:.0f})")
 
 # Gold-BTC (shared)
+gb_link = ct["gold_btc_linked"]  # default 0.4
 if pd.notna(corr_gb_20):
-    if corr_gb_20 > 0.4:
+    if corr_gb_20 > gb_link:
         score_short += 1; signals_short.append(f"Gold-BTC联动 ({corr_gb_20:.2f})")
         score_long += 1; signals_long.append(f"Gold-BTC联动 ({corr_gb_20:.2f})")
 
@@ -160,7 +176,47 @@ summary = f"""📊 **Regime Dashboard {pd.Timestamp.now().strftime('%Y-%m-%d')}*
 • Gold: ${latest.get('Gold', 0):.0f} | VIX: {latest.get('VIX', 0):.1f}
 • BTC: ${latest.get('BTC', 0):,.0f} | DXY: {latest.get('DXY', 0):.1f}"""
 
+# ── Feedback loop summary (Layer 1 + Layer 2) ──
+feedback_lines = []
+sc_summary_path = os.path.join(DATA_DIR, "prediction_scorecard_summary.json")
+bt_summary_path = os.path.join(DATA_DIR, "backtest_summary.json")
+
+if os.path.exists(sc_summary_path):
+    with open(sc_summary_path) as f:
+        sc_sum = json.load(f)
+    parts = []
+    for asset, m in sc_sum.get("per_asset", {}).items():
+        da = m.get("directional_accuracy")
+        if da is not None:
+            parts.append(f"{asset} {da*100:.0f}%")
+    if parts:
+        feedback_lines.append(f"• TimesFM方向准确率: {' | '.join(parts)}")
+
+if os.path.exists(bt_summary_path):
+    with open(bt_summary_path) as f:
+        bt_sum = json.load(f)
+    ranking = bt_sum.get("ranking", [])
+    if ranking:
+        rank_parts = []
+        for name in ranking[:3]:
+            s = bt_sum["strategies"][name]
+            sh = s.get("sharpe_60d") or s.get("sharpe_all", 0)
+            rank_parts.append(f"{name}({sh:.1f})")
+        feedback_lines.append(f"• 策略排名(Sharpe): {' > '.join(rank_parts)}")
+
+if feedback_lines:
+    summary += "\n\n**反馈闭环:**\n" + "\n".join(feedback_lines)
+
 print("\n" + summary)
+
+# ── Run strategy backtest (Layer 2, non-blocking) ──
+print("\n" + "=" * 60)
+print("Running strategy backtest...")
+bt_result = subprocess.run(
+    [sys.executable, os.path.join(SCRIPTS_DIR, "strategy_backtest.py")],
+    capture_output=True, text=True, timeout=60,
+)
+print(bt_result.stdout if bt_result.returncode == 0 else f"⚠ Backtest: {bt_result.stderr[-300:]}")
 
 # Save
 with open(os.path.join(ANALYSIS_DIR, f"dashboard_{today}.md"), "w") as f:
