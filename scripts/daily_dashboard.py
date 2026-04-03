@@ -63,46 +63,58 @@ gold_ret = df["Gold"].pct_change()
 btc_ret = df["BTC"].pct_change()
 corr_gb_20 = gold_ret.rolling(20).corr(btc_ret).iloc[-1]
 
-# Regime score (dual-window: 20d triggers warning, 60d confirms)
-score = 0
-signals = []
+# Dual regime scores: short-term (20d) and long-term (60d) independently
+score_short = 0
+score_long = 0
+signals_short = []
+signals_long = []
 
 # Oil-Bond: positive = inflation, negative = growth/fiscal
-# 20d triggers → 1 point; 60d confirms → full 2 points
 if pd.notna(corr_ob_20):
     if corr_ob_20 < -0.2:
-        if pd.notna(corr_ob_60) and corr_ob_60 < -0.2:
-            score += 2; signals.append(f"Oil-Bond脱钩🔴 (20d:{corr_ob_20:.2f} 60d:{corr_ob_60:.2f})")
-        else:
-            score += 1; signals.append(f"Oil-Bond脱钩🟡 (20d:{corr_ob_20:.2f} 60d:{corr_ob_60:.2f})")
+        score_short += 2; signals_short.append(f"Oil-Bond脱钩 ({corr_ob_20:.2f})")
     elif corr_ob_20 < 0.1:
-        score += 1; signals.append(f"Oil-Bond弱化 (20d:{corr_ob_20:.2f})")
+        score_short += 1; signals_short.append(f"Oil-Bond弱化 ({corr_ob_20:.2f})")
+if pd.notna(corr_ob_60):
+    if corr_ob_60 < -0.2:
+        score_long += 2; signals_long.append(f"Oil-Bond脱钩 ({corr_ob_60:.2f})")
+    elif corr_ob_60 < 0.1:
+        score_long += 1; signals_long.append(f"Oil-Bond弱化 ({corr_ob_60:.2f})")
 
 # SPX-Bond: negative = risk-off regime
-# 20d triggers → 1 point; 60d confirms → full 2 points
 if pd.notna(corr_sb_20):
     if corr_sb_20 < -0.3:
-        if pd.notna(corr_sb_60) and corr_sb_60 < -0.3:
-            score += 2; signals.append(f"股债避险🔴 (20d:{corr_sb_20:.2f} 60d:{corr_sb_60:.2f})")
-        else:
-            score += 1; signals.append(f"股债避险🟡 (20d:{corr_sb_20:.2f} 60d:{corr_sb_60:.2f})")
+        score_short += 2; signals_short.append(f"股债避险 ({corr_sb_20:.2f})")
     elif corr_sb_20 < 0:
-        score += 1; signals.append(f"股债弱避险 (20d:{corr_sb_20:.2f})")
+        score_short += 1; signals_short.append(f"股债弱避险 ({corr_sb_20:.2f})")
+if pd.notna(corr_sb_60):
+    if corr_sb_60 < -0.3:
+        score_long += 2; signals_long.append(f"股债避险 ({corr_sb_60:.2f})")
+    elif corr_sb_60 < 0:
+        score_long += 1; signals_long.append(f"股债弱避险 ({corr_sb_60:.2f})")
 
-# VIX
+# VIX (shared, not window-dependent)
 vix = latest.get("VIX", 20)
-if pd.notna(vix):
-    if vix > 30: score += 1; signals.append(f"VIX高压 ({vix:.0f})")
+if pd.notna(vix) and vix > 30:
+    score_short += 1; signals_short.append(f"VIX高压 ({vix:.0f})")
+    score_long += 1; signals_long.append(f"VIX高压 ({vix:.0f})")
 
-# Gold-BTC correlation (high = debasement trade)
+# Gold-BTC (shared)
 if pd.notna(corr_gb_20):
     if corr_gb_20 > 0.4:
-        score += 1; signals.append(f"Gold-BTC联动 ({corr_gb_20:.2f})")
+        score_short += 1; signals_short.append(f"Gold-BTC联动 ({corr_gb_20:.2f})")
+        score_long += 1; signals_long.append(f"Gold-BTC联动 ({corr_gb_20:.2f})")
 
-# Regime label
-if score >= 4: regime = "🔴 增长恐慌/财政定价"
-elif score >= 2: regime = "🟡 过渡/混合"
-else: regime = "🟢 通胀主导/正常"
+def _regime_label(s):
+    if s >= 4: return "🔴 增长恐慌/财政定价"
+    elif s >= 2: return "🟡 过渡/混合"
+    else: return "🟢 通胀主导/正常"
+
+regime_short = _regime_label(score_short)
+regime_long = _regime_label(score_long)
+# Combined score for backward compatibility (JSON output etc.)
+score = score_short
+regime = regime_short
 
 # Daily change highlights
 changes = []
@@ -130,14 +142,17 @@ for col, name, fmt in [
 # Build summary
 summary = f"""📊 **Regime Dashboard {pd.Timestamp.now().strftime('%Y-%m-%d')}**
 
-**Regime: {regime}** (score: {score}/6)
-信号: {', '.join(signals) if signals else 'None'}
+**短期 (20d): {regime_short}** (score: {score_short}/6)
+信号: {', '.join(signals_short) if signals_short else 'None'}
+
+**长期 (60d): {regime_long}** (score: {score_long}/6)
+信号: {', '.join(signals_long) if signals_long else 'None'}
 
 **日变动:** {' | '.join(changes)}
 
-**关键相关性 (20d / 60d):**
-• Oil↔Bond: {corr_ob_20:.2f} / {corr_ob_60:.2f} {'⚡脱钩确认' if corr_ob_20 < 0 and pd.notna(corr_ob_60) and corr_ob_60 < 0 else '⚡脱钩预警' if corr_ob_20 < 0 else '通胀传导'}
-• SPX↔Bond: {f"{corr_sb_20:.2f}" if pd.notna(corr_sb_20) else "N/A"} / {f"{corr_sb_60:.2f}" if pd.notna(corr_sb_60) else "N/A"} {"⚡避险确认" if pd.notna(corr_sb_20) and corr_sb_20 < -0.2 and pd.notna(corr_sb_60) and corr_sb_60 < -0.2 else "⚡避险预警" if pd.notna(corr_sb_20) and corr_sb_20 < -0.2 else "增长"}
+**关键相关性 (20d → 60d):**
+• Oil↔Bond: {corr_ob_20:.2f} → {corr_ob_60:.2f} {'⚡脱钩' if corr_ob_20 < 0 else '通胀传导'}
+• SPX↔Bond: {f"{corr_sb_20:.2f}" if pd.notna(corr_sb_20) else "N/A"} → {f"{corr_sb_60:.2f}" if pd.notna(corr_sb_60) else "N/A"} {"⚡避险" if pd.notna(corr_sb_20) and corr_sb_20 < -0.2 else "增长"}
 • Gold↔BTC: {corr_gb_20:.2f} {'💰贬值交易' if corr_gb_20 > 0.3 else '分化'}
 
 **水位:**
@@ -157,9 +172,14 @@ with open(os.path.join(ANALYSIS_DIR, "dashboard_latest.md"), "w") as f:
 
 # Output JSON for cron notification
 output_json = {
+    "regime_short": regime_short,
+    "score_short": score_short,
+    "signals_short": signals_short,
+    "regime_long": regime_long,
+    "score_long": score_long,
+    "signals_long": signals_long,
     "regime": regime,
     "score": score,
-    "signals": signals,
     "summary": summary,
 }
 with open(os.path.join(DATA_DIR, "dashboard_latest.json"), "w") as f:
