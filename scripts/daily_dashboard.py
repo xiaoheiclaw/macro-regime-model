@@ -377,14 +377,43 @@ else:
     lines.append("| Kalman β | ⚠ 未运行 | — |")
 lines.append("")
 
-# Synthesis
+# Synthesis — combine regime + Kalman + key drivers
 if pd.notna(stress_prob):
+    # Regime label
     if stress_prob > 0.6:
-        synthesis = "**综合：Stress 体制确认。**"
+        regime_tag = "Stress 体制确认"
     elif stress_prob > 0.4:
-        synthesis = "**综合：过渡至 Stress。切换进行中但未完成。**"
+        regime_tag = "过渡态，切换进行中"
     else:
-        synthesis = "**综合：Calm/通胀体制主导。**"
+        regime_tag = "Calm/通胀体制主导"
+
+    # Kalman interpretation
+    kalman_note = ""
+    if kalman_summary:
+        spx_b = kalman_summary.get("spx_beta", 0)
+        if spx_b < -1.0:
+            kalman_note = "股债强负相关（避险交易主导）"
+        elif spx_b < -0.5:
+            kalman_note = "股债负相关（避险倾向）"
+        elif spx_b > 0.5:
+            kalman_note = "股债正相关（通胀/增长逻辑）"
+        else:
+            kalman_note = "股债关系弱，逻辑不清晰"
+
+    # Key drivers from price moves (Series → last value, in %)
+    _oil_d = oil_ret.iloc[-1] * 100 if len(oil_ret) > 0 else np.nan
+    _gold_d = gold_ret.iloc[-1] * 100 if len(gold_ret) > 0 else np.nan
+    _spx_d = spx_ret.iloc[-1] * 100 if len(spx_ret) > 0 else np.nan
+    drivers = []
+    if pd.notna(_oil_d) and abs(_oil_d) > 3:
+        drivers.append(f"油{'暴跌' if _oil_d < 0 else '飙升'}{_oil_d:+.1f}%")
+    if pd.notna(_gold_d) and abs(_gold_d) > 1.5:
+        drivers.append(f"金{'走强' if _gold_d > 0 else '回落'}{_gold_d:+.1f}%")
+    if pd.notna(_spx_d) and abs(_spx_d) > 1:
+        drivers.append(f"SPX{_spx_d:+.1f}%")
+    driver_str = "；驱动：" + "、".join(drivers) if drivers else ""
+
+    synthesis = f"**综合：{regime_tag}（Stress {stress_prob:.0%}）。{kalman_note}{driver_str}。**"
     lines.append(synthesis)
     lines.append("")
 
