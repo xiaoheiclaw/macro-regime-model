@@ -13,8 +13,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from lib.paths import DATA_DIR
 
 # ── Config ──────────────────────────────────────────────
-START = "2020-01-01"
+# v2: 推 START 到 1990 以便 regime 模型有足够历史做 5y warm-up
+# 各序列自身起点不同（e.g. HY OAS 1996 起、BTC 2014 起），靠 availability_mask 记录
+START = "1990-01-01"
 END = datetime.now().strftime("%Y-%m-%d")
+SCHEMA_VERSION = "v2.1"  # freeze point (post codex review)
 
 # ── 1. Asset Prices via yfinance ────────────────────────
 import yfinance as yf
@@ -33,6 +36,8 @@ TICKERS = {
     # Commodities — agriculture
     "ZC=F":    "Corn",            # Corn futures
     "ZS=F":    "Soybeans",        # Soybean futures (China trade sensitive)
+    # Commodities — composite
+    "^BCOM":   "BCOM",            # Bloomberg Commodity Index (proxy, short history)
     # Equities
     "^GSPC":   "SPX",             # S&P 500
     "^VIX":    "VIX",             # Volatility
@@ -74,13 +79,23 @@ print("\n[2/3] Fetching macro factors via FRED...")
 
 # Try using fredapi if API key available, otherwise use pandas_datareader or direct CSV
 FRED_SERIES = {
-    "DGS10":   "US10Y_FRED",       # 10Y yield (backup)
-    "DGS2":    "US2Y_yield",       # 2Y yield
-    "T5YIE":   "BEI_5Y",          # 5Y Breakeven Inflation
-    "T10YIE":  "BEI_10Y",         # 10Y Breakeven Inflation
-    "SOFR":    "SOFR_rate",        # SOFR
-    "WALCL":   "Fed_balance_sheet", # Fed total assets
-    "DTWEXBGS": "USD_broad",       # Trade-weighted USD (broad)
+    # Rates (Treasury curve full nodes for PCA)
+    "DGS3MO":   "US3M_yield",       # 3M T-bill
+    "DGS2":     "US2Y_yield",       # 2Y
+    "DGS5":     "US5Y_FRED",        # 5Y
+    "DGS10":    "US10Y_FRED",       # 10Y
+    "DGS30":    "US30Y_yield",      # 30Y
+    # Inflation
+    "T5YIE":    "BEI_5Y",           # 5Y Breakeven
+    "T10YIE":   "BEI_10Y",          # 10Y Breakeven
+    # Funding
+    "SOFR":     "SOFR_rate",
+    # Credit spreads (new in v2)
+    "BAMLH0A0HYM2": "HY_OAS",       # High Yield OAS
+    "BAMLC0A0CM":   "IG_OAS",       # Investment Grade OAS
+    # Policy / USD
+    "WALCL":    "Fed_balance_sheet",
+    "DTWEXBGS": "USD_broad",
 }
 
 fred_frames = {}
@@ -182,26 +197,37 @@ print(f"\n✓ Saved {len(merged)} rows × {len(merged.columns)} cols → {out_pa
 # Save column descriptions
 col_desc = {
     "US10Y_yield": "US 10Y Treasury Yield (%, from ^TNX)",
-    "US5Y_yield": "US 5Y Treasury Yield (%, from ^FVX)",
-    "US2Y_yield": "US 2Y Treasury Yield (%, from FRED DGS2)",
+    "US5Y_yield":  "US 5Y Treasury Yield (%, from ^FVX)",
+    "US3M_yield":  "US 3M T-bill Yield (%, FRED DGS3MO)",
+    "US2Y_yield":  "US 2Y Treasury Yield (%, FRED DGS2)",
+    "US5Y_FRED":   "US 5Y Treasury Yield (%, FRED DGS5)",
+    "US10Y_FRED":  "US 10Y Yield (%, FRED DGS10, backup)",
+    "US30Y_yield": "US 30Y Treasury Yield (%, FRED DGS30)",
     "WTI_crude": "WTI Crude Oil Futures ($/bbl)",
-    "Gold": "Gold Futures ($/oz)",
+    "NatGas":    "Natural Gas Futures ($/MMBtu)",
+    "Gold":      "Gold Futures ($/oz)",
+    "Silver":    "Silver Futures ($/oz)",
+    "Copper":    "Copper Futures ($/lb, Dr. Copper)",
+    "Corn":      "Corn Futures (¢/bu)",
+    "Soybeans":  "Soybean Futures (¢/bu)",
+    "BCOM":      "Bloomberg Commodity Index (proxy, composite)",
     "SPX": "S&P 500 Index",
     "VIX": "CBOE Volatility Index",
     "HSI": "Hang Seng Index",
-    "DXY": "US Dollar Index",
+    "DXY": "US Dollar Index (DX-Y.NYB)",
     "BTC": "Bitcoin (USD)",
     "ETH": "Ethereum (USD)",
-    "BEI_5Y": "5Y Breakeven Inflation Rate (%)",
+    "BEI_5Y":  "5Y Breakeven Inflation Rate (%)",
     "BEI_10Y": "10Y Breakeven Inflation Rate (%)",
     "SOFR_rate": "Secured Overnight Financing Rate (%)",
+    "HY_OAS": "ICE BofA High Yield OAS (%, FRED BAMLH0A0HYM2)",
+    "IG_OAS": "ICE BofA Corporate IG OAS (%, FRED BAMLC0A0CM)",
     "Fed_balance_sheet": "Fed Total Assets ($M, WALCL)",
-    "USD_broad": "Trade-Weighted USD Index (Broad)",
-    "US10Y_FRED": "US 10Y Yield from FRED (backup)",
+    "USD_broad": "Trade-Weighted USD Index (Broad, DTWEXBGS)",
     "yield_curve_2s10s": "2s10s Yield Curve Spread (10Y - 2Y)",
-    "real_yield_10Y": "10Y Real Yield (Nominal - BEI)",
-    "corr_oil_10Y_20d": "20d Rolling Corr: Oil returns vs 10Y yield change",
-    "corr_spx_10Y_20d": "20d Rolling Corr: SPX returns vs 10Y yield change",
+    "real_yield_10Y":    "10Y Real Yield (Nominal - BEI)",
+    "corr_oil_10Y_20d":  "20d Rolling Corr: Oil returns vs 10Y yield change",
+    "corr_spx_10Y_20d":  "20d Rolling Corr: SPX returns vs 10Y yield change",
     "corr_gold_btc_20d": "20d Rolling Corr: Gold returns vs BTC returns",
 }
 
