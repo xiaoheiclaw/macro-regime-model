@@ -23,9 +23,16 @@ TICKERS = {
     # US rates (proxy via ETFs + direct)
     "^TNX":    "US10Y_yield",     # 10Y Treasury Yield
     "^FVX":    "US5Y_yield",      # 5Y Treasury Yield
-    # Commodities
+    # Commodities — energy
     "CL=F":    "WTI_crude",       # WTI Oil
+    "NG=F":    "NatGas",          # Natural Gas
+    # Commodities — metals
     "GC=F":    "Gold",            # Gold futures
+    "SI=F":    "Silver",          # Silver futures
+    "HG=F":    "Copper",          # Copper futures (Dr. Copper)
+    # Commodities — agriculture
+    "ZC=F":    "Corn",            # Corn futures
+    "ZS=F":    "Soybeans",        # Soybean futures (China trade sensitive)
     # Equities
     "^GSPC":   "SPX",             # S&P 500
     "^VIX":    "VIX",             # Volatility

@@ -12,6 +12,7 @@ dependencies = [
     "statsmodels>=0.14",
     "numba>=0.59",
     "scikit-learn>=1.4",
+    "httpx>=0.28.1",
 ]
 
 [project.optional-dependencies]
