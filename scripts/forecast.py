@@ -76,8 +76,16 @@ ROLLING_FALLBACK_WINDOW = 120
 # and d_trajectory (Phase 3b.1) is a weighted-lag state distance over past
 # TETHER_LENGTH months (emphasizes recent months). d_trajectory disambiguates
 # analogs whose current state looks similar but got there via different paths.
+#
+# Phase 3b.2: state-distance transform.
+# KERNEL = "euclidean" → d_state = ||x - x_cand||  (baseline)
+#        = "rbf"       → d_state = -log(K(x,x_cand)), K = exp(-||Δ||²/(2ε²))
+#        = "mahalanobis" → d_state = √((Δ)ᵀ Σ⁻¹ Δ) with Σ from training X
+# RBF with bandwidth ε tuned to median pairwise distance gives a
+# dynamics-adapted kernel (simplified Coifman/Lafon diffusion map).
 ALPHA_REGIME_DEFAULT = 3.0
 GAMMA_TETHER_DEFAULT = 0.5   # Phase 3b.1 backtest optimum (+0.2pp vs γ=0)
+KERNEL_DEFAULT = "euclidean"
 TETHER_LENGTH = 24   # months of past trajectory considered
 TETHER_WEIGHTS = np.array([1.0 / (k + 1) for k in range(TETHER_LENGTH)])  # 1, 1/2, ..., 1/24
 TETHER_WEIGHTS = TETHER_WEIGHTS / TETHER_WEIGHTS.sum()
@@ -310,6 +318,47 @@ def _trajectory_distance(
     return d_traj
 
 
+def _state_distance(
+    query: np.ndarray,
+    X_cand: np.ndarray,
+    kernel: str,
+    X_train: np.ndarray | None = None,
+) -> np.ndarray:
+    """
+    Compute state-space distance under the chosen metric.
+      euclidean:    plain Euclidean
+      rbf:          −log(exp(−||Δ||²/(2ε²))) = ||Δ||²/(2ε²) — equivalent to
+                    squared distance rescaled. ε = median pairwise distance
+                    on X_train (self-similarity scale).
+      mahalanobis:  √((Δ)ᵀ Σ⁻¹ Δ) with Σ the sample covariance of X_train.
+    """
+    delta = X_cand - query
+    if kernel == "euclidean":
+        return np.linalg.norm(delta, axis=1)
+    if kernel == "rbf":
+        if X_train is None or len(X_train) < 2:
+            return np.linalg.norm(delta, axis=1)
+        # Median heuristic for bandwidth: sample pairwise distances
+        n = min(len(X_train), 300)
+        idx = np.random.default_rng(42).choice(len(X_train), size=n, replace=False)
+        Xs = X_train[idx]
+        from scipy.spatial.distance import pdist
+        eps = float(np.median(pdist(Xs))) or 1.0
+        sq = np.sum(delta ** 2, axis=1)
+        return sq / (2 * eps * eps)  # monotone in squared distance; lower = more similar
+    if kernel == "mahalanobis":
+        if X_train is None or len(X_train) < X_train.shape[1] + 1:
+            return np.linalg.norm(delta, axis=1)
+        Sigma = np.cov(X_train, rowvar=False)
+        try:
+            inv = np.linalg.pinv(Sigma + 1e-6 * np.eye(Sigma.shape[0]))
+        except np.linalg.LinAlgError:
+            return np.linalg.norm(delta, axis=1)
+        m = np.einsum("ij,jk,ik->i", delta, inv, delta)
+        return np.sqrt(np.maximum(m, 0.0))
+    raise ValueError(f"Unknown kernel: {kernel}")
+
+
 def _select_analogs(
     asof: pd.Timestamp,
     state_subset: pd.DataFrame,
@@ -318,6 +367,7 @@ def _select_analogs(
     n_scn: int,
     alpha: float = ALPHA_REGIME_DEFAULT,
     gamma: float = GAMMA_TETHER_DEFAULT,
+    kernel: str = KERNEL_DEFAULT,
 ) -> AnalogSelection:
     """
     Pick N nearest analogs with complete H-month forward history.
@@ -352,7 +402,9 @@ def _select_analogs(
 
     X_cand = X[cand_idx]
     cand_dates = state_subset.index[cand_idx]
-    d_state = np.linalg.norm(X_cand - query, axis=1)
+    # X_train for kernel parameters uses candidate+query rows (all backtest-safe)
+    X_train = X[: query_idx + 1]
+    d_state = _state_distance(query, X_cand, kernel=kernel, X_train=X_train)
 
     # Regime distance = Frobenius on per-asset joint (g × r) matrices, comparing
     # current Q[a] (from template_map.joint_current) vs candidate C[a,s] = p_g(s)⊗p_a(s,a).
@@ -455,6 +507,7 @@ def run(
     asof: str | None = None,
     alpha: float | None = None,
     gamma: float | None = None,
+    kernel: str | None = None,
 ) -> dict:
     state_path = Path(DATA_DIR) / "state_features.parquet"
     if not state_path.exists():
@@ -476,10 +529,11 @@ def run(
     h_max = max(HORIZONS)
     alpha_eff = alpha if alpha is not None else ALPHA_REGIME_DEFAULT
     gamma_eff = gamma if gamma is not None else GAMMA_TETHER_DEFAULT
+    kernel_eff = kernel if kernel is not None else KERNEL_DEFAULT
     sel = _select_analogs(
         asof_ts, state_subset, X,
         h_max=h_max, n_scn=N_SCN,
-        alpha=alpha_eff, gamma=gamma_eff,
+        alpha=alpha_eff, gamma=gamma_eff, kernel=kernel_eff,
     )
     print(f"Analog selection: {sel.source} | n={len(sel.dates)}")
 
@@ -563,7 +617,7 @@ def run(
     meta = base_meta(
         layer="forecast",
         data_asof=asof_str,
-        model_version=f"kaf_alpha{alpha_eff}_gamma{gamma_eff}_jointFrob_tether{TETHER_LENGTH}",
+        model_version=f"kaf_alpha{alpha_eff}_gamma{gamma_eff}_kernel{kernel_eff}_tether{TETHER_LENGTH}",
         extra={
             "method": "kaf_baseline" if sel.source == "kaf" else "rolling_fallback",
             "joint_scenario": True,   # contract: same scenario_id → same analog_date
@@ -577,6 +631,7 @@ def run(
                 "alpha_regime": alpha_eff,
                 "gamma_tether": gamma_eff,
                 "tether_length_months": TETHER_LENGTH,
+                "kernel": kernel_eff,
                 "distance": "frobenius_on_per_asset_joint_(g,r)",
                 "query_joint_source": "template_asset_joint_current.parquet",
                 "enabled": (Path(DATA_DIR) / "v2" / "global_templates.parquet").exists()

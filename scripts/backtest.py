@@ -90,6 +90,7 @@ def _run_forecast_at(
     expanding_regimes: bool,
     alpha: float | None = None,
     gamma: float | None = None,
+    kernel: str | None = None,
     skip_regime_refit: bool = False,
 ) -> bool:
     """
@@ -103,7 +104,7 @@ def _run_forecast_at(
             _refit_regime_layers(asof_str)
         elif not expanding_regimes:
             template_map.run(asof=asof_str)
-        forecast.run(asof=asof_str, alpha=alpha, gamma=gamma)
+        forecast.run(asof=asof_str, alpha=alpha, gamma=gamma, kernel=kernel)
         return True
     except SystemExit as e:
         print(f"  skip {asof_str}: {e}")
@@ -126,6 +127,9 @@ def main() -> None:
                          "(default: single forecast with forecast.ALPHA_REGIME_DEFAULT)")
     ap.add_argument("--gammas", type=str, default=None,
                     help="comma-separated gamma (tether weight) values to grid-search")
+    ap.add_argument("--kernels", type=str, default=None,
+                    help="comma-separated state-distance kernels "
+                         "(euclidean,rbf,mahalanobis)")
     args = ap.parse_args()
 
     state = pd.read_parquet(Path(DATA_DIR) / "state_features.parquet")
@@ -134,16 +138,20 @@ def main() -> None:
 
     alpha_grid = [float(x) for x in args.alphas.split(",")] if args.alphas else None
     gamma_grid = [float(x) for x in args.gammas.split(",")] if args.gammas else None
+    kernel_grid = [k.strip() for k in args.kernels.split(",")] if args.kernels else None
     if alpha_grid:
         print(f"α grid: {alpha_grid}")
     if gamma_grid:
         print(f"γ grid: {gamma_grid}")
+    if kernel_grid:
+        print(f"kernel grid: {kernel_grid}")
 
     t0 = time.time()
     rows: list[dict] = []
     expanding = not args.no_expanding_regimes
     alphas_to_run = alpha_grid if alpha_grid is not None else [None]
     gammas_to_run = gamma_grid if gamma_grid is not None else [None]
+    kernels_to_run = kernel_grid if kernel_grid is not None else [None]
 
     for i, asof in enumerate(asofs, 1):
         asof_str = asof.strftime("%Y-%m-%d")
@@ -158,51 +166,52 @@ def main() -> None:
             template_map.run(asof=asof_str)
 
         for alpha in alphas_to_run:
-          for gamma in gammas_to_run:
-            if not _run_forecast_at(
-                asof_str,
-                expanding_regimes=expanding,
-                alpha=alpha,
-                gamma=gamma,
-                skip_regime_refit=True,
-            ):
-                continue
-
-            scn = pd.read_parquet(SCENARIOS_PATH)
-            if scn.empty:
-                continue
-
-            alpha_val = float(alpha) if alpha is not None else float("nan")
-            gamma_val = float(gamma) if gamma is not None else float("nan")
-            for (asset, h), grp in scn.groupby(["asset", "horizon"]):
-                samples = grp["log_return"].values
-                weights = grp["weight"].values
-                realized = _realized(state, asset, asof, int(h))
-                if realized is None:
-                    continue
-                crps_v2 = crps_sample(samples, realized, weights)
-                pit_v2 = pit_sample(samples, realized, weights)
-
-                bench_mu, bench_sigma = _gaussian_benchmark(state, asset, asof, int(h))
-                if bench_mu is None:
-                    crps_bench, pit_bench = float("nan"), float("nan")
-                else:
-                    crps_bench = crps_normal(bench_mu, bench_sigma, realized)
-                    pit_bench = pit_normal(bench_mu, bench_sigma, realized)
-
-                rows.append({
-                    "asof": asof,
-                    "alpha": alpha_val,
-                    "gamma": gamma_val,
-                    "asset": asset,
-                    "horizon": int(h),
-                    "realized": realized,
-                    "crps_v2": crps_v2,
-                    "crps_bench": crps_bench,
-                    "pit_v2": pit_v2,
-                    "pit_bench": pit_bench,
-                    "n_scn": len(samples),
-                })
+            for gamma in gammas_to_run:
+                for kernel in kernels_to_run:
+                    ok = _run_forecast_at(
+                        asof_str,
+                        expanding_regimes=expanding,
+                        alpha=alpha,
+                        gamma=gamma,
+                        kernel=kernel,
+                        skip_regime_refit=True,
+                    )
+                    if not ok:
+                        continue
+                    scn = pd.read_parquet(SCENARIOS_PATH)
+                    if scn.empty:
+                        continue
+                    alpha_val = float(alpha) if alpha is not None else float("nan")
+                    gamma_val = float(gamma) if gamma is not None else float("nan")
+                    kernel_val = kernel if kernel is not None else ""
+                    for (asset, h), grp in scn.groupby(["asset", "horizon"]):
+                        samples = grp["log_return"].values
+                        weights = grp["weight"].values
+                        realized = _realized(state, asset, asof, int(h))
+                        if realized is None:
+                            continue
+                        crps_v2 = crps_sample(samples, realized, weights)
+                        pit_v2 = pit_sample(samples, realized, weights)
+                        bench_mu, bench_sigma = _gaussian_benchmark(state, asset, asof, int(h))
+                        if bench_mu is None:
+                            crps_bench, pit_bench = float("nan"), float("nan")
+                        else:
+                            crps_bench = crps_normal(bench_mu, bench_sigma, realized)
+                            pit_bench = pit_normal(bench_mu, bench_sigma, realized)
+                        rows.append({
+                            "asof": asof,
+                            "alpha": alpha_val,
+                            "gamma": gamma_val,
+                            "kernel": kernel_val,
+                            "asset": asset,
+                            "horizon": int(h),
+                            "realized": realized,
+                            "crps_v2": crps_v2,
+                            "crps_bench": crps_bench,
+                            "pit_v2": pit_v2,
+                            "pit_bench": pit_bench,
+                            "n_scn": len(samples),
+                        })
 
     if not rows:
         sys.exit("no rows collected — check asof range and data")
@@ -333,7 +342,11 @@ def main() -> None:
     print(summary.to_string())
     print()
     has_gamma = df["gamma"].notna().any() and gamma_grid is not None
-    grp_cols = [c for c in ["alpha", "gamma"] if (c == "alpha" and has_alpha) or (c == "gamma" and has_gamma)]
+    has_kernel = ("kernel" in df.columns) and kernel_grid is not None
+    grp_cols = []
+    if has_alpha: grp_cols.append("alpha")
+    if has_gamma: grp_cols.append("gamma")
+    if has_kernel: grp_cols.append("kernel")
     if grp_cols:
         print(f"\n{'+'.join(grp_cols)} sweep overall skill:")
         for key, sub in df.groupby(grp_cols):
