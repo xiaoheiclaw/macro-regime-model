@@ -63,6 +63,24 @@ with rule-based segmentation (VIX quantile / NBER dates / rolling
   + BTC parametric:       -1.3%  (+0.7pp, real win; BTC -7% → -3%)
   + Bond parametric:      -1.1%  (+0.2pp, real but modest)
 
+**Downstream allocation evaluation (Phase 3b.8) — the real endpoint**:
+
+  Method         AnnRet   Vol    Sharpe
+  60/40           5.9%    8.5%   0.75
+  v2 MV BL      +34.4%   49.0%   0.74    ⚠ cap-binding on Gold/BTC
+  v2 SP-CVaR      6.7%    4.3%   **1.10**  ✓
+
+  SP-CVaR Sharpe 1.10 vs 60/40's 0.75 is the first end-to-end win
+  that matters. Vol 4.3% at 6m (vs 60/40's 5.9%) with higher return.
+  This is what joint scenarios deliver when fed to a tail-risk
+  objective: the structural forecast edge surfaces in allocation.
+
+  MV BL's 34% annualized is misleading — optimizer hits Gold cap
+  (50%) and piles into BTC (27%) because they had the biggest
+  2015-24 run. Sharpe 0.74 ≈ 60/40 despite 6× return — return is
+  flattered, risk-adjusted is the same. Under realistic position
+  caps (~25%) or tracking-error bounds it would moderate.
+
 **Joint structure validation (Phase 3b.7, Energy Score)**:
   Multivariate Energy Score v2 vs MVN-benchmark (historical Σ):
     h=1m:  +1.1%   h=3m:  +1.2%
