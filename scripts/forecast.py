@@ -87,15 +87,18 @@ ALPHA_REGIME_DEFAULT = 3.0
 GAMMA_TETHER_DEFAULT = 0.5   # Phase 3b.1 backtest optimum (+0.2pp vs γ=0)
 KERNEL_DEFAULT = "euclidean"
 
-# Phase 3b.3: assets with insufficient history for macro analog ranking get
-# a parametric Normal fallback from their own rolling window. Preserves
-# scenario_id + weight + analog_date to keep the joint schema honest, but the
-# log_return at each scenario is drawn from an asset-local distribution rather
-# than from the analog month's realized forward return. Rationale: BTC
-# (2014-10+) has too little overlap with macro history and its tail behavior
-# is largely regime-independent.
-SHORT_HISTORY_ASSETS = {"btc_ret"}
-PARAMETRIC_WINDOW_M = 120   # match Gaussian benchmark window → skill ≈ 0% for these assets
+# Phase 3b.3: assets where KAF analog framework doesn't add skill over a
+# simple Gaussian of their own rolling distribution. Preserves scenario_id,
+# weight, and analog_date for downstream joint-schema consumers, but the
+# log_return in each scenario is drawn from Normal(μ_window, σ_window·√h).
+# Two reasons an asset lands here:
+#   (a) short overlap with macro history (BTC, 2014-10+)
+#   (b) returns essentially macro-independent / mean-reverting
+#       (duration-proxy bond: KAF adds noise over Gaussian benchmark)
+# PARAMETRIC_WINDOW_M=120 matches Gaussian benchmark window so at worst
+# skill ≈ 0% (Monte Carlo noise from N=200 samples).
+PARAMETRIC_FALLBACK_ASSETS = {"btc_ret", "bond_ret"}
+PARAMETRIC_WINDOW_M = 120
 TETHER_LENGTH = 24   # months of past trajectory considered
 TETHER_WEIGHTS = np.array([1.0 / (k + 1) for k in range(TETHER_LENGTH)])  # 1, 1/2, ..., 1/24
 TETHER_WEIGHTS = TETHER_WEIGHTS / TETHER_WEIGHTS.sum()
@@ -556,7 +559,7 @@ def run(
         # Prepare parametric fallback stats for short-history assets
         rng = np.random.default_rng(hash(asof_str) & 0xFFFFFFFF)
         parametric_stats: dict[str, tuple[float, float]] = {}
-        for asset in SHORT_HISTORY_ASSETS:
+        for asset in PARAMETRIC_FALLBACK_ASSETS:
             if asset not in state.columns:
                 continue
             hist = state[asset].loc[:asof_ts].dropna().tail(PARAMETRIC_WINDOW_M)
