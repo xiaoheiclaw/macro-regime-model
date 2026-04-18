@@ -96,9 +96,8 @@ class GlobalTemplateLayer(Layer):
         return {"layer": self.name, **meta}
 
 
-# ── Phase 2b: per-asset regime (stub) ────────────────────
+# ── Phase 2b: per-asset regime (real GMM baseline) ──────
 class AssetRegimeLayer(Layer):
-    """Stub: uniform K=1 assignment per asset. Replace with per-asset Jump Model."""
     name = "asset_regime"
 
     @property
@@ -107,27 +106,16 @@ class AssetRegimeLayer(Layer):
 
     @property
     def outputs(self) -> list[Path]:
-        return [Path(DATA_DIR) / "v2" / "asset_regime_probs.parquet"]
+        out = Path(DATA_DIR) / "v2"
+        return [
+            out / "asset_regime_probs.parquet",
+            out / "asset_regime_meta.json",
+        ]
 
     def run(self, asof: str | None = None) -> dict:
-        state = pd.read_parquet(self.inputs[0])
-        out_dir = Path(DATA_DIR) / "v2"
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        from feature_mask import ASSET_FEATURES
-        assets = [a for a in ASSET_FEATURES if a in state.columns]
-        rows = [
-            {"date": dt, "asset": asset, "regime_id": 0, "prob": 1.0}
-            for asset in assets for dt in state.index
-        ]
-        pd.DataFrame(rows).to_parquet(out_dir / "asset_regime_probs.parquet", index=False)
-
-        return {
-            "layer": self.name,
-            "status": "stub",
-            "n_assets": len(assets),
-            "note": "placeholder — replace with per-asset Jump Model (Shu/Mulvey)",
-        }
+        from asset_regime import run as run_asset_regime
+        meta = run_asset_regime(asof=asof)
+        return {"layer": self.name, **meta}
 
 
 # ── Phase 3: forecast (stub) ─────────────────────────────
