@@ -74,10 +74,9 @@ class FeatureMaskLayer(Layer):
         return {"layer": self.name, **result.meta}
 
 
-# ── Phase 2: state conditioning (stub) ──────────────────
-class StateConditioningLayer(Layer):
-    """Stub: emits degenerate single-template output so downstream can wire."""
-    name = "state_conditioning"
+# ── Phase 2a: global macro template (real baseline) ─────
+class GlobalTemplateLayer(Layer):
+    name = "global_template"
 
     @property
     def inputs(self) -> list[Path]:
@@ -86,35 +85,48 @@ class StateConditioningLayer(Layer):
     @property
     def outputs(self) -> list[Path]:
         out = Path(DATA_DIR) / "v2"
-        return [out / "global_templates.parquet", out / "asset_regime_probs.parquet"]
+        return [
+            out / "global_templates.parquet",
+            out / "global_template_centroids.npz",
+        ]
+
+    def run(self, asof: str | None = None) -> dict:
+        from global_template import run as run_template
+        meta = run_template(asof=asof)
+        return {"layer": self.name, **meta}
+
+
+# ── Phase 2b: per-asset regime (stub) ────────────────────
+class AssetRegimeLayer(Layer):
+    """Stub: uniform K=1 assignment per asset. Replace with per-asset Jump Model."""
+    name = "asset_regime"
+
+    @property
+    def inputs(self) -> list[Path]:
+        return [Path(DATA_DIR) / "state_features.parquet"]
+
+    @property
+    def outputs(self) -> list[Path]:
+        return [Path(DATA_DIR) / "v2" / "asset_regime_probs.parquet"]
 
     def run(self, asof: str | None = None) -> dict:
         state = pd.read_parquet(self.inputs[0])
         out_dir = Path(DATA_DIR) / "v2"
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        # Single-template placeholder (K=1)
-        global_tpl = pd.DataFrame(
-            {"template_id": 0, "template_prob": 1.0}, index=state.index
-        )
-        global_tpl.to_parquet(out_dir / "global_templates.parquet")
-
-        # Asset regime probs: per asset, K=1, prob=1
         from feature_mask import ASSET_FEATURES
         assets = [a for a in ASSET_FEATURES if a in state.columns]
-        rows = []
-        for asset in assets:
-            for dt in state.index:
-                rows.append({"date": dt, "asset": asset, "regime_id": 0, "prob": 1.0})
-        asset_regime = pd.DataFrame(rows)
-        asset_regime.to_parquet(out_dir / "asset_regime_probs.parquet", index=False)
+        rows = [
+            {"date": dt, "asset": asset, "regime_id": 0, "prob": 1.0}
+            for asset in assets for dt in state.index
+        ]
+        pd.DataFrame(rows).to_parquet(out_dir / "asset_regime_probs.parquet", index=False)
 
         return {
             "layer": self.name,
             "status": "stub",
-            "n_templates": 1,
             "n_assets": len(assets),
-            "note": "placeholder — replace with Wasserstein template + Jump Model in Phase 2",
+            "note": "placeholder — replace with per-asset Jump Model (Shu/Mulvey)",
         }
 
 
@@ -176,7 +188,8 @@ class ForecastLayer(Layer):
 # ── Runner ───────────────────────────────────────────────
 LAYERS: dict[str, type[Layer]] = {
     "mask": FeatureMaskLayer,
-    "conditioning": StateConditioningLayer,
+    "global_template": GlobalTemplateLayer,
+    "asset_regime": AssetRegimeLayer,
     "forecast": ForecastLayer,
 }
 
