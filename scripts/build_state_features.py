@@ -286,6 +286,56 @@ def main() -> None:
             "description": "10Y real yield (nominal - BEI10)",
         }
 
+    # Commodity YoY from existing *_ret (12-month cumulative log return)
+    for base in ("oil", "copper", "bcom", "gold"):
+        ret_col = f"{base}_ret"
+        if ret_col not in state.columns:
+            continue
+        yoy_col = f"{base}_yoy"
+        state[yoy_col] = state[ret_col].rolling(12).sum()
+        first = state[yoy_col].first_valid_index()
+        catalog[yoy_col] = {
+            "start_date": str(first.date()) if first is not None else None,
+            "source": "derived",
+            "fill_policy": "none",
+            "transformation": "log_yoy_12m",
+            "proxy": catalog[ret_col].get("proxy", False),
+            "revision_aware": False,
+            "description": f"{ret_col} 12-month cumulative log return (YoY)",
+        }
+
+    # Shiller CAPE (valuation) — monthly, ffill for post-Shiller-last-obs staleness
+    try:
+        from lib import shiller
+        cape_df = shiller.load()
+        last_shiller = cape_df.index.max()
+        for shiller_col, out_col, desc in [
+            ("cape", "shiller_cape",
+             "Shiller Cyclically Adjusted P/E (10-yr real earnings)"),
+            ("earnings_yield", "shiller_earnings_yield",
+             "Shiller earnings yield = 1/CAPE (fraction)"),
+        ]:
+            if shiller_col not in cape_df.columns:
+                continue
+            series = cape_df[shiller_col].reindex(state.index, method="ffill")
+            state[out_col] = series.values
+            first_valid = pd.Series(state[out_col].values, index=state.index).first_valid_index()
+            stale_count = int((state.index > last_shiller).sum())
+            catalog[out_col] = {
+                "start_date": str(first_valid.date()) if first_valid is not None else None,
+                "source": "Shiller_ie_data",
+                "fill_policy": "ffill_from_shiller",
+                "transformation": shiller_col,
+                "proxy": False,
+                "revision_aware": False,
+                "stale_after": str(last_shiller.date()),
+                "description": f"{desc} (last Shiller obs: {last_shiller.date()}; {stale_count} months ffilled)",
+            }
+        print(f"  [shiller] loaded {len(cape_df)} monthly obs, "
+              f"last {last_shiller.date()}, ffilling {stale_count} months into state")
+    except Exception as e:
+        print(f"  ⚠ Shiller CAPE not loaded: {e}")
+
     # Moody's credit spreads (long-history credit risk proxies)
     if {"moody_baa", "moody_aaa"}.issubset(state.columns):
         state["moody_baa_aaa"] = state["moody_baa"] - state["moody_aaa"]

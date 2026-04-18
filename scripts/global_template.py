@@ -61,6 +61,12 @@ CLUSTERING_FEATURES = [
     "ip_yoy", "payroll_yoy", "unrate",
     # Inflation (ALFRED vintage)
     "cpi_yoy",
+    # Commodities (Phase 0c). BCOM composite has longest yfinance history;
+    # oil/copper YoY start 2001 — excluded from clustering to preserve
+    # pre-2001 regimes (dot-com, Asian crisis). They remain in state for MI.
+    "bcom_yoy",
+    # Equity valuation (Phase 0c)
+    "shiller_earnings_yield",
 ]
 
 
