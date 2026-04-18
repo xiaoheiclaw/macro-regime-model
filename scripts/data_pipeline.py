@@ -91,8 +91,14 @@ FRED_SERIES = {
     # Funding
     "SOFR":     "SOFR_rate",
     # Credit spreads (new in v2)
+    # ICE BofA OAS: high quality but history truncated by ICE (~2023+)
     "BAMLH0A0HYM2": "HY_OAS",       # High Yield OAS
     "BAMLC0A0CM":   "IG_OAS",       # Investment Grade OAS
+    # Moody's seasoned corporate yields (long history, used for credit-spread
+    # features when ICE history is unavailable). From 1919.
+    "DAAA":         "Moody_AAA",
+    "DBAA":         "Moody_BAA",
+    "TB3MS":        "TB3M_monthly",   # 3M T-bill monthly avg (for carry calcs)
     # Policy / USD
     "WALCL":    "Fed_balance_sheet",
     "DTWEXBGS": "USD_broad",
@@ -220,8 +226,11 @@ col_desc = {
     "BEI_5Y":  "5Y Breakeven Inflation Rate (%)",
     "BEI_10Y": "10Y Breakeven Inflation Rate (%)",
     "SOFR_rate": "Secured Overnight Financing Rate (%)",
-    "HY_OAS": "ICE BofA High Yield OAS (%, FRED BAMLH0A0HYM2)",
-    "IG_OAS": "ICE BofA Corporate IG OAS (%, FRED BAMLC0A0CM)",
+    "HY_OAS": "ICE BofA High Yield OAS (%, FRED BAMLH0A0HYM2; history truncated by ICE ~2023)",
+    "IG_OAS": "ICE BofA Corporate IG OAS (%, FRED BAMLC0A0CM; history truncated by ICE ~2023)",
+    "Moody_AAA": "Moody's Seasoned Aaa Corporate Bond Yield (%, FRED DAAA, from 1919)",
+    "Moody_BAA": "Moody's Seasoned Baa Corporate Bond Yield (%, FRED DBAA, from 1919)",
+    "TB3M_monthly": "3-Month T-Bill: Secondary Market Rate, Monthly (%, FRED TB3MS)",
     "Fed_balance_sheet": "Fed Total Assets ($M, WALCL)",
     "USD_broad": "Trade-Weighted USD Index (Broad, DTWEXBGS)",
     "yield_curve_2s10s": "2s10s Yield Curve Spread (10Y - 2Y)",

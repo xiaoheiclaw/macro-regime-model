@@ -32,8 +32,23 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from lib.paths import DATA_DIR
+from lib import alfred
 
 SCHEMA_VERSION = "v2.1"
+
+# Vintage-aware features: (series_id, out_name, transform, description)
+# transform:
+#   yoy_pct — (x_t / x_{t-12}) - 1
+#   mom_pct — (x_t / x_{t-1}) - 1  (monthly percent change)
+#   level   — use value directly
+VINTAGE_SPEC = [
+    ("CPIAUCSL", "cpi_yoy",      "yoy_pct", "Headline CPI YoY (%, ALFRED vintage)"),
+    ("CPILFESL", "core_cpi_yoy", "yoy_pct", "Core CPI YoY (%, ALFRED vintage)"),
+    ("INDPRO",   "ip_yoy",       "yoy_pct", "Industrial Production YoY (%, ALFRED vintage)"),
+    ("PAYEMS",   "payroll_yoy",  "yoy_pct", "Nonfarm Payrolls YoY (%, ALFRED vintage)"),
+    ("PAYEMS",   "payroll_mom",  "mom_pct", "Nonfarm Payrolls MoM (%, ALFRED vintage)"),
+    ("UNRATE",   "unrate",       "level",   "Unemployment Rate (%, ALFRED vintage)"),
+]
 BUILT_AT = datetime.now().isoformat(timespec="seconds")
 
 INPUT = Path(DATA_DIR) / "merged_data.csv"
@@ -76,9 +91,12 @@ FEATURE_SPEC = [
     # Inflation expectations
     ("BEI_5Y",      "bei_5y",       "level",      "ffill_5d", "FRED",     False, True,  "5Y breakeven inflation (%)"),
     ("BEI_10Y",     "bei_10y",      "level",      "ffill_5d", "FRED",     False, True,  "10Y breakeven inflation (%)"),
-    # Credit
-    ("HY_OAS",      "hy_oas",       "level",      "ffill_5d", "FRED",     False, True,  "HY OAS (%)"),
-    ("IG_OAS",      "ig_oas",       "level",      "ffill_5d", "FRED",     False, True,  "IG OAS (%)"),
+    # Credit — ICE BofA OAS (high-quality, post-2023 only due to ICE IP truncation)
+    ("HY_OAS",      "hy_oas",       "level",      "ffill_5d", "FRED",     False, True,  "ICE BofA HY OAS (%) — history from 2023 only"),
+    ("IG_OAS",      "ig_oas",       "level",      "ffill_5d", "FRED",     False, True,  "ICE BofA IG OAS (%) — history from 2023 only"),
+    # Credit — Moody's seasoned yields (long history, for full-sample regimes)
+    ("Moody_AAA",   "moody_aaa",    "level",      "ffill_5d", "FRED",     False, True,  "Moody's AAA yield (%, from 1919)"),
+    ("Moody_BAA",   "moody_baa",    "level",      "ffill_5d", "FRED",     False, True,  "Moody's BAA yield (%, from 1919)"),
     # Funding / policy
     ("SOFR_rate",   "sofr",         "level",      "ffill_5d", "FRED",     False, True,  "SOFR rate (%, post-2018)"),
     ("USD_broad",   "usd_broad_ret","log_return", "ffill_5d", "FRED",     False, True,  "Trade-weighted USD (broad) monthly log return"),
@@ -154,6 +172,60 @@ def build_yield_curve_pca(monthly: pd.DataFrame, catalog: dict) -> pd.DataFrame:
     return out
 
 
+def _apply_macro_transform(snap: pd.Series, transform: str) -> pd.Series:
+    if transform == "yoy_pct":
+        return snap / snap.shift(12) - 1
+    if transform == "mom_pct":
+        return snap / snap.shift(1) - 1
+    if transform == "level":
+        return snap
+    raise ValueError(f"Unknown macro transform: {transform}")
+
+
+def add_vintage_features(state: pd.DataFrame, catalog: dict) -> None:
+    """
+    For each asof t in state.index, pull the vintage snapshot and apply transform.
+    Use the LATEST observation available at t (typically 1-2 months lagged).
+    This is what an analyst actually saw at month-end t.
+    """
+    print("\n[vintage] resolving ALFRED vintage features")
+    asofs = state.index
+
+    # Pre-load all caches once
+    for series_id, *_ in VINTAGE_SPEC:
+        alfred.fetch_realtime(series_id)  # ensures cache is hot
+
+    for series_id, out_name, transform, desc in VINTAGE_SPEC:
+        values = np.full(len(asofs), np.nan, dtype="float64")
+        latest_obs = [pd.NaT] * len(asofs)
+        for i, asof in enumerate(asofs):
+            snap = alfred.series_as_of(series_id, asof)
+            if snap.empty:
+                continue
+            transformed = _apply_macro_transform(snap, transform).dropna()
+            if transformed.empty:
+                continue
+            values[i] = float(transformed.iloc[-1])
+            latest_obs[i] = transformed.index[-1]
+        state[out_name] = values
+        first_valid = pd.Series(values, index=asofs).first_valid_index()
+        catalog[out_name] = {
+            "start_date": str(first_valid.date()) if first_valid is not None else None,
+            "source": "ALFRED",
+            "fred_series": series_id,
+            "fill_policy": "vintage_latest",
+            "transformation": transform,
+            "proxy": False,
+            "revision_aware": True,
+            "vintage_resolved": True,
+            "description": desc,
+        }
+        non_null = int(np.isfinite(values).sum())
+        print(f"  {out_name:<14} ← {series_id:<10} {transform:<8} "
+              f"first={first_valid.date() if first_valid is not None else 'NA'} "
+              f"n_obs={non_null}")
+
+
 def main() -> None:
     print("=" * 60)
     print(f"Build state_features | schema={SCHEMA_VERSION} | {BUILT_AT}")
@@ -193,6 +265,9 @@ def main() -> None:
     if len(pca_df.columns):
         state = state.join(pca_df)
 
+    # Vintage-aware macro features (growth + inflation, resolved point-in-time)
+    add_vintage_features(state, catalog)
+
     # Derived spreads
     if {"y10y", "y2y"}.issubset(state.columns):
         state["yc_2s10s"] = state["y10y"] - state["y2y"]
@@ -209,6 +284,24 @@ def main() -> None:
             "source": "derived", "fill_policy": "none",
             "transformation": "level", "proxy": False, "revision_aware": True,
             "description": "10Y real yield (nominal - BEI10)",
+        }
+
+    # Moody's credit spreads (long-history credit risk proxies)
+    if {"moody_baa", "moody_aaa"}.issubset(state.columns):
+        state["moody_baa_aaa"] = state["moody_baa"] - state["moody_aaa"]
+        catalog["moody_baa_aaa"] = {
+            "start_date": str(state["moody_baa_aaa"].first_valid_index().date()) if state["moody_baa_aaa"].notna().any() else None,
+            "source": "derived", "fill_policy": "none",
+            "transformation": "level", "proxy": False, "revision_aware": True,
+            "description": "Moody's BAA - AAA credit risk premium (%, long history)",
+        }
+    if {"moody_baa", "y10y"}.issubset(state.columns):
+        state["moody_baa_10y"] = state["moody_baa"] - state["y10y"]
+        catalog["moody_baa_10y"] = {
+            "start_date": str(state["moody_baa_10y"].first_valid_index().date()) if state["moody_baa_10y"].notna().any() else None,
+            "source": "derived", "fill_policy": "none",
+            "transformation": "level", "proxy": False, "revision_aware": True,
+            "description": "Moody's BAA - 10Y Treasury (%, corporate over Treasury spread)",
         }
 
     # Availability mask = True where observed (before any downstream imputation)
@@ -228,7 +321,9 @@ def main() -> None:
             "Return features use log returns on month-end prices.",
             "Yield/spread features are in percent, not bps; yX_diff in pct points.",
             "PCA components signed: pc1=level(+), pc2=slope(long+), pc3=curvature(mid+).",
-            "'revision_aware' flags FRED series with vintage histories; current build uses as-is; ALFRED vintage integration planned as Phase 0b.",
+            "'revision_aware' flags FRED series with vintage histories.",
+            "'vintage_resolved=True' means the value at each row uses ALFRED point-in-time lookup — the data an analyst saw at that month-end, not today's revised value.",
+            "Other FRED series (y*, bei_*, *_oas, sofr) are revision_aware=True but vintage_resolved=False: revisions are small for yields/spreads so as-is is acceptable.",
             "'proxy' flags series using continuous futures or composite proxies vs professional indices.",
         ],
     }

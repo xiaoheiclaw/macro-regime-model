@@ -40,18 +40,27 @@ SCHEMA_VERSION = "v2.1"
 K = 4                    # default template count (tunable)
 SEED = 42
 SMOOTHING_LAMBDA = 0.2   # prob_t = (1-λ)*raw + λ*prob_{t-1}
-COMMON_START = "1997-01-01"  # HY_OAS start (1996-12) + 1 month buffer
+COMMON_START = "1990-02-01"  # first month with y10y_diff + VIX + Moody's spreads
 
 # State features used for clustering. Exclude *_ret (flow variables dominate
-# variance; regime is about state levels/spreads). Also exclude features with
-# short history post COMMON_START: bei_*, sofr, usd_broad_ret, real_y10y.
+# variance; regime is about state levels/spreads). Include growth+inflation
+# via ALFRED vintage features (cpi_yoy, ip_yoy, payroll_yoy, unrate) so
+# templates reflect the 4-quadrant macro framework, not just policy+risk.
+# Use Moody's BAA-AAA for credit (long history, from 1990); ICE HY/IG OAS
+# excluded because FRED history was truncated by ICE to 2023+.
 CLUSTERING_FEATURES = [
+    # Rates / policy
     "y3m", "y2y", "y5y", "y10y", "y30y",
     "y10y_diff",
     "curve_pc1_level", "curve_pc2_slope", "curve_pc3_curv",
     "yc_2s10s",
+    # Risk / credit
     "vix_level",
-    "hy_oas", "ig_oas",
+    "moody_baa_aaa", "moody_baa_10y",
+    # Growth (ALFRED vintage)
+    "ip_yoy", "payroll_yoy", "unrate",
+    # Inflation (ALFRED vintage)
+    "cpi_yoy",
 ]
 
 
