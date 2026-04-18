@@ -78,11 +78,21 @@ def _gaussian_benchmark(
     return mu, sigma
 
 
-def _run_forecast_at(asof_str: str) -> bool:
-    """Run template_map + forecast at asof. Returns True on success."""
+def _run_forecast_at(asof_str: str, expanding_regimes: bool) -> bool:
+    """
+    Refit downstream layers at asof and emit forecast. When
+    expanding_regimes=True (default, Stage B.1 rigor), global_template and
+    asset_regime are refit on data ≤ asof; this removes the main leakage
+    from using regime models fit on the full history. Costlier per asof.
+    """
     import template_map
     import forecast
     try:
+        if expanding_regimes:
+            import global_template
+            import asset_regime
+            global_template.run(asof=asof_str)
+            asset_regime.run(asof=asof_str)
         template_map.run(asof=asof_str)
         forecast.run(asof=asof_str)
         return True
@@ -99,6 +109,9 @@ def main() -> None:
     ap.add_argument("--start", type=str, required=True, help="YYYY-MM")
     ap.add_argument("--end", type=str, required=True, help="YYYY-MM")
     ap.add_argument("--step", type=int, default=1, help="month step")
+    ap.add_argument("--no-expanding-regimes", action="store_true",
+                    help="skip global_template + asset_regime refit per asof "
+                         "(faster, but leaks regime training on full history)")
     args = ap.parse_args()
 
     state = pd.read_parquet(Path(DATA_DIR) / "state_features.parquet")
@@ -113,7 +126,7 @@ def main() -> None:
         eta = elapsed / i * (len(asofs) - i) if i > 0 else 0
         print(f"[{i}/{len(asofs)}] {asof_str} (elapsed {elapsed:.0f}s, ETA {eta:.0f}s)")
 
-        if not _run_forecast_at(asof_str):
+        if not _run_forecast_at(asof_str, expanding_regimes=not args.no_expanding_regimes):
             continue
 
         scn = pd.read_parquet(SCENARIOS_PATH)
@@ -170,10 +183,13 @@ def main() -> None:
             "n_asofs": int(df["asof"].nunique()),
             "n_rows": len(df),
             "rolling_benchmark_window_m": ROLLING_WINDOW,
+            "expanding_regimes": not args.no_expanding_regimes,
             "leakage_notes": [
                 "forecast analog-eligibility respects asof (no fwd crossing)",
                 "template_map asof-aware",
-                "global_template & asset_regime fit on full history — Stage B.1 target",
+                ("global_template & asset_regime refit per asof (expanding window)"
+                 if not args.no_expanding_regimes else
+                 "global_template & asset_regime fit on full history (leakage; --no-expanding-regimes)"),
                 "non-vintage FRED series as-is — Important (deferred)",
             ],
         },

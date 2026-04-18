@@ -78,8 +78,20 @@ def _temporal_smooth(probs: np.ndarray, lam: float) -> np.ndarray:
     return out
 
 
-def fit_asset(asset: str, ret: pd.Series, k: int = K) -> AssetFit | None:
-    feat = _build_features(ret).dropna()
+def fit_asset(
+    asset: str,
+    ret: pd.Series,
+    k: int = K,
+    asof: pd.Timestamp | None = None,
+) -> AssetFit | None:
+    """
+    Fit per-asset GMM. If asof is provided, training is restricted to
+    observations ≤ asof (expanding-window backtest safe).
+    """
+    feat = _build_features(ret)
+    if asof is not None:
+        feat = feat.loc[:asof]
+    feat = feat.dropna()
     if len(feat) < MIN_OBS:
         print(f"  ⚠ {asset}: {len(feat)} obs < {MIN_OBS}, skipped")
         return None
@@ -206,12 +218,13 @@ def run(asof: str | None = None) -> dict:
     state = pd.read_parquet(state_path)
     print(f"Loaded state_features: {state.shape}")
 
+    asof_ts = pd.Timestamp(asof) if asof is not None else None
     fits: list[AssetFit] = []
     for asset in ASSETS:
         if asset not in state.columns:
             print(f"  ⚠ {asset}: not in state, skipped")
             continue
-        fit = fit_asset(asset, state[asset])
+        fit = fit_asset(asset, state[asset], asof=asof_ts)
         if fit is None:
             continue
         fits.append(fit)

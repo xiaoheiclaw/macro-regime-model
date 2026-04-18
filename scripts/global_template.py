@@ -105,13 +105,24 @@ def temporal_smooth(probs: np.ndarray, lam: float) -> np.ndarray:
     return smoothed
 
 
-def fit(state: pd.DataFrame, k: int = K) -> TemplateResult:
+def fit(
+    state: pd.DataFrame,
+    k: int = K,
+    asof: pd.Timestamp | None = None,
+) -> TemplateResult:
+    """
+    Fit K-Means on state vectors. If asof is provided, training is restricted
+    to rows ≤ asof (expanding-window backtest safe). With asof=None, uses all
+    data (original live-mode behavior).
+    """
     avail = [f for f in CLUSTERING_FEATURES if f in state.columns]
     missing = set(CLUSTERING_FEATURES) - set(avail)
     if missing:
         print(f"  ⚠ clustering features missing from state: {sorted(missing)}")
 
     X_df = state[avail].loc[COMMON_START:].dropna()
+    if asof is not None:
+        X_df = X_df.loc[:asof]
     print(f"Common window: {X_df.index.min().date()} → {X_df.index.max().date()}"
           f" ({len(X_df)} rows, {len(avail)} features)")
 
@@ -249,7 +260,8 @@ def run(asof: str | None = None) -> dict:
     state = pd.read_parquet(state_path)
     print(f"Loaded state_features: {state.shape}")
 
-    res = fit(state, k=K)
+    asof_ts = pd.Timestamp(asof) if asof is not None else None
+    res = fit(state, k=K, asof=asof_ts)
     print(f"K-Means inertia: {res.inertia:.2f} | silhouette: {res.silhouette:.3f}")
     print(f"Template sizes: {res.meta['template_sizes']}")
 
