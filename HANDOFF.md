@@ -22,36 +22,46 @@ All 4 rounds of codex review passed. Known issues deferred:
 - allocation daily rolling rebalance → Stage B setup
 - global_template + asset_regime expanding-window refit → Stage B.1
 
-### Stage B.0 findings (10-year backtest 2015-2024)
+### Stage B findings (10-year backtest, after Phase 3b series)
 
-Ran `scripts/backtest.py --start 2015-01 --end 2024-12`:
+Latest overall skill: **-1.2%** (v2 CRPS 0.0959 vs Gaussian 0.0947)
+— up from -2.0% Stage A baseline via Phase 3b fixes.
 
-**Overall skill: -2.0%** (v2 CRPS 0.0966 vs Gaussian rolling 0.0947)
+**Stress-period breakdown** (the real economic story):
+| window | dates | n | skill |
+|---|---|---|---|
+| Calm expansion | 2015–2019 | 2564 | **-7.8%** (v2 loses) |
+| COVID | 2020-01 → 2021-06 | 748 | **+4.8%** |
+| Inflation shock | 2022-01 → 2023-06 | 748 | **+3.3%** |
+| Recent | 2023-07 → 2024-12 | 748 | **+5.7%** |
 
-Per-asset @ 12m horizon:
-| Asset | Skill | Notes |
-|---|---|---|
-| Gold | **+17.4%** | Regime identification excels for precious metals |
-| Silver | +8.5% | Same pattern |
-| Copper | +4.7% | Industrial activity → regime |
-| Gold @ 6m | +7.8% | |
-| BCOM | +3.3% | Commodity composite |
-| Oil | +1.2% | Marginal |
-| SPX | +0.7% | Marginal |
-| DXY | +1.3% | Marginal |
-| NatGas | +6.1% | Gas-specific |
-| HSI | +0.6% | Marginal |
-| Bond | **-4.1%** | Rate mean-reversion → Gaussian sufficient |
-| BTC | **-6.8%** | Short history + regime-independent tails |
+v2 beats Gaussian in **every non-calm window** (3-6% skill gain) but
+loses -7.8% in calm expansion. The overall -1.2% is arithmetic mean
+of these two regimes. v2 is a stress-period specialist, not a
+uniform winner.
 
-**Cross-regime heterogeneity**:
-- COVID window (2020-01→2021-06): +6.5% overall skill
-- Full window (2015-2024): -2.0% overall skill
-→ v2's edge is regime-specific (shines in turbulent periods, underperforms
-  in calm years when regime info is noise)
+**Phase 3b trajectory**:
+  Stage A baseline:       -2.0%
+  + α calibration:        -2.0%  (null)
+  + γ=0.5 tethering:      -1.8%  (+0.2pp)
+  + kernel variants:      -2.0%  (null; some worse)
+  + BTC parametric:       -1.3%  (+0.7pp)
+  + Bond parametric:      -1.2%  (+0.1pp)
 
-PIT most assets ~0.5 (calibrated), bonds ~0.39 (left bias: v2 bond
-scenarios skewed above realized).
+**Key methodological finding**: distance-metric tweaks (α, γ, kernel)
+each give ≤0.3pp improvement. Identifying which assets KAF doesn't
+serve and swapping them out (BTC/Bond → Normal) gives the bulk
+of the improvement.
+
+**Path forward (not implemented)**:
+- Regime-conditional KAF/Gaussian switching (use Gaussian when
+  global_template probs concentrated, KAF when diffuse)
+- v2 as tail-risk specialist (use for CVaR allocation, Gaussian for
+  return point forecasts)
+- More benchmarks (VAR(1), regime-conditional historical) for
+  absolute assessment vs simple Gaussian
+
+PIT most assets ~0.5 (calibrated). Bonds ~0.40 (left bias).
 
 ### Artifacts
 
