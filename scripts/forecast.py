@@ -86,6 +86,16 @@ ROLLING_FALLBACK_WINDOW = 120
 ALPHA_REGIME_DEFAULT = 3.0
 GAMMA_TETHER_DEFAULT = 0.5   # Phase 3b.1 backtest optimum (+0.2pp vs γ=0)
 KERNEL_DEFAULT = "euclidean"
+
+# Phase 3b.3: assets with insufficient history for macro analog ranking get
+# a parametric Normal fallback from their own rolling window. Preserves
+# scenario_id + weight + analog_date to keep the joint schema honest, but the
+# log_return at each scenario is drawn from an asset-local distribution rather
+# than from the analog month's realized forward return. Rationale: BTC
+# (2014-10+) has too little overlap with macro history and its tail behavior
+# is largely regime-independent.
+SHORT_HISTORY_ASSETS = {"btc_ret"}
+PARAMETRIC_WINDOW_M = 120   # match Gaussian benchmark window → skill ≈ 0% for these assets
 TETHER_LENGTH = 24   # months of past trajectory considered
 TETHER_WEIGHTS = np.array([1.0 / (k + 1) for k in range(TETHER_LENGTH)])  # 1, 1/2, ..., 1/24
 TETHER_WEIGHTS = TETHER_WEIGHTS / TETHER_WEIGHTS.sum()
@@ -543,11 +553,34 @@ def run(
               f"falling back to rolling-{ROLLING_FALLBACK_WINDOW} quantiles")
         scenarios = _fallback_rolling(asof_ts, state, ASSETS, HORIZONS)
     else:
+        # Prepare parametric fallback stats for short-history assets
+        rng = np.random.default_rng(hash(asof_str) & 0xFFFFFFFF)
+        parametric_stats: dict[str, tuple[float, float]] = {}
+        for asset in SHORT_HISTORY_ASSETS:
+            if asset not in state.columns:
+                continue
+            hist = state[asset].loc[:asof_ts].dropna().tail(PARAMETRIC_WINDOW_M)
+            if len(hist) >= 24:
+                parametric_stats[asset] = (float(hist.mean()), float(hist.std()))
+
         for scenario_id, (analog_dt, analog_w) in enumerate(zip(sel.dates, sel.weights)):
             for asset in ASSETS:
                 if asset not in state.columns:
                     continue
                 for h in HORIZONS:
+                    if asset in parametric_stats:
+                        mu_m, sigma_m = parametric_stats[asset]
+                        r = float(rng.normal(mu_m * h, sigma_m * np.sqrt(h)))
+                        scenarios.append({
+                            "asof_date": asof_ts,
+                            "scenario_id": int(scenario_id),
+                            "analog_date": analog_dt,
+                            "asset": asset,
+                            "horizon": int(h),
+                            "log_return": r,
+                            "weight": float(analog_w),
+                        })
+                        continue
                     fwd = _forward_cum_return(state[asset], h)
                     v = fwd.loc[analog_dt] if analog_dt in fwd.index else np.nan
                     if not np.isfinite(v):
