@@ -32,7 +32,9 @@ Upgrade path (Phase 3b):
 Contract (schema v2.1):
   Input:
     data/state_features.parquet
-    data/v2/global_template_centroids.npz (scaler)
+    data/v2/global_templates.parquet            (regime time series)
+    data/v2/asset_regime_probs.parquet          (regime time series)
+    data/v2/template_asset_joint_current.parquet (query-time joint)
   Output:
     data/v2/forecast_scenarios.parquet
       asof_date, scenario_id, asset, horizon, log_return, weight
@@ -64,11 +66,14 @@ MIN_ANALOGS = 50
 ROLLING_FALLBACK_WINDOW = 120
 
 # Regime-conditional analog filtering (Phase 3 closure per codex Critical #1).
-# Combined distance: d = d_state + ALPHA_GLOBAL * d_global_regime + BETA_ASSET * d_asset_regime
-# Weights chosen so the regime terms are roughly 20-30% of d_state at typical magnitudes
-# (d_state ~ 5-7 on 19-D standardized; d_regime on K-simplex max √2 ~ 1.4). Tunable in Stage B.
-ALPHA_GLOBAL_REGIME = 2.0
-BETA_ASSET_REGIME = 0.5
+# Combined distance: d = d_state + ALPHA_REGIME * d_joint_regime
+# where d_joint_regime is the mean-over-assets Frobenius distance between the
+# current per-asset (K_g × K_a) joint matrix (from template_asset_joint_current)
+# and each candidate's independence-product joint.
+# ALPHA tuned so regime term is ~20% of d_state at typical magnitudes
+# (d_state ~ 5-7; Frobenius on independence-product simplex ~ 0.5-1.2). Stage B
+# should calibrate against CRPS sensitivity.
+ALPHA_REGIME = 3.0
 
 # State (what defines the analog — levels/spreads/macro)
 STATE_FEATURES = [
@@ -103,16 +108,23 @@ class AnalogSelection:
     source: str                   # "kaf" | "rolling_fallback"
 
 
-def _load_regime_probs() -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
+def _load_regime_artifacts() -> tuple[pd.DataFrame, dict[str, pd.DataFrame], pd.DataFrame]:
     """
-    Returns (global_probs_by_date, {asset: asset_probs_by_date}).
-    Each DataFrame indexed by date, columns = prob_0..prob_{K-1}.
-    Missing inputs → empty return; caller falls back to state-only distance.
+    Returns (global_probs_by_date, {asset: asset_probs_by_date}, joint_current).
+
+    - global_probs, asset_probs: time-series of regime probabilities
+    - joint_current: the template_map.py output at latest asof, long format
+      (asset, global_template_id, asset_regime_id, prob_joint) — used as the
+      query-time joint distribution. This is how forecast consumes Phase 2c.
+
+    Missing inputs → empty returns; caller falls back gracefully.
     """
-    g_path = Path(DATA_DIR) / "v2" / "global_templates.parquet"
-    a_path = Path(DATA_DIR) / "v2" / "asset_regime_probs.parquet"
+    v2 = Path(DATA_DIR) / "v2"
+    g_path = v2 / "global_templates.parquet"
+    a_path = v2 / "asset_regime_probs.parquet"
+    j_path = v2 / "template_asset_joint_current.parquet"
     if not g_path.exists() or not a_path.exists():
-        return pd.DataFrame(), {}
+        return pd.DataFrame(), {}, pd.DataFrame()
     g = pd.read_parquet(g_path)
     a = pd.read_parquet(a_path)
     a["date"] = pd.to_datetime(a["date"])
@@ -122,54 +134,86 @@ def _load_regime_probs() -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
     asset_lookup: dict[str, pd.DataFrame] = {}
     for asset, grp in a.groupby("asset"):
         asset_lookup[str(asset)] = grp.set_index("date")[a_cols]
-    return g, asset_lookup
+    joint_current = pd.read_parquet(j_path) if j_path.exists() else pd.DataFrame()
+    return g, asset_lookup, joint_current
 
 
-def _regime_distance_components(
+def _joint_regime_distance(
     query_date: pd.Timestamp,
     candidate_dates: pd.DatetimeIndex,
     global_probs: pd.DataFrame,
     asset_probs: dict[str, pd.DataFrame],
-) -> tuple[np.ndarray, np.ndarray]:
+    joint_current: pd.DataFrame,
+) -> np.ndarray:
     """
-    Returns (d_global, d_asset_mean). d_global is L2 on global regime probs,
-    d_asset_mean is mean L2 across per-asset regime probs (nan-ignored).
-    Shape: (len(candidate_dates),). Zeros returned if probs unavailable.
+    For each candidate s, compute mean-over-assets Frobenius distance between
+    current joint matrix Q[a] (K_g × K_a, from template_map.joint_current) and
+    candidate joint matrix C[a, s] = p_g(s) ⊗ p_a(s, a).
+
+    Returns a vector of length len(candidate_dates). Uses zeros where probs
+    unavailable — caller combines with state distance.
     """
     n = len(candidate_dates)
-    if global_probs.empty or query_date not in global_probs.index:
-        return np.zeros(n), np.zeros(n)
+    if global_probs.empty:
+        return np.zeros(n)
 
-    q_g = global_probs.loc[query_date].values
-    cand_in_g = candidate_dates.isin(global_probs.index)
-    d_g = np.zeros(n)
-    if cand_in_g.any():
-        mat = global_probs.loc[candidate_dates[cand_in_g]].values
-        d_g_vals = np.linalg.norm(mat - q_g, axis=1)
-        d_g[cand_in_g] = d_g_vals
+    g_cols = global_probs.columns.tolist()
+    K_g = len(g_cols)
 
-    per_asset: list[np.ndarray] = []
-    for asset, df in asset_probs.items():
-        if query_date not in df.index:
-            continue
-        q_a = df.loc[query_date].values
-        cand_in_a = candidate_dates.isin(df.index)
-        if not cand_in_a.any():
-            continue
-        mat = df.loc[candidate_dates[cand_in_a]].values
-        d_vals = np.full(n, np.nan)
-        d_vals[cand_in_a] = np.linalg.norm(mat - q_a, axis=1)
-        per_asset.append(d_vals)
-
-    if per_asset:
-        stacked = np.vstack(per_asset)
-        with np.errstate(all="ignore"):
-            d_a = np.nanmean(stacked, axis=0)
-        mean_fill = np.nanmean(d_a) if np.isfinite(np.nanmean(d_a)) else 0.0
-        d_a = np.where(np.isnan(d_a), mean_fill, d_a)
+    # Build query-side Q[a] from joint_current (per-asset K_g × K_a joint matrix).
+    # If joint_current is missing, fall back to independence at query_date.
+    q_joint_by_asset: dict[str, np.ndarray] = {}
+    if not joint_current.empty and (
+        query_date in pd.to_datetime(joint_current["asof"]).values
+    ):
+        sub = joint_current[pd.to_datetime(joint_current["asof"]) == query_date]
+        for asset, grp in sub.groupby("asset"):
+            K_a = int(grp["asset_regime_id"].max()) + 1
+            mat = np.zeros((K_g, K_a))
+            for r in grp.itertuples():
+                mat[int(r.global_template_id), int(r.asset_regime_id)] = float(r.prob_joint)
+            q_joint_by_asset[str(asset)] = mat
     else:
-        d_a = np.zeros(n)
-    return d_g, d_a
+        # Independence fallback
+        if query_date in global_probs.index:
+            q_g = global_probs.loc[query_date].values
+            for asset, df in asset_probs.items():
+                if query_date in df.index:
+                    q_a = df.loc[query_date].values
+                    q_joint_by_asset[asset] = np.outer(q_g, q_a)
+
+    if not q_joint_by_asset:
+        return np.zeros(n)
+
+    # Candidate joint: independence product (we don't have history-wide joint_current)
+    per_asset_d: list[np.ndarray] = []
+    for asset, q_mat in q_joint_by_asset.items():
+        df = asset_probs.get(asset)
+        if df is None:
+            continue
+        cand_has_g = candidate_dates.isin(global_probs.index)
+        cand_has_a = candidate_dates.isin(df.index)
+        both = cand_has_g & cand_has_a
+        if not both.any():
+            continue
+        d_vec = np.full(n, np.nan)
+        for i, date in enumerate(candidate_dates):
+            if not both[i]:
+                continue
+            p_g = global_probs.loc[date].values
+            p_a = df.loc[date].values
+            c_mat = np.outer(p_g, p_a)
+            # Frobenius
+            d_vec[i] = np.linalg.norm(q_mat - c_mat)
+        per_asset_d.append(d_vec)
+
+    if not per_asset_d:
+        return np.zeros(n)
+    stacked = np.vstack(per_asset_d)
+    with np.errstate(all="ignore"):
+        d = np.nanmean(stacked, axis=0)
+    fill = np.nanmean(d) if np.isfinite(np.nanmean(d)) else 0.0
+    return np.where(np.isnan(d), fill, d)
 
 
 MIN_SCALER_TRAIN = 60  # minimum rows to fit the expanding scaler at each asof
@@ -236,11 +280,12 @@ def _select_analogs(
     query_idx = state_subset.index.get_loc(asof)
     query = X[query_idx]
 
-    last_valid_analog_date = state_subset.index[-1] - pd.offsets.MonthEnd(h_max + 1)
-    candidates_mask = (
-        (state_subset.index <= last_valid_analog_date)
-        & (state_subset.index < asof)
-    )
+    # Forward-outcome leakage fix: analog s must have s + h_max ≤ asof so its
+    # realized forward path is strictly ≤ asof (an analyst at asof actually
+    # saw those outcomes). Anchor to asof, NOT to state panel end (which
+    # would let forward paths peek past asof during backtest).
+    last_valid_analog_date = asof - pd.offsets.MonthEnd(h_max)
+    candidates_mask = (state_subset.index <= last_valid_analog_date)
     cand_idx = np.where(candidates_mask)[0]
     if len(cand_idx) < MIN_ANALOGS:
         return AnalogSelection(
@@ -256,9 +301,12 @@ def _select_analogs(
     cand_dates = state_subset.index[cand_idx]
     d_state = np.linalg.norm(X_cand - query, axis=1)
 
-    global_probs, asset_probs = _load_regime_probs()
-    d_g, d_a = _regime_distance_components(asof, cand_dates, global_probs, asset_probs)
-    d_regime = ALPHA_GLOBAL_REGIME * d_g + BETA_ASSET_REGIME * d_a
+    # Regime distance = Frobenius on per-asset joint (g × r) matrices, comparing
+    # current Q[a] (from template_map.joint_current) vs candidate C[a,s] = p_g(s)⊗p_a(s,a).
+    # This explicitly consumes Phase 2c output (template_asset_joint_current).
+    global_probs, asset_probs, joint_current = _load_regime_artifacts()
+    d_regime_raw = _joint_regime_distance(asof, cand_dates, global_probs, asset_probs, joint_current)
+    d_regime = ALPHA_REGIME * d_regime_raw
     d_combined = d_state + d_regime
 
     top_n = min(n_scn, len(cand_idx))
@@ -302,7 +350,11 @@ def _fallback_rolling(
     not remapped to a different date — so scenario_id K always means
     "if history from window[K] repeated forward".
     """
-    window_idx = state.loc[:asof].tail(ROLLING_FALLBACK_WINDOW).index
+    # Forward-outcome leakage fix: window end is asof - h_max so forward paths
+    # of every scenario date are strictly ≤ asof (no future information).
+    h_max = max(horizons)
+    window_end = asof - pd.offsets.MonthEnd(h_max)
+    window_idx = state.loc[:window_end].tail(ROLLING_FALLBACK_WINDOW).index
     asset_cols: list[tuple[str, str]] = []
     for a in assets:
         col = a if a in state.columns else f"{a}_ret"
@@ -444,7 +496,7 @@ def run(asof: str | None = None) -> dict:
     meta = base_meta(
         layer="forecast",
         data_asof=asof_str,
-        model_version=f"kaf_baseline_alpha{ALPHA_GLOBAL_REGIME}_beta{BETA_ASSET_REGIME}",
+        model_version=f"kaf_baseline_alpha{ALPHA_REGIME}_jointFrob",
         extra={
             "method": "kaf_baseline" if sel.source == "kaf" else "rolling_fallback",
             "joint_scenario": True,   # contract: same scenario_id → same analog_date
@@ -455,10 +507,12 @@ def run(asof: str | None = None) -> dict:
             "assets": ASSETS,
             "upgrade_path": "diffusion-map kernel + delay embedding + tethering",
             "regime_filter": {
-                "alpha_global": ALPHA_GLOBAL_REGIME,
-                "beta_asset": BETA_ASSET_REGIME,
+                "alpha_regime": ALPHA_REGIME,
+                "distance": "frobenius_on_per_asset_joint_(g,r)",
+                "query_joint_source": "template_asset_joint_current.parquet",
                 "enabled": (Path(DATA_DIR) / "v2" / "global_templates.parquet").exists()
-                           and (Path(DATA_DIR) / "v2" / "asset_regime_probs.parquet").exists(),
+                           and (Path(DATA_DIR) / "v2" / "asset_regime_probs.parquet").exists()
+                           and (Path(DATA_DIR) / "v2" / "template_asset_joint_current.parquet").exists(),
             },
             "scaler": scaler_meta,
         },
@@ -479,10 +533,10 @@ def _render_doc(
         f"schema_version: `{SCHEMA_VERSION}` · method: {sel.source} · "
         f"n_scenarios: {scn_df['scenario_id'].nunique() if not scn_df.empty else 0}",
         "",
-        "> **Baseline**: combined state + regime distance "
-        f"(α={ALPHA_GLOBAL_REGIME}, β={BETA_ASSET_REGIME}), softmax weighting, "
-        "joint scenarios (same scenario_id = same historical analog month). "
-        "Upgrade path: diffusion kernel, delay embedding, trajectory tethering.",
+        "> **Baseline**: combined state + joint-regime Frobenius distance "
+        f"(α={ALPHA_REGIME}), softmax weighting, joint scenarios (same "
+        "scenario_id = same historical analog month). Query-time joint "
+        "comes from template_asset_joint_current (Phase 2c output).",
         "",
     ]
     if sel.source == "kaf" and len(sel.dates):

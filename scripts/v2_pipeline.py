@@ -156,12 +156,14 @@ class ForecastLayer(Layer):
     @property
     def inputs(self) -> list[Path]:
         # Scaler is now asof-conditional (fit on ≤ asof at each call).
-        # Regime-conditional analog filter reads global_templates and
-        # asset_regime_probs; falls back to state-only distance if missing.
+        # Regime-conditional analog filter reads global_templates,
+        # asset_regime_probs, and template_asset_joint_current (Phase 2c).
+        # Falls back to state-only distance if regime artifacts are missing.
         return [
             Path(DATA_DIR) / "state_features.parquet",
             Path(DATA_DIR) / "v2" / "global_templates.parquet",
             Path(DATA_DIR) / "v2" / "asset_regime_probs.parquet",
+            Path(DATA_DIR) / "v2" / "template_asset_joint_current.parquet",
         ]
 
     @property
