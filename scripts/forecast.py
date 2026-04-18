@@ -289,27 +289,53 @@ def _fallback_rolling(
     assets: list[str],
     horizons: list[int],
 ) -> list[dict]:
-    """Unconditional rolling-120 empirical quantiles as synthetic scenarios."""
-    rows = []
-    window = state.loc[:asof].tail(ROLLING_FALLBACK_WINDOW)
+    """
+    Joint-preserving unconditional rolling fallback. Each scenario_id
+    corresponds to ONE historical date in the trailing
+    ROLLING_FALLBACK_WINDOW window; all (asset, horizon) pairs with valid
+    forward returns on that date share the same scenario_id. This honors
+    the cross-asset joint contract required by BL/SP-CVaR.
+
+    Assets that lack history on an analog date get dropped (no row),
+    not remapped to a different date — so scenario_id K always means
+    "if history from window[K] repeated forward".
+    """
+    window_idx = state.loc[:asof].tail(ROLLING_FALLBACK_WINDOW).index
+    asset_cols: list[tuple[str, str]] = []
     for a in assets:
-        if f"{a}_ret" not in state.columns and a not in state.columns:
-            continue
-        ret_col = a if a in state.columns else f"{a}_ret"
+        col = a if a in state.columns else f"{a}_ret"
+        if col in state.columns:
+            asset_cols.append((a, col))
+
+    # Pre-compute forward cumulative returns once per (asset, horizon)
+    fwd_tables: dict[tuple[str, int], pd.Series] = {}
+    for asset, ret_col in asset_cols:
         for h in horizons:
-            fwd = _forward_cum_return(state[ret_col], h).loc[window.index].dropna()
-            if len(fwd) < 12:
+            fwd_tables[(asset, h)] = _forward_cum_return(state[ret_col], h)
+
+    rows: list[dict] = []
+    valid_sids: set[int] = set()
+    for sid, dt in enumerate(window_idx):
+        for (asset, h), fwd in fwd_tables.items():
+            if dt not in fwd.index:
                 continue
-            # Emit each historical forward return as a weak scenario
-            for sid, (dt, v) in enumerate(fwd.items()):
-                rows.append({
-                    "asof_date": asof,
-                    "scenario_id": sid,
-                    "asset": a,
-                    "horizon": h,
-                    "log_return": float(v),
-                    "weight": 1.0 / len(fwd),
-                })
+            v = fwd.loc[dt]
+            if not np.isfinite(v):
+                continue
+            rows.append({
+                "asof_date": asof,
+                "scenario_id": int(sid),
+                "asset": asset,
+                "horizon": int(h),
+                "log_return": float(v),
+                "weight": 0.0,  # filled below
+            })
+            valid_sids.add(int(sid))
+
+    if valid_sids:
+        w = 1.0 / len(valid_sids)
+        for r in rows:
+            r["weight"] = w
     return rows
 
 
