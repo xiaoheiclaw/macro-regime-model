@@ -311,6 +311,30 @@ def main() -> None:
                 f"{r['pit_v2_mean']:.3f} | {r['pit_bench_mean']:.3f} |"
             )
         lines.append("")
+    # Stress-period breakdown — reveals when v2 actually wins.
+    # Overall skill aggregates calm + turbulent; separating them shows
+    # the regime-conditional KAF edge is not uniform over time.
+    stress_periods = [
+        ("GFC-era",    "2007-07", "2009-12"),
+        ("Calm expansion", "2013-01", "2019-12"),
+        ("COVID",      "2020-01", "2021-06"),
+        ("Inflation shock", "2022-01", "2023-06"),
+        ("Recent",     "2023-07", "2024-12"),
+    ]
+    lines.append("## Skill by period (stress vs calm)")
+    lines.append("")
+    lines.append("| window | dates | n | CRPS v2 | CRPS bench | skill |")
+    lines.append("|---|---|---|---|---|---|")
+    for name, s, e in stress_periods:
+        sub = df[(df["asof"] >= pd.Timestamp(s)) & (df["asof"] <= pd.Timestamp(e))]
+        if sub.empty:
+            continue
+        v = sub["crps_v2"].mean()
+        b = sub["crps_bench"].mean()
+        sk = 1.0 - v / b if b > 0 else float("nan")
+        lines.append(f"| {name} | {s}→{e} | {len(sub)} | {v:.4f} | {b:.4f} | {sk:+.1%} |")
+    lines.append("")
+
     lines.append("## Headline averages")
     lines.append("")
     if has_alpha:
