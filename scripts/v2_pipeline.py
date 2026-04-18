@@ -148,9 +148,14 @@ class ForecastLayer(Layer):
 
     @property
     def inputs(self) -> list[Path]:
-        # Scaler is now asof-conditional (fit on ≤ asof at each call), so
-        # forecast no longer reads global_template_centroids.npz.
-        return [Path(DATA_DIR) / "state_features.parquet"]
+        # Scaler is now asof-conditional (fit on ≤ asof at each call).
+        # Regime-conditional analog filter reads global_templates and
+        # asset_regime_probs; falls back to state-only distance if missing.
+        return [
+            Path(DATA_DIR) / "state_features.parquet",
+            Path(DATA_DIR) / "v2" / "global_templates.parquet",
+            Path(DATA_DIR) / "v2" / "asset_regime_probs.parquet",
+        ]
 
     @property
     def outputs(self) -> list[Path]:
