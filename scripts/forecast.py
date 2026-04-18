@@ -48,6 +48,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from sklearn.preprocessing import StandardScaler
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from lib.paths import DATA_DIR, ANALYSIS_DIR  # type: ignore
@@ -89,12 +90,7 @@ class AnalogSelection:
     source: str             # "kaf" | "rolling_fallback"
 
 
-def _load_scaler() -> tuple[np.ndarray, np.ndarray, list[str]]:
-    """Returns (mean, scale, feature_names) from global_template centroids."""
-    npz = np.load(Path(DATA_DIR) / "v2" / "global_template_centroids.npz",
-                  allow_pickle=True)
-    feature_names = [str(s) for s in npz["feature_names"]]
-    return npz["scaler_mean"], npz["scaler_scale"], feature_names
+MIN_SCALER_TRAIN = 60  # minimum rows to fit the expanding scaler at each asof
 
 
 def _forward_cum_return(ret_series: pd.Series, h: int) -> pd.Series:
@@ -102,30 +98,41 @@ def _forward_cum_return(ret_series: pd.Series, h: int) -> pd.Series:
     return ret_series.shift(-1).rolling(h).sum().shift(-(h - 1))
 
 
-def _build_state_matrix(state: pd.DataFrame) -> tuple[pd.DataFrame, np.ndarray]:
-    """Returns (state[STATE_FEATURES] dropna, standardized ndarray)."""
+def _build_state_matrix(
+    state: pd.DataFrame,
+    asof: pd.Timestamp,
+) -> tuple[pd.DataFrame, np.ndarray, dict]:
+    """
+    Returns (state_subset, standardized_matrix, scaler_meta).
+
+    Scaler is refit on data strictly ≤ asof at each call (expanding window),
+    so backtesting at historical asof dates sees exactly the scaling an
+    analyst at that date would compute. No dependence on the global_template
+    training scaler — that one is fit once on the full panel and would
+    contaminate backtests.
+    """
     missing = [f for f in STATE_FEATURES if f not in state.columns]
     if missing:
         sys.exit(f"STATE_FEATURES missing from state: {missing}")
     s = state[STATE_FEATURES].dropna()
-    mean, scale, fnames = _load_scaler()
-    # Scaler was trained on a subset (clustering features); re-standardize in
-    # place using available training stats where feature names align.
-    scaler_map = {n: (mean[i], scale[i]) for i, n in enumerate(fnames)}
-    standardized = np.empty_like(s.values, dtype="float64")
-    for j, f in enumerate(STATE_FEATURES):
-        if f in scaler_map:
-            m, sc = scaler_map[f]
-        else:
-            # Feature not in original scaler (bcom_yoy, shiller_earnings_yield
-            # were added post-global_template training); standardize on the
-            # series itself. Self-standardization is fine — global_template
-            # captures the rate/credit/macro subspace; added features get
-            # their own z-score.
-            m = s[f].mean()
-            sc = s[f].std() or 1.0
-        standardized[:, j] = (s[f].values - m) / (sc if sc > 0 else 1.0)
-    return s, standardized
+
+    train_mask = s.index <= asof
+    train = s.loc[train_mask]
+    if len(train) < MIN_SCALER_TRAIN:
+        sys.exit(f"Insufficient history ≤ {asof.date()} for scaler fit "
+                 f"({len(train)} < {MIN_SCALER_TRAIN})")
+
+    scaler = StandardScaler()
+    scaler.fit(train.values)
+    standardized = scaler.transform(s.values)
+    meta = {
+        "scaler_fit_start": str(train.index.min().date()),
+        "scaler_fit_end":   str(train.index.max().date()),
+        "scaler_fit_rows":  int(len(train)),
+        "scaler_mean":      scaler.mean_.tolist(),
+        "scaler_scale":     scaler.scale_.tolist(),
+    }
+    return s, standardized, meta
 
 
 def _select_analogs(
@@ -211,15 +218,17 @@ def run(asof: str | None = None) -> dict:
         sys.exit(f"missing {state_path}")
     state = pd.read_parquet(state_path)
 
-    state_subset, X = _build_state_matrix(state)
-    asof_ts = pd.Timestamp(asof) if asof else state_subset.index.max()
-    if asof_ts not in state_subset.index:
-        # Snap to nearest <= asof
-        prev = state_subset.index[state_subset.index <= asof_ts]
+    # Resolve asof first; scaler must be fit on ≤ asof only (no look-ahead)
+    all_idx = state[STATE_FEATURES].dropna().index
+    asof_ts = pd.Timestamp(asof) if asof else all_idx.max()
+    if asof_ts not in all_idx:
+        prev = all_idx[all_idx <= asof_ts]
         if len(prev) == 0:
             sys.exit(f"no state data <= {asof_ts}")
         asof_ts = prev[-1]
     asof_str = asof_ts.strftime("%Y-%m-%d")
+
+    state_subset, X, scaler_meta = _build_state_matrix(state, asof_ts)
 
     h_max = max(HORIZONS)
     sel = _select_analogs(asof_ts, state_subset, X, h_max=h_max, n_scn=N_SCN)
@@ -312,6 +321,7 @@ def run(asof: str | None = None) -> dict:
         "assets": ASSETS,
         "built_at": datetime.now().isoformat(timespec="seconds"),
         "upgrade_path": "diffusion-map kernel + delay embedding + tethering + regime filter",
+        "scaler": scaler_meta,
     }
     (out_dir / "forecast_meta.json").write_text(json.dumps(meta, indent=2))
     return meta

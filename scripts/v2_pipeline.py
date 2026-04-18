@@ -148,10 +148,9 @@ class ForecastLayer(Layer):
 
     @property
     def inputs(self) -> list[Path]:
-        return [
-            Path(DATA_DIR) / "state_features.parquet",
-            Path(DATA_DIR) / "v2" / "global_template_centroids.npz",
-        ]
+        # Scaler is now asof-conditional (fit on ≤ asof at each call), so
+        # forecast no longer reads global_template_centroids.npz.
+        return [Path(DATA_DIR) / "state_features.parquet"]
 
     @property
     def outputs(self) -> list[Path]:
