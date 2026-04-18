@@ -118,6 +118,30 @@ class AssetRegimeLayer(Layer):
         return {"layer": self.name, **meta}
 
 
+# ── Phase 2c: template × asset joint map ─────────────────
+class TemplateMapLayer(Layer):
+    name = "template_map"
+
+    @property
+    def inputs(self) -> list[Path]:
+        out = Path(DATA_DIR) / "v2"
+        return [out / "global_templates.parquet", out / "asset_regime_probs.parquet"]
+
+    @property
+    def outputs(self) -> list[Path]:
+        out = Path(DATA_DIR) / "v2"
+        return [
+            out / "template_asset_empirical.parquet",
+            out / "template_asset_joint_current.parquet",
+            out / "template_map_meta.json",
+        ]
+
+    def run(self, asof: str | None = None) -> dict:
+        from template_map import run as run_tm
+        meta = run_tm(asof=asof)
+        return {"layer": self.name, **meta}
+
+
 # ── Phase 3: forecast (stub) ─────────────────────────────
 class ForecastLayer(Layer):
     """Stub: emits empty scenario table with correct schema."""
@@ -178,6 +202,7 @@ LAYERS: dict[str, type[Layer]] = {
     "mask": FeatureMaskLayer,
     "global_template": GlobalTemplateLayer,
     "asset_regime": AssetRegimeLayer,
+    "template_map": TemplateMapLayer,
     "forecast": ForecastLayer,
 }
 
