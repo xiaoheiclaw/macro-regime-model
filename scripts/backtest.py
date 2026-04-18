@@ -91,6 +91,7 @@ def _run_forecast_at(
     alpha: float | None = None,
     gamma: float | None = None,
     kernel: str | None = None,
+    regime_switch_vix_pct: float | None = None,
     skip_regime_refit: bool = False,
 ) -> bool:
     """
@@ -104,7 +105,13 @@ def _run_forecast_at(
             _refit_regime_layers(asof_str)
         elif not expanding_regimes:
             template_map.run(asof=asof_str)
-        forecast.run(asof=asof_str, alpha=alpha, gamma=gamma, kernel=kernel)
+        forecast.run(
+            asof=asof_str,
+            alpha=alpha,
+            gamma=gamma,
+            kernel=kernel,
+            regime_switch_vix_pct=regime_switch_vix_pct,
+        )
         return True
     except SystemExit as e:
         print(f"  skip {asof_str}: {e}")
@@ -130,6 +137,9 @@ def main() -> None:
     ap.add_argument("--kernels", type=str, default=None,
                     help="comma-separated state-distance kernels "
                          "(euclidean,rbf,mahalanobis)")
+    ap.add_argument("--vix-switch", type=float, default=None,
+                    help="regime-switch VIX percentile (e.g., 0.50); "
+                         "below → all assets Gaussian, above → KAF")
     args = ap.parse_args()
 
     state = pd.read_parquet(Path(DATA_DIR) / "state_features.parquet")
@@ -174,6 +184,7 @@ def main() -> None:
                         alpha=alpha,
                         gamma=gamma,
                         kernel=kernel,
+                        regime_switch_vix_pct=args.vix_switch,
                         skip_regime_refit=True,
                     )
                     if not ok:

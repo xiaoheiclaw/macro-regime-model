@@ -99,6 +99,14 @@ KERNEL_DEFAULT = "euclidean"
 # skill ≈ 0% (Monte Carlo noise from N=200 samples).
 PARAMETRIC_FALLBACK_ASSETS = {"btc_ret", "bond_ret"}
 PARAMETRIC_WINDOW_M = 120
+
+# Phase 3b.6 — regime-conditional forecast switch.
+# Hypothesis tested: v2's stress-period edge (exploratory finding in 3b.5)
+# is real. If asof is in a "calm" VIX regime, KAF analog ranking adds
+# noise over Gaussian; switch all assets to parametric. Above threshold,
+# keep KAF. VIX_SWITCH_WINDOW_M defines the rolling window for percentile.
+VIX_SWITCH_PCT_DEFAULT = 0.50     # switch to Gaussian when VIX below median
+VIX_SWITCH_WINDOW_M = 120
 TETHER_LENGTH = 24   # months of past trajectory considered
 TETHER_WEIGHTS = np.array([1.0 / (k + 1) for k in range(TETHER_LENGTH)])  # 1, 1/2, ..., 1/24
 TETHER_WEIGHTS = TETHER_WEIGHTS / TETHER_WEIGHTS.sum()
@@ -516,11 +524,30 @@ def _fallback_rolling(
     return rows
 
 
+def _vix_regime_says_kaf(
+    state: pd.DataFrame,
+    asof_ts: pd.Timestamp,
+    pct_threshold: float,
+    window_m: int = VIX_SWITCH_WINDOW_M,
+) -> tuple[bool, float, float]:
+    """
+    Returns (use_kaf, current_vix, threshold_vix). KAF is selected when
+    VIX at asof exceeds the pct_threshold quantile of its rolling window.
+    """
+    vix = state["vix_level"].loc[:asof_ts].dropna().tail(window_m)
+    if len(vix) < 24:
+        return True, float("nan"), float("nan")
+    current_vix = float(vix.iloc[-1])
+    threshold_vix = float(vix.quantile(pct_threshold))
+    return current_vix > threshold_vix, current_vix, threshold_vix
+
+
 def run(
     asof: str | None = None,
     alpha: float | None = None,
     gamma: float | None = None,
     kernel: str | None = None,
+    regime_switch_vix_pct: float | None = None,
 ) -> dict:
     state_path = Path(DATA_DIR) / "state_features.parquet"
     if not state_path.exists():
@@ -560,8 +587,27 @@ def run(
         # asof ordinal (not Python str hash which is PYTHONHASHSEED-randomized
         # between processes — would make backtest results non-reproducible).
         rng = np.random.default_rng(asof_ts.toordinal())
+        # Determine parametric set: always-on assets + all if regime switch
+        # says current environment is below VIX threshold (calm → Gaussian).
+        parametric_set = set(PARAMETRIC_FALLBACK_ASSETS)
+        vix_switch_info = None
+        if regime_switch_vix_pct is not None:
+            use_kaf, cur_vix, thr_vix = _vix_regime_says_kaf(
+                state, asof_ts, regime_switch_vix_pct
+            )
+            vix_switch_info = {
+                "enabled": True,
+                "pct_threshold": regime_switch_vix_pct,
+                "use_kaf_for_assets": use_kaf,
+                "current_vix": cur_vix,
+                "threshold_vix": thr_vix,
+            }
+            if not use_kaf:
+                parametric_set = set(ASSETS)   # flip all assets to Gaussian
+                print(f"  [regime-switch] VIX {cur_vix:.1f} < {thr_vix:.1f} ({regime_switch_vix_pct*100:.0f}%ile) → Gaussian for all assets")
+
         parametric_stats: dict[str, tuple[float, float]] = {}
-        for asset in PARAMETRIC_FALLBACK_ASSETS:
+        for asset in parametric_set:
             if asset not in state.columns:
                 continue
             hist = state[asset].loc[:asof_ts].dropna().tail(PARAMETRIC_WINDOW_M)
@@ -670,6 +716,7 @@ def run(
                 "gamma_tether": gamma_eff,
                 "tether_length_months": TETHER_LENGTH,
                 "kernel": kernel_eff,
+                "vix_regime_switch": vix_switch_info,
                 "distance": "frobenius_on_per_asset_joint_(g,r)",
                 "query_joint_source": "template_asset_joint_current.parquet",
                 "enabled": (Path(DATA_DIR) / "v2" / "global_templates.parquet").exists()
