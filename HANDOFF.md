@@ -63,18 +63,34 @@ with rule-based segmentation (VIX quantile / NBER dates / rolling
   + BTC parametric:       -1.3%  (+0.7pp, real win; BTC -7% → -3%)
   + Bond parametric:      -1.1%  (+0.2pp, real but modest)
 
-**Known limitations (codex round 5)**:
-- **Joint structure broken for BTC/Bond value-level**. Parametric
-  scenarios correlate with macro only at scenario_id weight, not at
-  value. Cross-asset correlation signal (stock-bond, BTC-risk) lost
-  for these assets. Not tested downstream in allocation.
-- CRPS is per-(asset, horizon) marginal — **no joint dependence test**
-  in current evaluation. Stage C would need Energy Score or similar
-  multivariate scoring.
-- Gaussian benchmark (rolling 120m) is strong for monthly log returns;
-  v2's ~-1% to +5% skill should be read in that context.
+**Joint structure validation (Phase 3b.7, Energy Score)**:
+  Multivariate Energy Score v2 vs MVN-benchmark (historical Σ):
+    h=1m:  +1.1%   h=3m:  +1.2%
+    h=6m:  +0.6%   h=12m: +0.7%
+  All horizons positive. First positive KAF-core result: cross-asset
+  joint structure in v2 scenarios carries information beyond what a
+  multivariate Gaussian with historical covariance captures. Small
+  but consistent — this is the "earn your keep" evidence for joint
+  scenarios as inputs to BL/SP-CVaR allocation.
+
+**AR(1) benchmark (Phase 3b.7, stronger than unconditional Gaussian)**:
+  Many Gaussian "wins" are AR(1) losses — AR(1) captures mean-reverting/
+  momentum dynamics Gaussian misses. Under both benchmarks:
+    Gold @ 12m:   +7.6% vs AR(1), +16.7% vs Gaussian  ← real v2 win
+    Silver @ 12m: +4.8% vs AR(1), +7.5% vs Gaussian   ← real v2 win
+    Oil short-h:  +0.3 to +3.2%                       ← marginal
+    BTC:          -24.7% vs AR(1), -5.3% vs Gaussian  ← AR(1) captures momentum
+    Bond:         -13.6% vs AR(1), -1.2% vs Gaussian  ← AR(1) captures mean reversion
+  Honest recalibration: Gold and Silver are the only assets that
+  genuinely beat both benchmarks.
+
+**Remaining limitations**:
+- Joint structure broken at VALUE level for BTC/Bond (parametric);
+  joint for other 8 assets is intact and shown positive by ES. Not
+  tested downstream in allocation.
 - Stress-period breakdown windows are hand-named; do not cite as
-  evidence, only as hypothesis.
+  evidence, only as hypothesis. VIX threshold switch (3b.6) didn't
+  help — calm vs KAF-win isn't cleanly separable by VIX.
 
 **Path forward**:
 - Regime-conditional KAF/Gaussian switching (use Gaussian when
