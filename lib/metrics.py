@@ -12,6 +12,7 @@ forecast has discrete support (samples).
 from __future__ import annotations
 
 import numpy as np
+import pandas as pd
 from scipy.stats import norm
 
 
@@ -86,3 +87,95 @@ def pit_normal(mu: float, sigma: float, realized: float) -> float:
     if sigma <= 0:
         return 0.5
     return float(norm.cdf((realized - mu) / sigma))
+
+
+def energy_score_sample(
+    samples: np.ndarray,
+    realized: np.ndarray,
+    weights: np.ndarray | None = None,
+) -> float:
+    """
+    Multivariate Energy Score (Gneiting 2008) — proper scoring rule for
+    probabilistic multivariate forecasts. Generalizes CRPS to vector-valued
+    predictands.
+      ES = E||X - y||₂ - 0.5 · E||X - X'||₂
+    samples: (N, D) ensemble
+    realized: (D,) vector
+    weights: (N,) optional scenario weights
+    """
+    samples = np.asarray(samples, dtype=float)
+    realized = np.asarray(realized, dtype=float)
+    if samples.ndim != 2 or samples.shape[1] != len(realized):
+        return float("nan")
+    n = len(samples)
+    if n == 0:
+        return float("nan")
+    if weights is None:
+        w = np.full(n, 1.0 / n)
+    else:
+        w = np.asarray(weights, dtype=float)
+        s = w.sum()
+        if s <= 0:
+            return float("nan")
+        w = w / s
+    d_to_y = np.linalg.norm(samples - realized[None, :], axis=1)
+    e1 = float(np.sum(w * d_to_y))
+    d_pair = np.linalg.norm(samples[:, None, :] - samples[None, :, :], axis=2)
+    e2 = 0.5 * float(np.sum(w[:, None] * w[None, :] * d_pair))
+    return e1 - e2
+
+
+def energy_score_mvn(
+    mu: np.ndarray,
+    Sigma: np.ndarray,
+    realized: np.ndarray,
+    n_samples: int = 500,
+    rng: np.random.Generator | None = None,
+) -> float:
+    """
+    Energy Score for Normal(μ, Σ) against realized y, via MC sampling.
+    Provides a joint-Gaussian benchmark with historical covariance structure.
+    """
+    if rng is None:
+        rng = np.random.default_rng(42)
+    d = len(mu)
+    Sigma_reg = Sigma + 1e-8 * np.eye(d)  # jitter for PSD
+    try:
+        samples = rng.multivariate_normal(mu, Sigma_reg, size=n_samples)
+    except np.linalg.LinAlgError:
+        return float("nan")
+    return energy_score_sample(samples, realized)
+
+
+def ar1_forecast(
+    series: pd.Series,
+    h: int,
+    window: int = 120,
+) -> tuple[float, float] | None:
+    """
+    AR(1) h-step-ahead forecast: y_{t+1} = c + φ y_t + ε. Iterates forward h
+    steps. Returns (cumulative mean μ_h, cumulative std σ_h) for log-return
+    cumulative over h months. OLS on rolling `window` recent observations.
+    """
+    s = series.dropna().tail(window + 1)
+    if len(s) < 36:
+        return None
+    y = s.values[1:]
+    x = s.values[:-1]
+    # OLS: y = c + phi * x + eps
+    phi = np.cov(x, y, ddof=1)[0, 1] / max(np.var(x, ddof=1), 1e-12)
+    c = float(np.mean(y) - phi * np.mean(x))
+    resid = y - (c + phi * x)
+    sigma_eps = float(np.std(resid, ddof=1))
+    # h-step iterated forecast from last observed
+    last = float(s.values[-1])
+    mu_t = last
+    mu_cum = 0.0
+    var_cum = 0.0
+    coef_sum = 0.0
+    for k in range(1, h + 1):
+        mu_t = c + phi * mu_t
+        mu_cum += mu_t
+        coef_sum = 1.0 + phi * coef_sum  # recursive coefficient accumulation
+        var_cum += (coef_sum ** 2) * (sigma_eps ** 2)
+    return float(mu_cum), float(np.sqrt(max(var_cum, 0.0)))

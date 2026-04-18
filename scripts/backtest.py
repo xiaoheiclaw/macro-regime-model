@@ -44,7 +44,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lib.paths import DATA_DIR, ANALYSIS_DIR  # type: ignore
 from lib.schema import base_meta  # type: ignore
-from lib.metrics import crps_sample, crps_normal, pit_sample, pit_normal  # type: ignore
+from lib.metrics import (  # type: ignore
+    crps_sample, crps_normal, pit_sample, pit_normal,
+    energy_score_sample, energy_score_mvn, ar1_forecast,
+)
 
 
 ROLLING_WINDOW = 120
@@ -76,6 +79,25 @@ def _gaussian_benchmark(
     mu = float(hist.mean()) * h
     sigma = float(hist.std()) * np.sqrt(h)
     return mu, sigma
+
+
+def _joint_gaussian_benchmark(
+    state: pd.DataFrame,
+    assets: list[str],
+    asof: pd.Timestamp,
+    h: int,
+    window: int = ROLLING_WINDOW,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Multivariate Normal with rolling (μ, Σ) scaled to horizon h."""
+    cols = [a for a in assets if a in state.columns]
+    if not cols:
+        return None
+    hist = state[cols].loc[:asof].dropna(how="any").tail(window)
+    if len(hist) < max(24, len(cols) + 2):
+        return None
+    mu = hist.mean().values * h
+    Sigma = hist.cov().values * h
+    return mu, Sigma
 
 
 def _refit_regime_layers(asof_str: str) -> None:
@@ -158,6 +180,7 @@ def main() -> None:
 
     t0 = time.time()
     rows: list[dict] = []
+    energy_rows: list[dict] = []   # per-(asof, horizon): joint energy score v2 vs MVN
     expanding = not args.no_expanding_regimes
     alphas_to_run = alpha_grid if alpha_grid is not None else [None]
     gammas_to_run = gamma_grid if gamma_grid is not None else [None]
@@ -209,6 +232,16 @@ def main() -> None:
                         else:
                             crps_bench = crps_normal(bench_mu, bench_sigma, realized)
                             pit_bench = pit_normal(bench_mu, bench_sigma, realized)
+
+                        # AR(1) per-asset benchmark (alternative baseline)
+                        ar_res = ar1_forecast(state[asset], int(h))
+                        if ar_res is None:
+                            crps_ar, pit_ar = float("nan"), float("nan")
+                        else:
+                            ar_mu, ar_sigma = ar_res
+                            crps_ar = crps_normal(ar_mu, ar_sigma, realized)
+                            pit_ar = pit_normal(ar_mu, ar_sigma, realized)
+
                         rows.append({
                             "asof": asof,
                             "alpha": alpha_val,
@@ -219,9 +252,53 @@ def main() -> None:
                             "realized": realized,
                             "crps_v2": crps_v2,
                             "crps_bench": crps_bench,
+                            "crps_ar1": crps_ar,
                             "pit_v2": pit_v2,
                             "pit_bench": pit_bench,
+                            "pit_ar1": pit_ar,
                             "n_scn": len(samples),
+                        })
+
+                    # Energy Score per (asof, horizon) — tests joint dependence
+                    for h_int in scn["horizon"].unique():
+                        sub_h = scn[scn["horizon"] == int(h_int)]
+                        if sub_h.empty:
+                            continue
+                        wide = sub_h.pivot_table(
+                            index="scenario_id",
+                            columns="asset",
+                            values="log_return",
+                            aggfunc="first",
+                        ).dropna(axis=1, how="any").dropna(axis=0, how="any")
+                        if wide.empty or wide.shape[1] < 2:
+                            continue
+                        # Realized vector for these assets at asof
+                        realized_vec = np.array([
+                            _realized(state, a, asof, int(h_int)) for a in wide.columns
+                        ])
+                        if any(r is None for r in realized_vec):
+                            continue
+                        realized_vec = realized_vec.astype(float)
+                        # Scenario weights (one per scenario_id)
+                        w_map = sub_h.drop_duplicates("scenario_id").set_index("scenario_id")["weight"]
+                        w_vec = w_map.loc[wide.index].values
+                        w_vec = w_vec / w_vec.sum() if w_vec.sum() > 0 else np.full(len(w_vec), 1.0/len(w_vec))
+                        es_v2 = energy_score_sample(wide.values, realized_vec, w_vec)
+                        # MVN benchmark
+                        mvn = _joint_gaussian_benchmark(state, list(wide.columns), asof, int(h_int))
+                        es_mvn = float("nan")
+                        if mvn is not None:
+                            mvn_rng = np.random.default_rng(pd.Timestamp(asof).toordinal() + int(h_int))
+                            es_mvn = energy_score_mvn(mvn[0], mvn[1], realized_vec, n_samples=500, rng=mvn_rng)
+                        energy_rows.append({
+                            "asof": asof,
+                            "alpha": alpha_val,
+                            "gamma": gamma_val,
+                            "kernel": kernel_val,
+                            "horizon": int(h_int),
+                            "n_assets": int(wide.shape[1]),
+                            "es_v2": es_v2,
+                            "es_mvn": es_mvn,
                         })
 
     if not rows:
@@ -367,6 +444,41 @@ def main() -> None:
 
     doc_dir = Path(ANALYSIS_DIR) / "v2"
     doc_dir.mkdir(parents=True, exist_ok=True)
+    # Energy Score + AR(1) sections
+    if energy_rows:
+        es_df = pd.DataFrame(energy_rows)
+        es_df.to_parquet(out_dir / f"energy_{tag}.parquet", index=False)
+        es_summary = es_df.groupby("horizon").agg(
+            n=("es_v2", "count"),
+            es_v2_mean=("es_v2", "mean"),
+            es_mvn_mean=("es_mvn", "mean"),
+        ).round(4)
+        es_summary["skill"] = 1.0 - es_summary["es_v2_mean"] / es_summary["es_mvn_mean"]
+        lines.append("## Multivariate Energy Score (tests joint dependence)")
+        lines.append("")
+        lines.append("| horizon | n | ES v2 | ES MVN-bench | skill |")
+        lines.append("|---|---|---|---|---|")
+        for h, r in es_summary.iterrows():
+            lines.append(
+                f"| {h}m | {int(r['n'])} | {r['es_v2_mean']:.4f} | "
+                f"{r['es_mvn_mean']:.4f} | {r['skill']:+.1%} |"
+            )
+        lines.append("")
+
+    if "crps_ar1" in df.columns and df["crps_ar1"].notna().any():
+        lines.append("## AR(1) benchmark (stronger than unconditional Gaussian)")
+        lines.append("")
+        lines.append("| asset | h | skill vs AR(1) | skill vs Gaussian |")
+        lines.append("|---|---|---|---|")
+        for (asset, h), sub in df.groupby(["asset", "horizon"]):
+            s_ar = sub["crps_ar1"].mean()
+            s_g = sub["crps_bench"].mean()
+            s_v = sub["crps_v2"].mean()
+            skill_ar = 1 - s_v / s_ar if s_ar > 0 else float("nan")
+            skill_g = 1 - s_v / s_g if s_g > 0 else float("nan")
+            lines.append(f"| {asset} | {h}m | {skill_ar:+.1%} | {skill_g:+.1%} |")
+        lines.append("")
+
     doc_path = doc_dir / f"backtest_{tag}.md"
     doc_path.write_text("\n".join(lines))
 
