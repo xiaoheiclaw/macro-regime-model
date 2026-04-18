@@ -336,6 +336,21 @@ def main() -> None:
     except Exception as e:
         print(f"  ⚠ Shiller CAPE not loaded: {e}")
 
+    # Synthetic bond return from yield change (duration-based proxy so
+    # allocation can treat "bonds" as a return asset alongside equities).
+    if "y10y" in state.columns:
+        state["bond_ret"] = -8.0 * state["y10y"].diff() / 100.0
+        first_valid = state["bond_ret"].first_valid_index()
+        catalog["bond_ret"] = {
+            "start_date": str(first_valid.date()) if first_valid is not None else None,
+            "source": "derived",
+            "fill_policy": "none",
+            "transformation": "duration_proxy",
+            "proxy": True,
+            "revision_aware": True,
+            "description": "Synthetic 10Y bond log return (−8 × Δy10y / 100, duration proxy)",
+        }
+
     # Moody's credit spreads (long-history credit risk proxies)
     if {"moody_baa", "moody_aaa"}.issubset(state.columns):
         state["moody_baa_aaa"] = state["moody_baa"] - state["moody_aaa"]

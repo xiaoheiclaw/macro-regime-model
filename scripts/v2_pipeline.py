@@ -168,6 +168,25 @@ class ForecastLayer(Layer):
         return {"layer": self.name, **meta}
 
 
+# ── Phase 4: v2 allocation (MV + SP-CVaR on joint scenarios) ─
+class AllocationLayer(Layer):
+    name = "allocation"
+
+    @property
+    def inputs(self) -> list[Path]:
+        return [Path(DATA_DIR) / "v2" / "forecast_scenarios.parquet"]
+
+    @property
+    def outputs(self) -> list[Path]:
+        out = Path(DATA_DIR) / "v2"
+        return [out / "weights_v2.parquet", out / "allocation_v2_meta.json"]
+
+    def run(self, asof: str | None = None) -> dict:
+        from v2_allocation import run as run_alloc
+        meta = run_alloc(asof=asof)
+        return {"layer": self.name, **meta}
+
+
 # ── Runner ───────────────────────────────────────────────
 LAYERS: dict[str, type[Layer]] = {
     "mask": FeatureMaskLayer,
@@ -175,6 +194,7 @@ LAYERS: dict[str, type[Layer]] = {
     "asset_regime": AssetRegimeLayer,
     "template_map": TemplateMapLayer,
     "forecast": ForecastLayer,
+    "allocation": AllocationLayer,
 }
 
 

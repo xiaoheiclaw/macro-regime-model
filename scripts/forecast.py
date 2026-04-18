@@ -77,6 +77,7 @@ ASSETS = [
     "spx_ret", "hsi_ret", "btc_ret",
     "oil_ret", "natgas_ret", "gold_ret", "silver_ret", "copper_ret", "bcom_ret",
     "dxy_ret",
+    "bond_ret",  # synthetic 10Y bond return (duration proxy)
 ]
 
 
