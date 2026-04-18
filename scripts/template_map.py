@@ -117,22 +117,33 @@ def build_empirical(
 def build_current_joint(
     g: pd.DataFrame,
     a: pd.DataFrame,
+    asof: pd.Timestamp | None = None,
 ) -> tuple[pd.DataFrame, pd.Timestamp]:
-    """Independence approximation at latest asof date common to both."""
+    """
+    Independence-product joint at the latest date ≤ asof that is present in
+    both panels. If asof is None, uses the latest observed date.
+
+    Per-asset latest-available date (≤ asof) may differ — we record each
+    asset's `asof` separately in the output. `asof_used` (2nd return value)
+    is the max across assets (for reporting).
+    """
     g_cols = _global_prob_columns(g)
     a_cols = _asset_prob_columns(a)
     K_g = len(g_cols)
     K_a = len(a_cols)
 
+    asof_ts = pd.Timestamp(asof) if asof is not None else None
     rows = []
-    asof = None
+    asof_used: pd.Timestamp | None = None
     for asset, grp in a.groupby("asset"):
         grp = grp.set_index("date")
         common = grp.index.intersection(g.index)
+        if asof_ts is not None:
+            common = common[common <= asof_ts]
         if len(common) == 0:
             continue
         latest = common.max()
-        asof = max(asof, latest) if asof is not None else latest
+        asof_used = max(asof_used, latest) if asof_used is not None else latest
         pg = g.loc[latest, g_cols].values
         pa = grp.loc[latest, a_cols].values
         joint = np.outer(pg, pa)
@@ -147,7 +158,7 @@ def build_current_joint(
                     "prob_asset": float(pa[aj]),
                     "prob_joint": float(joint[gi, aj]),
                 })
-    return pd.DataFrame(rows), asof
+    return pd.DataFrame(rows), asof_used
 
 
 def render_doc(empirical: pd.DataFrame, current: pd.DataFrame, asof: str) -> str:
@@ -207,8 +218,8 @@ def run(asof: str | None = None) -> dict:
     print(f"Loaded global_templates {g.shape} · asset_regime_probs {a.shape}")
 
     empirical = build_empirical(g, a)
-    current, asof_ts = build_current_joint(g, a)
-    asof_str = asof or asof_ts.strftime("%Y-%m-%d")
+    current, asof_ts = build_current_joint(g, a, asof=asof)
+    asof_str = asof_ts.strftime("%Y-%m-%d") if asof_ts is not None else (asof or "latest")
 
     out_dir = Path(DATA_DIR) / "v2"
     out_dir.mkdir(parents=True, exist_ok=True)

@@ -11,13 +11,16 @@ Baseline:
 - State vector: standardized STATE_FEATURES (19 features; rates,
   credit, growth, inflation, vix, bcom_yoy, shiller_earnings_yield).
   Scaler is fit expanding-window on data ≤ asof (no look-ahead).
-- Distance: combined state + regime
-    d_total = d_state + α · d_global_regime + β · d_asset_regime
-  where d_state is standardized Euclidean on STATE_FEATURES, and the
-  regime terms are L2 on probability simplices (global_templates and
-  asset_regime_probs respectively). α=2.0, β=0.5 as baseline.
+- Distance: combined state + regime-joint
+    d_total = d_state + α · d_joint_regime
+  where d_state is standardized Euclidean on STATE_FEATURES, and
+  d_joint_regime is the mean-over-assets Frobenius distance between
+  per-asset (K_g × K_a) joint matrices: Q[a] from the query-time joint
+  (template_asset_joint_current if asof matches, else independence
+  product) vs C[a, s] = p_g(s) ⊗ p_a(s, a) for each candidate s.
+  α=3.0 as baseline (targets ~20-30% regime share of total distance).
 - Selection: top-N_SCN by d_total; analogs must have complete forward
-  H-month history (and lie strictly before asof).
+  H-month history AND s + h_max ≤ asof (no forward-outcome leakage).
 - Weights: softmax(-d_total / auto_temp) normalized over selected.
 - Horizons: 1, 3, 6, 12 months (18m excluded — too few independent samples)
 - Fallback chain (per codex review):
@@ -28,6 +31,8 @@ Upgrade path (Phase 3b):
 - Diffusion map / dynamics-adapted kernel (Alexander & Giannakis)
 - Delay embedding (q-lag concatenated state vectors)
 - Tethering: trajectory similarity over past 24m weighted 1, 1/2, 1/3
+- Empirical-joint prior from template_asset_empirical (weight analog
+  plausibility by historical P(r|g) per asset, not just marginals)
 
 Contract (schema v2.1):
   Input:
@@ -272,8 +277,10 @@ def _select_analogs(
     Pick N nearest analogs with complete H-month forward history.
 
     Distance is combined: state (standardized Euclidean on 19 features) +
-    α * global regime L2 + β * mean per-asset regime L2. This implements
-    the Phase 3 regime-conditional analog pool the v2.1 design required.
+    α · regime-joint-Frobenius. The regime term takes per-asset joint matrices
+    Q[a] (K_g × K_a) computed from template_asset_joint_current at the query's
+    asof (or independence product as fallback) and compares them to each
+    candidate's independence-product joint C[a, s] = p_g(s) ⊗ p_a(s, a).
     """
     if asof not in state_subset.index:
         sys.exit(f"asof {asof} not in state panel")
