@@ -556,8 +556,10 @@ def run(
               f"falling back to rolling-{ROLLING_FALLBACK_WINDOW} quantiles")
         scenarios = _fallback_rolling(asof_ts, state, ASSETS, HORIZONS)
     else:
-        # Prepare parametric fallback stats for short-history assets
-        rng = np.random.default_rng(hash(asof_str) & 0xFFFFFFFF)
+        # Prepare parametric fallback stats. Deterministic seed derived from
+        # asof ordinal (not Python str hash which is PYTHONHASHSEED-randomized
+        # between processes — would make backtest results non-reproducible).
+        rng = np.random.default_rng(asof_ts.toordinal())
         parametric_stats: dict[str, tuple[float, float]] = {}
         for asset in PARAMETRIC_FALLBACK_ASSETS:
             if asset not in state.columns:

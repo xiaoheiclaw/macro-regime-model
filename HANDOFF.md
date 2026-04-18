@@ -24,44 +24,69 @@ All 4 rounds of codex review passed. Known issues deferred:
 
 ### Stage B findings (10-year backtest, after Phase 3b series)
 
-Latest overall skill: **-1.2%** (v2 CRPS 0.0959 vs Gaussian 0.0947)
-— up from -2.0% Stage A baseline via Phase 3b fixes.
+Latest overall skill: **-1.1%** (v2 CRPS 0.0957 vs Gaussian 0.0947),
+reproducible under fixed seed.
 
-**Stress-period breakdown** (the real economic story):
+**Honest attribution of the -2.0% → -1.1% improvement** (codex round 5):
+
+- **KAF core remains around -2%**. α / γ / kernel tweaks each deliver
+  ≤0.3pp — they don't materially change analog ranking because
+  d_state already dominates, d_regime is partially redundant with
+  d_state (regime layers derived from state features), and d_traj
+  adds tiny marginal information at the chosen tether length.
+- The ~0.9pp headline win comes from **switching BTC/Bond out of KAF
+  entirely** into a Gaussian parametric fallback that matches the
+  benchmark family (same 120m rolling window). This is a real CRPS
+  win, but it's "asset-level switch to benchmark", not "KAF got
+  better". If you read the headline as "v2 baseline improved", you
+  are over-attributing.
+
+**Stress-period breakdown** (exploratory only — post-hoc named
+windows, not a validation):
 | window | dates | n | skill |
 |---|---|---|---|
-| Calm expansion | 2015–2019 | 2564 | **-7.8%** (v2 loses) |
-| COVID | 2020-01 → 2021-06 | 748 | **+4.8%** |
-| Inflation shock | 2022-01 → 2023-06 | 748 | **+3.3%** |
-| Recent | 2023-07 → 2024-12 | 748 | **+5.7%** |
+| Calm expansion | 2015-01 → 2019-12 | 2564 | -7.8% |
+| COVID | 2020-01 → 2021-06 | 748 | +4.8% |
+| Inflation shock | 2022-01 → 2023-06 | 748 | +3.3% |
+| Recent | 2023-07 → 2024-12 | 748 | +5.7% |
 
-v2 beats Gaussian in **every non-calm window** (3-6% skill gain) but
-loses -7.8% in calm expansion. The overall -1.2% is arithmetic mean
-of these two regimes. v2 is a stress-period specialist, not a
-uniform winner.
+Hypothesis-generating: v2 appears to beat Gaussian in every non-calm
+window. To turn this into evidence, replace post-hoc window naming
+with rule-based segmentation (VIX quantile / NBER dates / rolling
+24m skill curve).
 
-**Phase 3b trajectory**:
+**Phase 3b trajectory (reproducible, fixed seed)**:
   Stage A baseline:       -2.0%
   + α calibration:        -2.0%  (null)
   + γ=0.5 tethering:      -1.8%  (+0.2pp)
-  + kernel variants:      -2.0%  (null; some worse)
-  + BTC parametric:       -1.3%  (+0.7pp)
-  + Bond parametric:      -1.2%  (+0.1pp)
+  + kernel variants:      -2.0%  (null; RBF neutral, Mahal worse)
+  + BTC parametric:       -1.3%  (+0.7pp, real win; BTC -7% → -3%)
+  + Bond parametric:      -1.1%  (+0.2pp, real but modest)
 
-**Key methodological finding**: distance-metric tweaks (α, γ, kernel)
-each give ≤0.3pp improvement. Identifying which assets KAF doesn't
-serve and swapping them out (BTC/Bond → Normal) gives the bulk
-of the improvement.
+**Known limitations (codex round 5)**:
+- **Joint structure broken for BTC/Bond value-level**. Parametric
+  scenarios correlate with macro only at scenario_id weight, not at
+  value. Cross-asset correlation signal (stock-bond, BTC-risk) lost
+  for these assets. Not tested downstream in allocation.
+- CRPS is per-(asset, horizon) marginal — **no joint dependence test**
+  in current evaluation. Stage C would need Energy Score or similar
+  multivariate scoring.
+- Gaussian benchmark (rolling 120m) is strong for monthly log returns;
+  v2's ~-1% to +5% skill should be read in that context.
+- Stress-period breakdown windows are hand-named; do not cite as
+  evidence, only as hypothesis.
 
-**Path forward (not implemented)**:
+**Path forward**:
 - Regime-conditional KAF/Gaussian switching (use Gaussian when
-  global_template probs concentrated, KAF when diffuse)
-- v2 as tail-risk specialist (use for CVaR allocation, Gaussian for
-  return point forecasts)
-- More benchmarks (VAR(1), regime-conditional historical) for
-  absolute assessment vs simple Gaussian
+  global_template probs concentrated, KAF when diffuse) — tests the
+  stress-vs-calm hypothesis within the model itself
+- Energy Score / multivariate CRPS to validate joint scenarios
+- VAR(1) + regime-conditional historical benchmarks for absolute
+  assessment
+- v2 as tail-risk specialist framing (use for CVaR allocation,
+  Gaussian for return point forecasts)
 
-PIT most assets ~0.5 (calibrated). Bonds ~0.40 (left bias).
+PIT: most assets ~0.5 (calibrated). Bonds ~0.40 (left bias persists).
 
 ### Artifacts
 
