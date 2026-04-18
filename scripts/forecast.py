@@ -54,8 +54,10 @@ from sklearn.preprocessing import StandardScaler
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from lib.paths import DATA_DIR, ANALYSIS_DIR  # type: ignore
+from lib.schema import (
+    SCHEMA_VERSION, FEATURE_SET_VERSION, base_meta,
+)  # type: ignore
 
-SCHEMA_VERSION = "v2.1"
 HORIZONS = [1, 3, 6, 12]
 N_SCN = 200
 MIN_ANALOGS = 50
@@ -325,6 +327,7 @@ def _fallback_rolling(
             rows.append({
                 "asof_date": asof,
                 "scenario_id": int(sid),
+                "analog_date": dt,
                 "asset": asset,
                 "horizon": int(h),
                 "log_return": float(v),
@@ -379,6 +382,7 @@ def run(asof: str | None = None) -> dict:
                     scenarios.append({
                         "asof_date": asof_ts,
                         "scenario_id": int(scenario_id),
+                        "analog_date": analog_dt,
                         "asset": asset,
                         "horizon": int(h),
                         "log_return": float(v),
@@ -437,25 +441,28 @@ def run(asof: str | None = None) -> dict:
             print(f"  {r.asset:<14} p10={r.p10:+.3f} p50={r.p50:+.3f} "
                   f"p90={r.p90:+.3f} mean={r.mean:+.3f}")
 
-    meta = {
-        "schema_version": SCHEMA_VERSION,
-        "asof": asof_str,
-        "method": "kaf_baseline" if sel.source == "kaf" else "rolling_fallback",
-        "n_scenarios": int(scn_df["scenario_id"].nunique()) if not scn_df.empty else 0,
-        "n_assets": int(scn_df["asset"].nunique()) if not scn_df.empty else 0,
-        "horizons": HORIZONS,
-        "state_features": STATE_FEATURES,
-        "assets": ASSETS,
-        "built_at": datetime.now().isoformat(timespec="seconds"),
-        "upgrade_path": "diffusion-map kernel + delay embedding + tethering",
-        "regime_filter": {
-            "alpha_global": ALPHA_GLOBAL_REGIME,
-            "beta_asset": BETA_ASSET_REGIME,
-            "enabled": (Path(DATA_DIR) / "v2" / "global_templates.parquet").exists()
-                       and (Path(DATA_DIR) / "v2" / "asset_regime_probs.parquet").exists(),
+    meta = base_meta(
+        layer="forecast",
+        data_asof=asof_str,
+        model_version=f"kaf_baseline_alpha{ALPHA_GLOBAL_REGIME}_beta{BETA_ASSET_REGIME}",
+        extra={
+            "method": "kaf_baseline" if sel.source == "kaf" else "rolling_fallback",
+            "joint_scenario": True,   # contract: same scenario_id → same analog_date
+            "n_scenarios": int(scn_df["scenario_id"].nunique()) if not scn_df.empty else 0,
+            "n_assets": int(scn_df["asset"].nunique()) if not scn_df.empty else 0,
+            "horizons": HORIZONS,
+            "state_features": STATE_FEATURES,
+            "assets": ASSETS,
+            "upgrade_path": "diffusion-map kernel + delay embedding + tethering",
+            "regime_filter": {
+                "alpha_global": ALPHA_GLOBAL_REGIME,
+                "beta_asset": BETA_ASSET_REGIME,
+                "enabled": (Path(DATA_DIR) / "v2" / "global_templates.parquet").exists()
+                           and (Path(DATA_DIR) / "v2" / "asset_regime_probs.parquet").exists(),
+            },
+            "scaler": scaler_meta,
         },
-        "scaler": scaler_meta,
-    }
+    )
     (out_dir / "forecast_meta.json").write_text(json.dumps(meta, indent=2))
     return meta
 

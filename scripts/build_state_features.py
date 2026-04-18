@@ -33,21 +33,22 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from lib.paths import DATA_DIR
 from lib import alfred
+from lib.schema import SCHEMA_VERSION, FEATURE_SET_VERSION, base_meta
 
-SCHEMA_VERSION = "v2.1"
-
-# Vintage-aware features: (series_id, out_name, transform, description)
+# Vintage-aware features: (series_id, out_name, transform, release_lag_days, description)
 # transform:
 #   yoy_pct — (x_t / x_{t-12}) - 1
 #   mom_pct — (x_t / x_{t-1}) - 1  (monthly percent change)
 #   level   — use value directly
+# release_lag_days: typical publication delay after reference month end.
+#   CPI: ~15d; Core CPI: ~15d; IP: ~15d; PAYEMS: ~7d (first release); UNRATE: ~7d
 VINTAGE_SPEC = [
-    ("CPIAUCSL", "cpi_yoy",      "yoy_pct", "Headline CPI YoY (%, ALFRED vintage)"),
-    ("CPILFESL", "core_cpi_yoy", "yoy_pct", "Core CPI YoY (%, ALFRED vintage)"),
-    ("INDPRO",   "ip_yoy",       "yoy_pct", "Industrial Production YoY (%, ALFRED vintage)"),
-    ("PAYEMS",   "payroll_yoy",  "yoy_pct", "Nonfarm Payrolls YoY (%, ALFRED vintage)"),
-    ("PAYEMS",   "payroll_mom",  "mom_pct", "Nonfarm Payrolls MoM (%, ALFRED vintage)"),
-    ("UNRATE",   "unrate",       "level",   "Unemployment Rate (%, ALFRED vintage)"),
+    ("CPIAUCSL", "cpi_yoy",      "yoy_pct", 15, "Headline CPI YoY (%, ALFRED vintage)"),
+    ("CPILFESL", "core_cpi_yoy", "yoy_pct", 15, "Core CPI YoY (%, ALFRED vintage)"),
+    ("INDPRO",   "ip_yoy",       "yoy_pct", 15, "Industrial Production YoY (%, ALFRED vintage)"),
+    ("PAYEMS",   "payroll_yoy",  "yoy_pct",  7, "Nonfarm Payrolls YoY (%, ALFRED vintage)"),
+    ("PAYEMS",   "payroll_mom",  "mom_pct",  7, "Nonfarm Payrolls MoM (%, ALFRED vintage)"),
+    ("UNRATE",   "unrate",       "level",    7, "Unemployment Rate (%, ALFRED vintage)"),
 ]
 BUILT_AT = datetime.now().isoformat(timespec="seconds")
 
@@ -195,7 +196,7 @@ def add_vintage_features(state: pd.DataFrame, catalog: dict) -> None:
     for series_id, *_ in VINTAGE_SPEC:
         alfred.fetch_realtime(series_id)  # ensures cache is hot
 
-    for series_id, out_name, transform, desc in VINTAGE_SPEC:
+    for series_id, out_name, transform, release_lag_days, desc in VINTAGE_SPEC:
         values = np.full(len(asofs), np.nan, dtype="float64")
         latest_obs = [pd.NaT] * len(asofs)
         for i, asof in enumerate(asofs):
@@ -218,6 +219,7 @@ def add_vintage_features(state: pd.DataFrame, catalog: dict) -> None:
             "proxy": False,
             "revision_aware": True,
             "vintage_resolved": True,
+            "release_lag_days": release_lag_days,
             "description": desc,
         }
         non_null = int(np.isfinite(values).sum())
@@ -373,10 +375,11 @@ def main() -> None:
     mask = state.notna()
 
     # Metadata
-    meta = {
-        "schema_version": SCHEMA_VERSION,
-        "built_at": BUILT_AT,
-        "frequency": "monthly_end",
+    meta = base_meta(
+        layer="state_features",
+        data_asof=str(state.index.max().date()) if len(state) else None,
+    )
+    meta.update({
         "index_type": "DatetimeIndex (month-end)",
         "n_rows": len(state),
         "n_features": len(state.columns),
@@ -391,7 +394,7 @@ def main() -> None:
             "Other FRED series (y*, bei_*, *_oas, sofr) are revision_aware=True but vintage_resolved=False: revisions are small for yields/spreads so as-is is acceptable.",
             "'proxy' flags series using continuous futures or composite proxies vs professional indices.",
         ],
-    }
+    })
 
     state.to_parquet(OUT_STATE)
     mask.to_parquet(OUT_MASK)

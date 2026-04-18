@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
 """
 v2 pipeline orchestrator. Calls each layer in order; each layer is end-to-end
-runnable on its own. Stubs (regime, forecast) return placeholder outputs so
-downstream (allocation) can be wired before those layers are real.
+runnable on its own.
+
+Layers (all real after Stage A completion):
+  mask             — asset-aware MI feature mask
+  global_template  — K-Means macro regimes (K=4)
+  asset_regime     — per-asset GMM regimes (K=3)
+  template_map     — joint (global × asset) conditional distribution
+  forecast         — KAF baseline with regime-conditional analog filter
+  allocation       — MV + SP-CVaR on joint scenarios
 
 Layer contract (Layer ABC):
   name: str
@@ -11,7 +18,7 @@ Layer contract (Layer ABC):
   run(asof) -> dict  # metadata summary
 
 Usage:
-  uv run python scripts/v2_pipeline.py                # run all phases
+  uv run python scripts/v2_pipeline.py                # run all layers
   uv run python scripts/v2_pipeline.py --only mask    # single layer
 """
 from __future__ import annotations

@@ -40,8 +40,7 @@ from scipy.optimize import minimize
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from lib.paths import DATA_DIR, ANALYSIS_DIR  # type: ignore
-
-SCHEMA_VERSION = "v2.1"
+from lib.schema import SCHEMA_VERSION, base_meta  # type: ignore
 RISK_AVERSION = 2.5
 CVAR_ALPHA = 0.05
 MAX_WEIGHT = 0.50
@@ -297,21 +296,24 @@ def run(asof: str | None = None) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
     weights_df.to_parquet(out_dir / "weights_v2.parquet", index=False)
 
-    meta = {
-        "schema_version": SCHEMA_VERSION,
-        "asof": asof_ts.strftime("%Y-%m-%d"),
-        "bl_horizon_m": BL_HORIZON_M,
-        "cvar_horizon_m": CVAR_HORIZON_M,
-        "cvar_alpha": CVAR_ALPHA,
-        "max_weight": MAX_WEIGHT,
-        "risk_aversion": RISK_AVERSION,
-        "bl_weights": {labels12[i]: float(bl_w[i]) for i in range(len(labels12))},
-        "cvar_weights": {labels6[i]: float(cvar_w[i]) for i in range(len(labels6))},
-        "bl_portfolio_vol": bl_vol,
-        "cvar_expected_return": cvar_exp,
-        "cvar_realized_cvar": cvar_realized,
-        "built_at": datetime.now().isoformat(timespec="seconds"),
-    }
+    meta = base_meta(
+        layer="allocation",
+        data_asof=asof_ts.strftime("%Y-%m-%d"),
+        model_version=f"mv_bl_d{RISK_AVERSION}_h{BL_HORIZON_M}m+cvar_a{CVAR_ALPHA}_h{CVAR_HORIZON_M}m_cap{int(MAX_WEIGHT*100)}",
+        extra={
+            "bl_horizon_m": BL_HORIZON_M,
+            "cvar_horizon_m": CVAR_HORIZON_M,
+            "cvar_alpha": CVAR_ALPHA,
+            "max_weight": MAX_WEIGHT,
+            "risk_aversion": RISK_AVERSION,
+            "bl_weights": {labels12[i]: float(bl_w[i]) for i in range(len(labels12))},
+            "cvar_weights": {labels6[i]: float(cvar_w[i]) for i in range(len(labels6))},
+            "bl_portfolio_vol": bl_vol,
+            "cvar_expected_return": cvar_exp,
+            "cvar_realized_cvar": cvar_realized,
+            "universe": [lbl for lbl, _ in V1_UNIVERSE],
+        },
+    )
     (out_dir / "allocation_v2_meta.json").write_text(json.dumps(meta, indent=2))
 
     # Doc with v1 comparison if available

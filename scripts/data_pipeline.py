@@ -17,7 +17,8 @@ from lib.paths import DATA_DIR
 # 各序列自身起点不同（e.g. HY OAS 1996 起、BTC 2014 起），靠 availability_mask 记录
 START = "1990-01-01"
 END = datetime.now().strftime("%Y-%m-%d")
-SCHEMA_VERSION = "v2.1"  # freeze point (post codex review)
+# Schema version is canonical in lib/schema.py; this script predates the
+# v2 pipeline so just emits CSV + column_descriptions.json — no meta block.
 
 # ── 1. Asset Prices via yfinance ────────────────────────
 import yfinance as yf
