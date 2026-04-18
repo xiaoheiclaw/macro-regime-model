@@ -89,21 +89,21 @@ def _run_forecast_at(
     asof_str: str,
     expanding_regimes: bool,
     alpha: float | None = None,
+    gamma: float | None = None,
     skip_regime_refit: bool = False,
 ) -> bool:
     """
     Emit forecast at asof. Refits regime layers if needed.
     skip_regime_refit: used when we've already refit at this asof in a prior
-    alpha-grid iteration (regime layers don't depend on α).
+    alpha/gamma-grid iteration (regime layers don't depend on α or γ).
     """
     import forecast, template_map
     try:
         if expanding_regimes and not skip_regime_refit:
             _refit_regime_layers(asof_str)
         elif not expanding_regimes:
-            # template_map still needs current-asof for the joint query
             template_map.run(asof=asof_str)
-        forecast.run(asof=asof_str, alpha=alpha)
+        forecast.run(asof=asof_str, alpha=alpha, gamma=gamma)
         return True
     except SystemExit as e:
         print(f"  skip {asof_str}: {e}")
@@ -124,40 +124,47 @@ def main() -> None:
     ap.add_argument("--alphas", type=str, default=None,
                     help="comma-separated alpha values to grid-search "
                          "(default: single forecast with forecast.ALPHA_REGIME_DEFAULT)")
+    ap.add_argument("--gammas", type=str, default=None,
+                    help="comma-separated gamma (tether weight) values to grid-search")
     args = ap.parse_args()
 
     state = pd.read_parquet(Path(DATA_DIR) / "state_features.parquet")
     asofs = pd.date_range(args.start, args.end, freq=f"{args.step}ME")
     print(f"Backtest: {len(asofs)} asof steps, {args.start} → {args.end}")
 
-    alpha_grid = None
-    if args.alphas:
-        alpha_grid = [float(x) for x in args.alphas.split(",")]
+    alpha_grid = [float(x) for x in args.alphas.split(",")] if args.alphas else None
+    gamma_grid = [float(x) for x in args.gammas.split(",")] if args.gammas else None
+    if alpha_grid:
         print(f"α grid: {alpha_grid}")
+    if gamma_grid:
+        print(f"γ grid: {gamma_grid}")
 
     t0 = time.time()
     rows: list[dict] = []
     expanding = not args.no_expanding_regimes
+    alphas_to_run = alpha_grid if alpha_grid is not None else [None]
+    gammas_to_run = gamma_grid if gamma_grid is not None else [None]
+
     for i, asof in enumerate(asofs, 1):
         asof_str = asof.strftime("%Y-%m-%d")
         elapsed = time.time() - t0
         eta = elapsed / i * (len(asofs) - i) if i > 0 else 0
         print(f"[{i}/{len(asofs)}] {asof_str} (elapsed {elapsed:.0f}s, ETA {eta:.0f}s)")
 
-        # Regime layers don't depend on α — refit once per asof, then iterate α
         if expanding:
             _refit_regime_layers(asof_str)
         else:
             import template_map
             template_map.run(asof=asof_str)
 
-        alphas_to_run = alpha_grid if alpha_grid is not None else [None]
         for alpha in alphas_to_run:
+          for gamma in gammas_to_run:
             if not _run_forecast_at(
                 asof_str,
                 expanding_regimes=expanding,
                 alpha=alpha,
-                skip_regime_refit=True,  # already refit above
+                gamma=gamma,
+                skip_regime_refit=True,
             ):
                 continue
 
@@ -166,6 +173,7 @@ def main() -> None:
                 continue
 
             alpha_val = float(alpha) if alpha is not None else float("nan")
+            gamma_val = float(gamma) if gamma is not None else float("nan")
             for (asset, h), grp in scn.groupby(["asset", "horizon"]):
                 samples = grp["log_return"].values
                 weights = grp["weight"].values
@@ -185,6 +193,7 @@ def main() -> None:
                 rows.append({
                     "asof": asof,
                     "alpha": alpha_val,
+                    "gamma": gamma_val,
                     "asset": asset,
                     "horizon": int(h),
                     "realized": realized,
@@ -323,11 +332,14 @@ def main() -> None:
     print()
     print(summary.to_string())
     print()
-    if has_alpha:
-        print("\nα sweep overall skill:")
-        for alpha_val, sub in df.groupby("alpha"):
+    has_gamma = df["gamma"].notna().any() and gamma_grid is not None
+    grp_cols = [c for c in ["alpha", "gamma"] if (c == "alpha" and has_alpha) or (c == "gamma" and has_gamma)]
+    if grp_cols:
+        print(f"\n{'+'.join(grp_cols)} sweep overall skill:")
+        for key, sub in df.groupby(grp_cols):
             s = 1.0 - sub["crps_v2"].mean() / sub["crps_bench"].mean()
-            print(f"  α={alpha_val}: skill {s:+.1%}")
+            label = ", ".join(f"{c}={k}" for c, k in zip(grp_cols, key if isinstance(key, tuple) else (key,)))
+            print(f"  {label}: skill {s:+.1%}")
     else:
         s = 1.0 - df["crps_v2"].mean() / df["crps_bench"].mean()
         print(f"Overall skill: {s:+.1%} | "

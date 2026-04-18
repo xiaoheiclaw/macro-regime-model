@@ -71,12 +71,16 @@ MIN_ANALOGS = 50
 ROLLING_FALLBACK_WINDOW = 120
 
 # Regime-conditional analog filtering (Phase 3 closure per codex Critical #1).
-# Combined distance: d = d_state + ALPHA_REGIME * d_joint_regime
-# where d_joint_regime is the mean-over-assets Frobenius distance between the
-# current per-asset (K_g × K_a) joint matrix (from template_asset_joint_current)
-# and each candidate's independence-product joint.
-# ALPHA calibrated in Phase 3b.0 against CRPS skill vs Gaussian benchmark.
+# Combined distance: d = d_state + α·d_joint_regime + γ·d_trajectory
+# where d_joint_regime is the per-asset Frobenius distance on joint matrices,
+# and d_trajectory (Phase 3b.1) is a weighted-lag state distance over past
+# TETHER_LENGTH months (emphasizes recent months). d_trajectory disambiguates
+# analogs whose current state looks similar but got there via different paths.
 ALPHA_REGIME_DEFAULT = 3.0
+GAMMA_TETHER_DEFAULT = 0.5   # Phase 3b.1 backtest optimum (+0.2pp vs γ=0)
+TETHER_LENGTH = 24   # months of past trajectory considered
+TETHER_WEIGHTS = np.array([1.0 / (k + 1) for k in range(TETHER_LENGTH)])  # 1, 1/2, ..., 1/24
+TETHER_WEIGHTS = TETHER_WEIGHTS / TETHER_WEIGHTS.sum()
 
 # State (what defines the analog — levels/spreads/macro)
 STATE_FEATURES = [
@@ -274,6 +278,38 @@ def _build_state_matrix(
     return s, standardized, meta
 
 
+def _trajectory_distance(
+    asof_idx: int,
+    cand_idx: np.ndarray,
+    X: np.ndarray,
+    tether_len: int = TETHER_LENGTH,
+) -> np.ndarray:
+    """
+    Weighted-lag state distance: for each candidate, sum weighted Euclidean
+    distances over past tether_len months. Candidates with fewer than
+    tether_len months of prior history get a fill value (max observed
+    trajectory distance) to avoid unfair advantage.
+    """
+    n_cand = len(cand_idx)
+    d_traj = np.full(n_cand, np.nan, dtype="float64")
+    q_block_start = asof_idx - tether_len + 1
+    if q_block_start < 0:
+        return np.zeros(n_cand)   # degenerate early in panel
+    q_block = X[q_block_start: asof_idx + 1]   # shape (tether_len, F)
+    for i, ci in enumerate(cand_idx):
+        c_start = ci - tether_len + 1
+        if c_start < 0:
+            continue  # skip — will be filled below
+        c_block = X[c_start: ci + 1]
+        per_lag = np.linalg.norm(c_block - q_block, axis=1)   # (tether_len,)
+        d_traj[i] = float(np.dot(TETHER_WEIGHTS, per_lag))
+    # Fill candidates with insufficient history using max observed
+    if np.isnan(d_traj).any():
+        fill = np.nanmax(d_traj) if np.isfinite(np.nanmax(d_traj)) else 0.0
+        d_traj = np.where(np.isnan(d_traj), fill, d_traj)
+    return d_traj
+
+
 def _select_analogs(
     asof: pd.Timestamp,
     state_subset: pd.DataFrame,
@@ -281,6 +317,7 @@ def _select_analogs(
     h_max: int,
     n_scn: int,
     alpha: float = ALPHA_REGIME_DEFAULT,
+    gamma: float = GAMMA_TETHER_DEFAULT,
 ) -> AnalogSelection:
     """
     Pick N nearest analogs with complete H-month forward history.
@@ -323,7 +360,11 @@ def _select_analogs(
     global_probs, asset_probs, joint_current = _load_regime_artifacts()
     d_regime_raw = _joint_regime_distance(asof, cand_dates, global_probs, asset_probs, joint_current)
     d_regime = alpha * d_regime_raw
-    d_combined = d_state + d_regime
+
+    d_traj_raw = _trajectory_distance(query_idx, cand_idx, X)
+    d_traj = gamma * d_traj_raw
+
+    d_combined = d_state + d_regime + d_traj
 
     top_n = min(n_scn, len(cand_idx))
     top_ranks = np.argsort(d_combined)[:top_n]
@@ -410,7 +451,11 @@ def _fallback_rolling(
     return rows
 
 
-def run(asof: str | None = None, alpha: float | None = None) -> dict:
+def run(
+    asof: str | None = None,
+    alpha: float | None = None,
+    gamma: float | None = None,
+) -> dict:
     state_path = Path(DATA_DIR) / "state_features.parquet"
     if not state_path.exists():
         sys.exit(f"missing {state_path}")
@@ -430,7 +475,12 @@ def run(asof: str | None = None, alpha: float | None = None) -> dict:
 
     h_max = max(HORIZONS)
     alpha_eff = alpha if alpha is not None else ALPHA_REGIME_DEFAULT
-    sel = _select_analogs(asof_ts, state_subset, X, h_max=h_max, n_scn=N_SCN, alpha=alpha_eff)
+    gamma_eff = gamma if gamma is not None else GAMMA_TETHER_DEFAULT
+    sel = _select_analogs(
+        asof_ts, state_subset, X,
+        h_max=h_max, n_scn=N_SCN,
+        alpha=alpha_eff, gamma=gamma_eff,
+    )
     print(f"Analog selection: {sel.source} | n={len(sel.dates)}")
 
     scenarios: list[dict] = []
@@ -513,7 +563,7 @@ def run(asof: str | None = None, alpha: float | None = None) -> dict:
     meta = base_meta(
         layer="forecast",
         data_asof=asof_str,
-        model_version=f"kaf_baseline_alpha{alpha_eff}_jointFrob",
+        model_version=f"kaf_alpha{alpha_eff}_gamma{gamma_eff}_jointFrob_tether{TETHER_LENGTH}",
         extra={
             "method": "kaf_baseline" if sel.source == "kaf" else "rolling_fallback",
             "joint_scenario": True,   # contract: same scenario_id → same analog_date
@@ -525,6 +575,8 @@ def run(asof: str | None = None, alpha: float | None = None) -> dict:
             "upgrade_path": "diffusion-map kernel + delay embedding + tethering",
             "regime_filter": {
                 "alpha_regime": alpha_eff,
+                "gamma_tether": gamma_eff,
+                "tether_length_months": TETHER_LENGTH,
                 "distance": "frobenius_on_per_asset_joint_(g,r)",
                 "query_joint_source": "template_asset_joint_current.parquet",
                 "enabled": (Path(DATA_DIR) / "v2" / "global_templates.parquet").exists()
