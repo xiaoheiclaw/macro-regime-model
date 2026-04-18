@@ -75,10 +75,8 @@ ROLLING_FALLBACK_WINDOW = 120
 # where d_joint_regime is the mean-over-assets Frobenius distance between the
 # current per-asset (K_g × K_a) joint matrix (from template_asset_joint_current)
 # and each candidate's independence-product joint.
-# ALPHA tuned so regime term is ~20% of d_state at typical magnitudes
-# (d_state ~ 5-7; Frobenius on independence-product simplex ~ 0.5-1.2). Stage B
-# should calibrate against CRPS sensitivity.
-ALPHA_REGIME = 3.0
+# ALPHA calibrated in Phase 3b.0 against CRPS skill vs Gaussian benchmark.
+ALPHA_REGIME_DEFAULT = 3.0
 
 # State (what defines the analog — levels/spreads/macro)
 STATE_FEATURES = [
@@ -282,6 +280,7 @@ def _select_analogs(
     X: np.ndarray,
     h_max: int,
     n_scn: int,
+    alpha: float = ALPHA_REGIME_DEFAULT,
 ) -> AnalogSelection:
     """
     Pick N nearest analogs with complete H-month forward history.
@@ -323,7 +322,7 @@ def _select_analogs(
     # This explicitly consumes Phase 2c output (template_asset_joint_current).
     global_probs, asset_probs, joint_current = _load_regime_artifacts()
     d_regime_raw = _joint_regime_distance(asof, cand_dates, global_probs, asset_probs, joint_current)
-    d_regime = ALPHA_REGIME * d_regime_raw
+    d_regime = alpha * d_regime_raw
     d_combined = d_state + d_regime
 
     top_n = min(n_scn, len(cand_idx))
@@ -411,7 +410,7 @@ def _fallback_rolling(
     return rows
 
 
-def run(asof: str | None = None) -> dict:
+def run(asof: str | None = None, alpha: float | None = None) -> dict:
     state_path = Path(DATA_DIR) / "state_features.parquet"
     if not state_path.exists():
         sys.exit(f"missing {state_path}")
@@ -430,7 +429,8 @@ def run(asof: str | None = None) -> dict:
     state_subset, X, scaler_meta = _build_state_matrix(state, asof_ts)
 
     h_max = max(HORIZONS)
-    sel = _select_analogs(asof_ts, state_subset, X, h_max=h_max, n_scn=N_SCN)
+    alpha_eff = alpha if alpha is not None else ALPHA_REGIME_DEFAULT
+    sel = _select_analogs(asof_ts, state_subset, X, h_max=h_max, n_scn=N_SCN, alpha=alpha_eff)
     print(f"Analog selection: {sel.source} | n={len(sel.dates)}")
 
     scenarios: list[dict] = []
@@ -496,7 +496,7 @@ def run(asof: str | None = None) -> dict:
     # Doc
     doc_path = Path(ANALYSIS_DIR) / "v2" / f"forecast_{asof_str}.md"
     doc_path.parent.mkdir(parents=True, exist_ok=True)
-    doc_path.write_text(_render_doc(sel, scn_df, sum_df, asof_str))
+    doc_path.write_text(_render_doc(sel, scn_df, sum_df, asof_str, alpha=alpha_eff))
 
     print(f"\n✓ scenarios → {out_dir / 'forecast_scenarios.parquet'}  ({len(scn_df)} rows)")
     print(f"✓ summary   → {out_dir / 'forecast_summary.parquet'}  ({len(sum_df)} rows)")
@@ -513,7 +513,7 @@ def run(asof: str | None = None) -> dict:
     meta = base_meta(
         layer="forecast",
         data_asof=asof_str,
-        model_version=f"kaf_baseline_alpha{ALPHA_REGIME}_jointFrob",
+        model_version=f"kaf_baseline_alpha{alpha_eff}_jointFrob",
         extra={
             "method": "kaf_baseline" if sel.source == "kaf" else "rolling_fallback",
             "joint_scenario": True,   # contract: same scenario_id → same analog_date
@@ -524,7 +524,7 @@ def run(asof: str | None = None) -> dict:
             "assets": ASSETS,
             "upgrade_path": "diffusion-map kernel + delay embedding + tethering",
             "regime_filter": {
-                "alpha_regime": ALPHA_REGIME,
+                "alpha_regime": alpha_eff,
                 "distance": "frobenius_on_per_asset_joint_(g,r)",
                 "query_joint_source": "template_asset_joint_current.parquet",
                 "enabled": (Path(DATA_DIR) / "v2" / "global_templates.parquet").exists()
@@ -543,6 +543,7 @@ def _render_doc(
     scn_df: pd.DataFrame,
     sum_df: pd.DataFrame,
     asof: str,
+    alpha: float = ALPHA_REGIME_DEFAULT,
 ) -> str:
     lines = [
         f"# KAF Forecast — {asof}",
@@ -551,7 +552,7 @@ def _render_doc(
         f"n_scenarios: {scn_df['scenario_id'].nunique() if not scn_df.empty else 0}",
         "",
         "> **Baseline**: combined state + joint-regime Frobenius distance "
-        f"(α={ALPHA_REGIME}), softmax weighting, joint scenarios (same "
+        f"(α={alpha}), softmax weighting, joint scenarios (same "
         "scenario_id = same historical analog month). Query-time joint "
         "comes from template_asset_joint_current (Phase 2c output).",
         "",

@@ -78,23 +78,32 @@ def _gaussian_benchmark(
     return mu, sigma
 
 
-def _run_forecast_at(asof_str: str, expanding_regimes: bool) -> bool:
+def _refit_regime_layers(asof_str: str) -> None:
+    import global_template, asset_regime, template_map
+    global_template.run(asof=asof_str)
+    asset_regime.run(asof=asof_str)
+    template_map.run(asof=asof_str)
+
+
+def _run_forecast_at(
+    asof_str: str,
+    expanding_regimes: bool,
+    alpha: float | None = None,
+    skip_regime_refit: bool = False,
+) -> bool:
     """
-    Refit downstream layers at asof and emit forecast. When
-    expanding_regimes=True (default, Stage B.1 rigor), global_template and
-    asset_regime are refit on data ≤ asof; this removes the main leakage
-    from using regime models fit on the full history. Costlier per asof.
+    Emit forecast at asof. Refits regime layers if needed.
+    skip_regime_refit: used when we've already refit at this asof in a prior
+    alpha-grid iteration (regime layers don't depend on α).
     """
-    import template_map
-    import forecast
+    import forecast, template_map
     try:
-        if expanding_regimes:
-            import global_template
-            import asset_regime
-            global_template.run(asof=asof_str)
-            asset_regime.run(asof=asof_str)
-        template_map.run(asof=asof_str)
-        forecast.run(asof=asof_str)
+        if expanding_regimes and not skip_regime_refit:
+            _refit_regime_layers(asof_str)
+        elif not expanding_regimes:
+            # template_map still needs current-asof for the joint query
+            template_map.run(asof=asof_str)
+        forecast.run(asof=asof_str, alpha=alpha)
         return True
     except SystemExit as e:
         print(f"  skip {asof_str}: {e}")
@@ -112,54 +121,79 @@ def main() -> None:
     ap.add_argument("--no-expanding-regimes", action="store_true",
                     help="skip global_template + asset_regime refit per asof "
                          "(faster, but leaks regime training on full history)")
+    ap.add_argument("--alphas", type=str, default=None,
+                    help="comma-separated alpha values to grid-search "
+                         "(default: single forecast with forecast.ALPHA_REGIME_DEFAULT)")
     args = ap.parse_args()
 
     state = pd.read_parquet(Path(DATA_DIR) / "state_features.parquet")
     asofs = pd.date_range(args.start, args.end, freq=f"{args.step}ME")
     print(f"Backtest: {len(asofs)} asof steps, {args.start} → {args.end}")
 
+    alpha_grid = None
+    if args.alphas:
+        alpha_grid = [float(x) for x in args.alphas.split(",")]
+        print(f"α grid: {alpha_grid}")
+
     t0 = time.time()
     rows: list[dict] = []
+    expanding = not args.no_expanding_regimes
     for i, asof in enumerate(asofs, 1):
         asof_str = asof.strftime("%Y-%m-%d")
         elapsed = time.time() - t0
         eta = elapsed / i * (len(asofs) - i) if i > 0 else 0
         print(f"[{i}/{len(asofs)}] {asof_str} (elapsed {elapsed:.0f}s, ETA {eta:.0f}s)")
 
-        if not _run_forecast_at(asof_str, expanding_regimes=not args.no_expanding_regimes):
-            continue
+        # Regime layers don't depend on α — refit once per asof, then iterate α
+        if expanding:
+            _refit_regime_layers(asof_str)
+        else:
+            import template_map
+            template_map.run(asof=asof_str)
 
-        scn = pd.read_parquet(SCENARIOS_PATH)
-        if scn.empty:
-            continue
-
-        for (asset, h), grp in scn.groupby(["asset", "horizon"]):
-            samples = grp["log_return"].values
-            weights = grp["weight"].values
-            realized = _realized(state, asset, asof, int(h))
-            if realized is None:
+        alphas_to_run = alpha_grid if alpha_grid is not None else [None]
+        for alpha in alphas_to_run:
+            if not _run_forecast_at(
+                asof_str,
+                expanding_regimes=expanding,
+                alpha=alpha,
+                skip_regime_refit=True,  # already refit above
+            ):
                 continue
-            crps_v2 = crps_sample(samples, realized, weights)
-            pit_v2 = pit_sample(samples, realized, weights)
 
-            bench_mu, bench_sigma = _gaussian_benchmark(state, asset, asof, int(h))
-            if bench_mu is None:
-                crps_bench, pit_bench = float("nan"), float("nan")
-            else:
-                crps_bench = crps_normal(bench_mu, bench_sigma, realized)
-                pit_bench = pit_normal(bench_mu, bench_sigma, realized)
+            scn = pd.read_parquet(SCENARIOS_PATH)
+            if scn.empty:
+                continue
 
-            rows.append({
-                "asof": asof,
-                "asset": asset,
-                "horizon": int(h),
-                "realized": realized,
-                "crps_v2": crps_v2,
-                "crps_bench": crps_bench,
-                "pit_v2": pit_v2,
-                "pit_bench": pit_bench,
-                "n_scn": len(samples),
-            })
+            alpha_val = float(alpha) if alpha is not None else float("nan")
+            for (asset, h), grp in scn.groupby(["asset", "horizon"]):
+                samples = grp["log_return"].values
+                weights = grp["weight"].values
+                realized = _realized(state, asset, asof, int(h))
+                if realized is None:
+                    continue
+                crps_v2 = crps_sample(samples, realized, weights)
+                pit_v2 = pit_sample(samples, realized, weights)
+
+                bench_mu, bench_sigma = _gaussian_benchmark(state, asset, asof, int(h))
+                if bench_mu is None:
+                    crps_bench, pit_bench = float("nan"), float("nan")
+                else:
+                    crps_bench = crps_normal(bench_mu, bench_sigma, realized)
+                    pit_bench = pit_normal(bench_mu, bench_sigma, realized)
+
+                rows.append({
+                    "asof": asof,
+                    "alpha": alpha_val,
+                    "asset": asset,
+                    "horizon": int(h),
+                    "realized": realized,
+                    "crps_v2": crps_v2,
+                    "crps_bench": crps_bench,
+                    "pit_v2": pit_v2,
+                    "pit_bench": pit_bench,
+                    "n_scn": len(samples),
+                })
 
     if not rows:
         sys.exit("no rows collected — check asof range and data")
@@ -197,8 +231,10 @@ def main() -> None:
     meta_path = out_dir / f"backtest_meta_{tag}.json"
     meta_path.write_text(json.dumps(meta, indent=2, default=str))
 
-    # Summary
-    summary = df.groupby(["asset", "horizon"]).agg(
+    # Summary grouped by (α, asset, horizon) if α grid was run; else (asset, horizon)
+    has_alpha = df["alpha"].notna().any() and alpha_grid is not None
+    group_keys = ["alpha", "asset", "horizon"] if has_alpha else ["asset", "horizon"]
+    summary = df.groupby(group_keys).agg(
         n=("crps_v2", "count"),
         crps_v2_mean=("crps_v2", "mean"),
         crps_bench_mean=("crps_bench", "mean"),
@@ -210,40 +246,70 @@ def main() -> None:
 
     # Render markdown
     lines = [
-        f"# Stage B.0 Backtest — {args.start} → {args.end}",
+        f"# Stage B Backtest — {args.start} → {args.end}",
         "",
-        f"schema_version: v2.1 · n_asofs={df['asof'].nunique()} · n_rows={len(df)}",
+        f"schema_version: v2.1 · n_asofs={df['asof'].nunique()} · n_rows={len(df)}"
+        + (f" · α grid: {alpha_grid}" if has_alpha else ""),
         "",
         "Benchmark: Gaussian Normal(μ, σ·√h) with (μ, σ) from rolling "
         f"{ROLLING_WINDOW}-month window of asset monthly log returns.",
         "",
         "Skill = 1 − CRPS_v2 / CRPS_bench (positive ⇒ v2 beats Gaussian).",
         "",
-        "## CRPS by (asset, horizon)",
-        "",
-        "| asset | h | n | CRPS v2 | CRPS bench | skill | PIT v2 | PIT bench |",
-        "|---|---|---|---|---|---|---|---|",
     ]
-    for (asset, h), r in summary.iterrows():
-        skill_str = f"{r['skill']:+.1%}" if np.isfinite(r["skill"]) else "—"
-        lines.append(
-            f"| {asset} | {h}m | {int(r['n'])} | {r['crps_v2_mean']:.4f} | "
-            f"{r['crps_bench_mean']:.4f} | {skill_str} | "
-            f"{r['pit_v2_mean']:.3f} | {r['pit_bench_mean']:.3f} |"
-        )
-    lines.append("")
+    if has_alpha:
+        lines.append("## CRPS by (α, asset, horizon) — optimal α per (asset, h)")
+        lines.append("")
+        lines.append("| asset | h | best α | skill@best | skill@α=3.0 | PIT v2 @best |")
+        lines.append("|---|---|---|---|---|---|")
+        # For each (asset, h), find α that maximizes skill
+        for (asset, h), sub in df.groupby(["asset", "horizon"]):
+            per_alpha = sub.groupby("alpha").agg(
+                crps_v2=("crps_v2", "mean"),
+                crps_bench=("crps_bench", "mean"),
+                pit=("pit_v2", "mean"),
+            )
+            per_alpha["skill"] = 1.0 - per_alpha["crps_v2"] / per_alpha["crps_bench"]
+            best_alpha = per_alpha["skill"].idxmax()
+            best = per_alpha.loc[best_alpha]
+            alpha3 = per_alpha.loc[3.0] if 3.0 in per_alpha.index else None
+            skill3 = f"{alpha3['skill']:+.1%}" if alpha3 is not None else "—"
+            lines.append(
+                f"| {asset} | {h}m | **{best_alpha:.1f}** | {best['skill']:+.1%} | "
+                f"{skill3} | {best['pit']:.3f} |"
+            )
+        lines.append("")
+    else:
+        lines.append("## CRPS by (asset, horizon)")
+        lines.append("")
+        lines.append("| asset | h | n | CRPS v2 | CRPS bench | skill | PIT v2 | PIT bench |")
+        lines.append("|---|---|---|---|---|---|---|---|")
+        for idx, r in summary.iterrows():
+            asset, h = idx  # (asset, horizon) only
+            skill_str = f"{r['skill']:+.1%}" if np.isfinite(r["skill"]) else "—"
+            lines.append(
+                f"| {asset} | {h}m | {int(r['n'])} | {r['crps_v2_mean']:.4f} | "
+                f"{r['crps_bench_mean']:.4f} | {skill_str} | "
+                f"{r['pit_v2_mean']:.3f} | {r['pit_bench_mean']:.3f} |"
+            )
+        lines.append("")
     lines.append("## Headline averages")
     lines.append("")
-    overall = df.agg(
-        crps_v2_mean=("crps_v2", "mean"),
-        crps_bench_mean=("crps_bench", "mean"),
-    )
-    overall_skill = 1.0 - df["crps_v2"].mean() / df["crps_bench"].mean() \
-        if df["crps_bench"].mean() > 0 else float("nan")
-    lines.append(f"- Mean CRPS v2: **{df['crps_v2'].mean():.4f}**")
-    lines.append(f"- Mean CRPS bench: {df['crps_bench'].mean():.4f}")
-    lines.append(f"- Overall skill: **{overall_skill:+.1%}**")
-    lines.append(f"- PIT v2 mean: {df['pit_v2'].mean():.3f} (uniform target 0.5)")
+    if has_alpha:
+        for alpha_val, sub in df.groupby("alpha"):
+            skill = 1.0 - sub["crps_v2"].mean() / sub["crps_bench"].mean() \
+                if sub["crps_bench"].mean() > 0 else float("nan")
+            lines.append(
+                f"- α={alpha_val}: mean CRPS v2 {sub['crps_v2'].mean():.4f} "
+                f"vs bench {sub['crps_bench'].mean():.4f} → skill **{skill:+.1%}**"
+            )
+    else:
+        overall_skill = 1.0 - df["crps_v2"].mean() / df["crps_bench"].mean() \
+            if df["crps_bench"].mean() > 0 else float("nan")
+        lines.append(f"- Mean CRPS v2: **{df['crps_v2'].mean():.4f}**")
+        lines.append(f"- Mean CRPS bench: {df['crps_bench'].mean():.4f}")
+        lines.append(f"- Overall skill: **{overall_skill:+.1%}**")
+        lines.append(f"- PIT v2 mean: {df['pit_v2'].mean():.3f} (uniform target 0.5)")
     lines.append("")
 
     doc_dir = Path(ANALYSIS_DIR) / "v2"
@@ -257,8 +323,15 @@ def main() -> None:
     print()
     print(summary.to_string())
     print()
-    print(f"Overall skill: {overall_skill:+.1%} | "
-          f"mean CRPS v2={df['crps_v2'].mean():.4f} vs bench {df['crps_bench'].mean():.4f}")
+    if has_alpha:
+        print("\nα sweep overall skill:")
+        for alpha_val, sub in df.groupby("alpha"):
+            s = 1.0 - sub["crps_v2"].mean() / sub["crps_bench"].mean()
+            print(f"  α={alpha_val}: skill {s:+.1%}")
+    else:
+        s = 1.0 - df["crps_v2"].mean() / df["crps_bench"].mean()
+        print(f"Overall skill: {s:+.1%} | "
+              f"mean CRPS v2={df['crps_v2'].mean():.4f} vs bench {df['crps_bench'].mean():.4f}")
 
 
 if __name__ == "__main__":
