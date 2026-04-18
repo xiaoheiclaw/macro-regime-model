@@ -117,10 +117,20 @@ def _load_regime_artifacts() -> tuple[pd.DataFrame, dict[str, pd.DataFrame], pd.
     """
     Returns (global_probs_by_date, {asset: asset_probs_by_date}, joint_current).
 
-    - global_probs, asset_probs: time-series of regime probabilities
-    - joint_current: the template_map.py output at latest asof, long format
-      (asset, global_template_id, asset_regime_id, prob_joint) — used as the
-      query-time joint distribution. This is how forecast consumes Phase 2c.
+    - global_probs, asset_probs: full regime probability time-series
+    - joint_current: per-asset (g × r) joint produced by the most recent
+      template_map.run(asof=...), long format with asof column. At pipeline
+      time this reflects the current query's asof (not necessarily latest
+      in the panel). Used as the query-time Q[a] when asof matches any
+      asset's asof row; else _joint_regime_distance falls back to
+      independence product at query_date.
+
+    Note: if assets have different history lengths, build_current_joint may
+    emit different per-asset asof values; _joint_regime_distance currently
+    matches only the subset whose asof equals the query, and does not do
+    per-asset fallback for earlier-asof assets. Acceptable while our asset
+    histories are roughly aligned (all start ≤ 1990 or via bond_ret
+    synthesis); revisit if short-history assets matter for regime distance.
 
     Missing inputs → empty returns; caller falls back gracefully.
     """
