@@ -142,59 +142,30 @@ class TemplateMapLayer(Layer):
         return {"layer": self.name, **meta}
 
 
-# ── Phase 3: forecast (stub) ─────────────────────────────
+# ── Phase 3: forecast (KAF baseline) ─────────────────────
 class ForecastLayer(Layer):
-    """Stub: emits empty scenario table with correct schema."""
     name = "forecast"
 
     @property
     def inputs(self) -> list[Path]:
         return [
             Path(DATA_DIR) / "state_features.parquet",
-            Path(DATA_DIR) / "v2" / "global_templates.parquet",
-            Path(DATA_DIR) / "v2" / "asset_regime_probs.parquet",
+            Path(DATA_DIR) / "v2" / "global_template_centroids.npz",
         ]
 
     @property
     def outputs(self) -> list[Path]:
+        out = Path(DATA_DIR) / "v2"
         return [
-            Path(DATA_DIR) / "v2" / "forecast_scenarios.parquet",
-            Path(DATA_DIR) / "v2" / "forecast_summary.parquet",
+            out / "forecast_scenarios.parquet",
+            out / "forecast_summary.parquet",
+            out / "forecast_meta.json",
         ]
 
     def run(self, asof: str | None = None) -> dict:
-        out_dir = Path(DATA_DIR) / "v2"
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        # Empty scenarios with canonical schema
-        scn_schema = pd.DataFrame({
-            "asof_date": pd.Series(dtype="datetime64[ns]"),
-            "scenario_id": pd.Series(dtype="int64"),
-            "asset": pd.Series(dtype="object"),
-            "horizon": pd.Series(dtype="int64"),
-            "log_return": pd.Series(dtype="float64"),
-            "weight": pd.Series(dtype="float64"),
-        })
-        scn_schema.to_parquet(out_dir / "forecast_scenarios.parquet", index=False)
-
-        sum_schema = pd.DataFrame({
-            "asof_date": pd.Series(dtype="datetime64[ns]"),
-            "asset": pd.Series(dtype="object"),
-            "horizon": pd.Series(dtype="int64"),
-            "p10": pd.Series(dtype="float64"),
-            "p50": pd.Series(dtype="float64"),
-            "p90": pd.Series(dtype="float64"),
-            "mean": pd.Series(dtype="float64"),
-            "std": pd.Series(dtype="float64"),
-        })
-        sum_schema.to_parquet(out_dir / "forecast_summary.parquet", index=False)
-
-        return {
-            "layer": self.name,
-            "status": "stub",
-            "n_scenarios": 0,
-            "note": "placeholder schema — replace with KAF + tethering in Phase 3",
-        }
+        from forecast import run as run_forecast
+        meta = run_forecast(asof=asof)
+        return {"layer": self.name, **meta}
 
 
 # ── Runner ───────────────────────────────────────────────
