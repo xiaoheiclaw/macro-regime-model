@@ -81,6 +81,49 @@ def _gaussian_benchmark(
     return mu, sigma
 
 
+# Asset label → state column mapping (v1 allocation universe)
+V1_LABEL_TO_RET = {
+    "SPX":         "spx_ret",
+    "US10Y_yield": "bond_ret",
+    "Gold":        "gold_ret",
+    "WTI_crude":   "oil_ret",
+    "BTC":         "btc_ret",
+    "DXY":         "dxy_ret",
+}
+
+
+def _portfolio_realized(
+    state: pd.DataFrame,
+    weights: dict[str, float],
+    asof: pd.Timestamp,
+    h: int,
+) -> float | None:
+    """
+    Realized portfolio log-return over t+1 .. t+h for given weights.
+    Converts per-asset cumulative log returns to arithmetic then weights,
+    returns log of 1+arith.
+    """
+    total = 0.0
+    any_ok = False
+    for label, w in weights.items():
+        if w == 0:
+            continue
+        col = V1_LABEL_TO_RET.get(label, label)
+        if col not in state.columns:
+            continue
+        fwd = _forward_cum_return(state[col], h)
+        if asof not in fwd.index:
+            continue
+        v = fwd.loc[asof]
+        if not np.isfinite(v):
+            continue
+        total += w * (np.exp(float(v)) - 1.0)
+        any_ok = True
+    if not any_ok:
+        return None
+    return float(np.log1p(total))
+
+
 def _joint_gaussian_benchmark(
     state: pd.DataFrame,
     assets: list[str],
@@ -162,6 +205,9 @@ def main() -> None:
     ap.add_argument("--vix-switch", type=float, default=None,
                     help="regime-switch VIX percentile (e.g., 0.50); "
                          "below → all assets Gaussian, above → KAF")
+    ap.add_argument("--allocate", action="store_true",
+                    help="also run v2 allocation (MV + SP-CVaR) per asof and "
+                         "track realized portfolio forward returns")
     args = ap.parse_args()
 
     state = pd.read_parquet(Path(DATA_DIR) / "state_features.parquet")
@@ -181,6 +227,7 @@ def main() -> None:
     t0 = time.time()
     rows: list[dict] = []
     energy_rows: list[dict] = []   # per-(asof, horizon): joint energy score v2 vs MVN
+    alloc_rows: list[dict] = []    # per-(asof, method, horizon): realized portfolio return
     expanding = not args.no_expanding_regimes
     alphas_to_run = alpha_grid if alpha_grid is not None else [None]
     gammas_to_run = gamma_grid if gamma_grid is not None else [None]
@@ -300,6 +347,42 @@ def main() -> None:
                             "es_v2": es_v2,
                             "es_mvn": es_mvn,
                         })
+
+                    if args.allocate:
+                        try:
+                            import v2_allocation
+                            alloc_meta = v2_allocation.run(asof=asof_str)
+                            for method, weights in [
+                                ("mv_bl_12m", alloc_meta.get("bl_weights", {})),
+                                ("sp_cvar_6m", alloc_meta.get("cvar_weights", {})),
+                            ]:
+                                for h_alloc in (1, 3, 6, 12):
+                                    pr = _portfolio_realized(state, weights, asof, h_alloc)
+                                    if pr is None:
+                                        continue
+                                    alloc_rows.append({
+                                        "asof": asof,
+                                        "method": method,
+                                        "horizon": h_alloc,
+                                        "realized_log_return": pr,
+                                        "weights": json.dumps(weights),
+                                    })
+                            # 60/40 benchmark (SPX 60, Bond 40)
+                            for h_alloc in (1, 3, 6, 12):
+                                pr = _portfolio_realized(
+                                    state, {"SPX": 0.6, "US10Y_yield": 0.4}, asof, h_alloc
+                                )
+                                if pr is None:
+                                    continue
+                                alloc_rows.append({
+                                    "asof": asof,
+                                    "method": "bench_60_40",
+                                    "horizon": h_alloc,
+                                    "realized_log_return": pr,
+                                    "weights": json.dumps({"SPX": 0.6, "US10Y_yield": 0.4}),
+                                })
+                        except Exception as e:
+                            print(f"  ⚠ allocation at {asof_str} failed: {e}")
 
     if not rows:
         sys.exit("no rows collected — check asof range and data")
@@ -462,6 +545,27 @@ def main() -> None:
             lines.append(
                 f"| {h}m | {int(r['n'])} | {r['es_v2_mean']:.4f} | "
                 f"{r['es_mvn_mean']:.4f} | {r['skill']:+.1%} |"
+            )
+        lines.append("")
+
+    if alloc_rows:
+        alloc_df = pd.DataFrame(alloc_rows)
+        alloc_df.to_parquet(out_dir / f"allocation_{tag}.parquet", index=False)
+        lines.append("## Downstream allocation outcomes (realized forward returns)")
+        lines.append("")
+        lines.append("| method | h | n | mean log-ret | ann log-ret | vol (h) | Sharpe (ann) |")
+        lines.append("|---|---|---|---|---|---|---|")
+        for (method, h), sub in alloc_df.groupby(["method", "horizon"]):
+            r = sub["realized_log_return"]
+            mean_r = float(r.mean())
+            vol_r = float(r.std())
+            # Annualize (log returns scale linearly; vol by sqrt)
+            ann_r = mean_r * (12 / h)
+            ann_vol = vol_r * np.sqrt(12 / h)
+            sharpe = ann_r / ann_vol if ann_vol > 0 else float("nan")
+            lines.append(
+                f"| {method} | {h}m | {len(sub)} | {mean_r:+.4f} | "
+                f"{ann_r:+.2%} | {vol_r:.4f} | {sharpe:+.2f} |"
             )
         lines.append("")
 
