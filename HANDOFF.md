@@ -76,11 +76,19 @@ with rule-based segmentation (VIX quantile / NBER dates / rolling
   (block length = horizon; this is the honest test codex Round-6
   demanded):
 
-  v2 SP-CVaR vs MVN SP-CVaR (99 common asofs):
-    h=1m:  ann +1.63%, CI [−0.04, +0.32]  not sig
-    h=3m:  ann +2.37%, CI [+0.24, +0.97]  **SIGNIFICANT**
-    h=6m:  ann +2.33%, CI [+0.48, +1.80]  **SIGNIFICANT**
-    h=12m: ann +2.60%, CI [+1.04, +3.38]  **SIGNIFICANT**
+  v2 SP-CVaR vs MVN SP-CVaR (99 common asofs, paired block bootstrap):
+    h     Δmean ann      Δmean sig?   ΔSharpe        ΔSharpe sig?
+    1m    +1.63%         —            +0.10          —
+    3m    +2.37%         ✓            +0.19          ✓
+    6m    +2.33%         ✓            +0.24          ✓
+    12m   +2.60%         ✓            +0.03          —  (weights stale)
+
+  Turnover drag (10bps round-trip, monthly):
+    v2 SP-CVaR     0.256 L1/month → ann drag 0.31%
+    MVN SP-CVaR    0.292 L1/month → ann drag 0.35%
+  → Net-of-cost v2 edge ≈ +2.0% ann @ 6m (+2.3% gross − 0.3% drag).
+  → MVN actually has HIGHER turnover: KAF analog pools are more
+    temporally stable across adjacent asofs than rolling-moment MVN.
 
   On same asofs, same optimizer, same 50% cap — v2's joint-structure
   scenarios deliver +2.3-2.6% annualized realized return over MVN
