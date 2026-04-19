@@ -393,8 +393,12 @@ def main() -> None:
                         mvn = _joint_gaussian_benchmark(state, list(wide.columns), asof, int(h_int))
                         es_mvn = float("nan")
                         if mvn is not None:
-                            mvn_rng = np.random.default_rng(pd.Timestamp(asof).toordinal() + int(h_int))
-                            es_mvn = energy_score_mvn(mvn[0], mvn[1], realized_vec, n_samples=500, rng=mvn_rng)
+                            # Codex Round-7: multi-seed averaging to reduce MC noise
+                            es_mvn = energy_score_mvn(
+                                mvn[0], mvn[1], realized_vec,
+                                n_samples=5000, n_seeds=3,
+                                base_seed=pd.Timestamp(asof).toordinal() + int(h_int),
+                            )
                         energy_rows.append({
                             "asof": asof,
                             "alpha": alpha_val,
@@ -612,16 +616,16 @@ def main() -> None:
         lines.append("## Multivariate Energy Score — paired v2 vs MVN")
         lines.append("")
         lines.append(
-            "> MVN benchmark uses 500 Monte Carlo samples (single-seed). "
-            "d = ES_MVN − ES_v2 at each (asof, horizon); positive = v2 wins. "
-            "95% CI via moving-block bootstrap with block=horizon to handle "
-            "overlapping monthly forecasts."
+            "> MVN benchmark uses 5000 MC samples averaged over 3 seeds "
+            "(~15k effective; Round-7 fix to reduce MC noise from ~0.045 to "
+            "~0.008). d = ES_MVN − ES_v2 at each (asof, horizon); positive = "
+            "v2 wins. 95% CI via moving-block bootstrap with block=horizon."
         )
         lines.append("")
         lines.append("| horizon | n | mean ES v2 | mean ES MVN | mean diff | 95% CI (blk-bootstrap) | skill % |")
         lines.append("|---|---|---|---|---|---|---|")
         for h, sub in es_df.groupby("horizon"):
-            sub = sub.dropna(subset=["es_v2", "es_mvn"])
+            sub = sub.dropna(subset=["es_v2", "es_mvn"]).sort_values("asof")
             if sub.empty:
                 continue
             diff = (sub["es_mvn"] - sub["es_v2"]).values
@@ -677,7 +681,7 @@ def main() -> None:
                 b_sub = alloc_df[(alloc_df.method == b) & (alloc_df.horizon == h)]
                 if a_sub.empty or b_sub.empty:
                     continue
-                paired = a_sub.merge(b_sub, on="asof", suffixes=("_a", "_b"))
+                paired = a_sub.merge(b_sub, on="asof", suffixes=("_a", "_b")).sort_values("asof")
                 if paired.empty:
                     continue
                 r_a = paired["realized_log_return_a"].values

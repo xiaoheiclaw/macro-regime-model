@@ -101,20 +101,27 @@ with rule-based segmentation (VIX quantile / NBER dates / rolling
       mean return premium. That's a valid portfolio property but
       doesn't pass paired-mean significance test.
 
-**Joint Energy Score (Phase 3b.7) — NOT statistically significant**:
-  Paired v2 vs MVN, block-bootstrap 95% CI:
-    h=1m:  +0.0014 [−0.0003, +0.0030]  not sig
-    h=3m:  +0.0029 [−0.0007, +0.0062]  marginal
-    h=6m:  +0.0024 [−0.0033, +0.0081]  not sig
-    h=12m: +0.0039 [−0.0032, +0.0142]  not sig
-  All point estimates positive but 0 inside every CI. Earlier
-  "+0.6-1.2% skill" claim was noise, not signal. Retracted.
+**Joint Energy Score (Phase 3b.7) — tentative 1m only, fragile**:
 
-  Interesting: the joint structure appears to manifest at the
-  ALLOCATION layer (significant paired return diff) but not at the
-  raw multivariate Energy Score layer. Possible explanation: the CVaR
-  optimizer's tail focus amplifies asymmetric joint structure that
-  symmetric Energy Score averages out.
+  Current MVN benchmark uses 5000 MC × 3 seeds (~15k effective samples)
+  after Codex Round-7 flagged 500-sample noise:
+    h=1m:  +0.0009 [+0.0000, +0.0018]  marginal — CI lower bound ≈ 0
+    h=3m:  +0.0025 [−0.0008, +0.0052]  not sig
+    h=6m:  +0.0028 [−0.0042, +0.0093]  not sig
+    h=12m: +0.0062 [−0.0035, +0.0175]  not sig
+
+  All point estimates positive but only 1m crosses CI threshold, and
+  even then the lower bound is effectively at zero. **Do not cite ES
+  as a hard positive result**; it's at best a very weak hint.
+
+  Earlier "+0.6-1.2% skill across horizons" Phase 3b.7 claim was
+  inflated MC noise. Retracted.
+
+  Interesting: the joint structure does manifest at the ALLOCATION
+  layer (significant paired return diff, paired Sharpe diff), but
+  NOT cleanly at the raw multivariate Energy Score layer. Possible
+  explanation: the CVaR optimizer's tail focus amplifies asymmetric
+  joint structure that symmetric Energy Score averages out.
 
 **AR(1) benchmark (Phase 3b.7, stronger than unconditional Gaussian)**:
   Many Gaussian "wins" are AR(1) losses — AR(1) captures mean-reverting/

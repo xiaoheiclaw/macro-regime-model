@@ -129,22 +129,32 @@ def energy_score_mvn(
     mu: np.ndarray,
     Sigma: np.ndarray,
     realized: np.ndarray,
-    n_samples: int = 500,
-    rng: np.random.Generator | None = None,
+    n_samples: int = 5000,
+    n_seeds: int = 3,
+    base_seed: int = 42,
 ) -> float:
     """
     Energy Score for Normal(μ, Σ) against realized y, via MC sampling.
-    Provides a joint-Gaussian benchmark with historical covariance structure.
+
+    Codex Round-7 Critical: single-seed 500 samples gives MC noise ~O(0.04)
+    which is comparable to the skill magnitude we try to detect. Now averages
+    over n_seeds independent MCs × n_samples each, so effective sample count
+    is n_samples × n_seeds and MC noise drops by √(n_seeds). Default 5000×3
+    = 15k effective → MC SE roughly 0.008 vs 0.045 single-seed 500.
     """
-    if rng is None:
-        rng = np.random.default_rng(42)
     d = len(mu)
-    Sigma_reg = Sigma + 1e-8 * np.eye(d)  # jitter for PSD
-    try:
-        samples = rng.multivariate_normal(mu, Sigma_reg, size=n_samples)
-    except np.linalg.LinAlgError:
+    Sigma_reg = Sigma + 1e-8 * np.eye(d)
+    scores = []
+    for s in range(n_seeds):
+        rng = np.random.default_rng(base_seed + s)
+        try:
+            samples = rng.multivariate_normal(mu, Sigma_reg, size=n_samples)
+        except np.linalg.LinAlgError:
+            continue
+        scores.append(energy_score_sample(samples, realized))
+    if not scores:
         return float("nan")
-    return energy_score_sample(samples, realized)
+    return float(np.mean(scores))
 
 
 def moving_block_bootstrap_mean(
