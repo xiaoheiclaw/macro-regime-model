@@ -436,8 +436,28 @@ def main() -> None:
 
                     if args.allocate:
                         try:
-                            import v2_allocation
+                            import v2_allocation, forecast_v3
                             excl = set(args.exclude_assets.split(",")) if args.exclude_assets else None
+
+                            # v3: regime-conditional scenarios, then same allocator
+                            # Save v2 scenarios, run v3, allocate, restore
+                            _scn_backup = scn.copy()
+                            try:
+                                forecast_v3.run(asof=asof_str)
+                                v3_meta = v2_allocation.run(asof=asof_str, exclude_assets=excl)
+                                for h_alloc in (1, 3, 6, 12):
+                                    pr = _portfolio_realized(state, v3_meta.get("cvar_weights", {}), asof, h_alloc)
+                                    if pr is not None:
+                                        alloc_rows.append({
+                                            "asof": asof, "method": "v3_sp_cvar_6m",
+                                            "horizon": h_alloc, "realized_log_return": pr,
+                                            "weights": json.dumps(v3_meta.get("cvar_weights", {})),
+                                        })
+                            except Exception as _e:
+                                print(f"  ⚠ v3 allocation failed: {_e}")
+                            # Restore v2 scenarios for remaining v2 allocation
+                            _scn_backup.to_parquet(SCENARIOS_PATH, index=False)
+
                             alloc_meta = v2_allocation.run(asof=asof_str, exclude_assets=excl)
                             for method, weights in [
                                 ("mv_bl_12m", alloc_meta.get("bl_weights", {})),
