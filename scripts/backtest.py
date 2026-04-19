@@ -760,6 +760,67 @@ def main() -> None:
             )
         lines.append("")
 
+        # 6-month rebalance strategy — matches CVaR optimizer horizon.
+        # Picks asofs every 6 months (non-overlapping 6m periods), applies
+        # weights at rebalance date, uses realized 6m cum log return.
+        lines.append("### Semi-annual (6m) rebalance strategy")
+        lines.append("")
+        lines.append(
+            "> Rebalance every 6 months (matches CVaR optimization horizon). "
+            "20 non-overlapping rebalance dates over 10 years. Sharpe "
+            "annualized via × √2 (2 rebalances/year)."
+        )
+        lines.append("")
+        lines.append("| method | n_rebal | ann net ret | ann vol | Sharpe | total | max DD |")
+        lines.append("|---|---|---|---|---|---|---|")
+        sharpe_6m: dict[str, np.ndarray] = {}
+        for method in sorted(alloc_df["method"].unique()):
+            sub = alloc_df[(alloc_df.method == method) & (alloc_df.horizon == 6)].sort_values("asof").reset_index(drop=True)
+            if len(sub) < 12:
+                continue
+            reb = sub.iloc[::6].reset_index(drop=True)
+            if len(reb) < 4:
+                continue
+            wlist = [json.loads(w) for w in reb["weights"].values]
+            keys = sorted({k for wd in wlist for k in wd.keys()})
+            vecs = np.array([[wd.get(k, 0.0) for k in keys] for wd in wlist])
+            turnover = np.concatenate([[0.0], np.sum(np.abs(np.diff(vecs, axis=0)), axis=1)])
+            drag = turnover * tcost_rt
+            r_gross = reb["realized_log_return"].values
+            r_net = r_gross - drag
+            ann_ret = float(r_net.mean() * 2)          # 2 semi-annuals/year
+            ann_vol = float(r_net.std(ddof=1) * np.sqrt(2))
+            sharpe = ann_ret / ann_vol if ann_vol > 0 else float("nan")
+            cum = np.cumsum(r_net)
+            dd = float((cum - np.maximum.accumulate(cum)).min())
+            max_dd = float(np.exp(dd) - 1)
+            total = float(np.exp(r_net.sum()) - 1)
+            lines.append(
+                f"| {method} | {len(reb)} | {ann_ret:+.2%} | {ann_vol:.2%} | "
+                f"{sharpe:+.2f} | {total:+.1%} | {max_dd:+.1%} |"
+            )
+            sharpe_6m[method] = r_net
+        lines.append("")
+
+        # Paired test on 6m-rebalance net returns (v2 vs MVN SP-CVaR)
+        if "sp_cvar_6m" in sharpe_6m and "mvn_sp_cvar_6m" in sharpe_6m:
+            a = sharpe_6m["sp_cvar_6m"]
+            b = sharpe_6m["mvn_sp_cvar_6m"]
+            n = min(len(a), len(b))
+            a, b = a[-n:], b[-n:]
+            mean_d, lo_m, hi_m = moving_block_bootstrap_mean(a - b, block_length=1)
+            ds, ds_lo, ds_hi = moving_block_bootstrap_sharpe_diff(a, b, block_length=1)
+            sig_m = "✓" if (lo_m > 0 or hi_m < 0) else "—"
+            sig_s = "✓" if (ds_lo > 0 or ds_hi < 0) else "—"
+            lines.append("### Paired NET 6m-rebalance v2 SP-CVaR vs MVN SP-CVaR")
+            lines.append("")
+            lines.append(f"- n_rebalances aligned: {n}")
+            lines.append(f"- paired Δmean per rebal: {mean_d:+.4f} "
+                         f"CI [{lo_m:+.4f}, {hi_m:+.4f}] {sig_m}  →  ann {mean_d*2:+.2%}")
+            lines.append(f"- paired ΔSharpe (semi-ann): {ds:+.2f} "
+                         f"CI [{ds_lo:+.2f}, {ds_hi:+.2f}] {sig_s}")
+            lines.append("")
+
         # Paired net-return test for v2 vs MVN sequential strategies
         if "sp_cvar_6m" in per_method_series and "mvn_sp_cvar_6m" in per_method_series:
             r_v2 = per_method_series["sp_cvar_6m"]
