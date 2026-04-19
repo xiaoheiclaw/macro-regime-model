@@ -134,6 +134,41 @@ with rule-based segmentation (VIX quantile / NBER dates / rolling
   Honest recalibration: Gold and Silver are the only assets that
   genuinely beat both benchmarks.
 
+**OOS 2002-2014 + matched-horizon + RegimeCond benchmark findings**:
+
+Ran the same pipeline on 13-year pre-inception window (2002-2014)
+and against a regime-conditional historical sampler benchmark.
+
+Sample-regime robustness:
+- v2 SP-CVaR vs 60/40 Sharpe spread: +0.29 OOS (2002-14) vs +0.15 IS
+  (2015-24). Both samples v2 wins, max DD consistently 2.5-5× smaller
+  than 60/40. **Structural allocation-layer edge replicates across
+  distinct market regimes (GFC/ZIRP era vs post-COVID era).**
+- Per-asset CRPS wins DO NOT replicate. Gold/Silver 2015-24 wins
+  reverse OOS (Gold -7.6% / Silver -9.9% vs AR(1) in 2002-14). Those
+  "per-asset KAF wins" were era-specific, not structural.
+
+Matched-horizon strategy (6m rebalance to match CVaR optimizer):
+- v2 SP-CVaR vs MVN SP-CVaR paired Δmean +3.83% ann (CI [+0.01%,
+  +0.75%]) on 17 aligned semi-annuals. SIG at matching horizon
+  though n=17 ΔSharpe CI wide.
+- Monthly rebalance doesn't show the edge cleanly (paired not sig).
+  Rebalance cadence must match the optimizer horizon.
+
+RegimeCond benchmark kills the per-asset KAF claim:
+  @ 12m Gold vs AR(1) +7.6% → vs RegimeCond +0.7%
+  @ 12m SPX/Oil/Copper/BTC: v2 LOSES to RegimeCond by -8% to -27%
+  → Most of v2's forecast skill at long horizons is from "knowing
+    which regime am I in", not from state-distance analog ranking.
+  → At 1m horizon v2 still slightly wins (Gold +1.4% vs RC).
+  State distance matters short-term; regime label matters long-term.
+
+**Model architecture implication**: Phase 1 (mask) + Phase 3 (KAF
+analog ranking) is over-engineered for long horizons. A simpler
+v3 architecture (Phase 2 regime → direct regime-conditional
+sampling → CVaR allocation) would likely preserve the allocation
+edge with fewer layers.
+
 **Remaining limitations**:
 - Joint structure broken at VALUE level for BTC/Bond (parametric);
   joint for other 8 assets is intact and shown positive by ES. Not
