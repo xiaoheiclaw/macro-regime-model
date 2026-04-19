@@ -63,23 +63,30 @@ with rule-based segmentation (VIX quantile / NBER dates / rolling
   + BTC parametric:       -1.3%  (+0.7pp, real win; BTC -7% → -3%)
   + Bond parametric:      -1.1%  (+0.2pp, real but modest)
 
-**Downstream allocation evaluation (Phase 3b.8) — the real endpoint**:
+**Downstream allocation evaluation (Phase 3b.8 + 3b.9)**:
 
-  Method         AnnRet   Vol    Sharpe
-  60/40           5.9%    8.5%   0.75
-  v2 MV BL      +34.4%   49.0%   0.74    ⚠ cap-binding on Gold/BTC
-  v2 SP-CVaR      6.7%    4.3%   **1.10**  ✓
+  Method (6m)          AnnRet   Vol    Sharpe
+  60/40                 5.8%    5.9%   0.70
+  MVN SP-CVaR           5.1%    3.8%   0.95    ← fair benchmark
+  v2 SP-CVaR            6.7%    4.3%   **1.10**  ← joint structure win
+  v2 MV BL             34.4%   32.6%   0.75    ⚠ Gold/BTC cap-binding
 
-  SP-CVaR Sharpe 1.10 vs 60/40's 0.75 is the first end-to-end win
-  that matters. Vol 4.3% at 6m (vs 60/40's 5.9%) with higher return.
-  This is what joint scenarios deliver when fed to a tail-risk
-  objective: the structural forecast edge surfaces in allocation.
+  **Clean isolation**: v2 SP-CVaR beats MVN SP-CVaR (same optimizer,
+  same cap, only difference is scenarios) by +0.15 Sharpe at 6m.
+  This isolates the value of v2's joint analog structure from the
+  value of the CVaR optimizer itself.
+
+  Across horizons (v2 − MVN Sharpe):
+    1m: +0.02  3m: +0.05  **6m: +0.15**  12m: -0.18
+  v2's edge is strongest at the horizon matching the CVaR
+  optimization window. At 12m hold, v2 weights become stale (more
+  concentrated → higher realized vol). Implies rebalancing cadence
+  ≤ 6m for CVaR-optimized v2 portfolios.
 
   MV BL's 34% annualized is misleading — optimizer hits Gold cap
   (50%) and piles into BTC (27%) because they had the biggest
-  2015-24 run. Sharpe 0.74 ≈ 60/40 despite 6× return — return is
-  flattered, risk-adjusted is the same. Under realistic position
-  caps (~25%) or tracking-error bounds it would moderate.
+  2015-24 run. Sharpe 0.74 ≈ 60/40 despite 6× return — risk-adjusted
+  is similar. Under position caps ~25% it would moderate.
 
 **Joint structure validation (Phase 3b.7, Energy Score)**:
   Multivariate Energy Score v2 vs MVN-benchmark (historical Σ):
