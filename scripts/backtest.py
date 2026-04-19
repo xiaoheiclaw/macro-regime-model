@@ -698,6 +698,85 @@ def main() -> None:
                 )
             lines.append("")
 
+        # True monthly-rebalance strategy backtest (net-of-tcost sequential PnL)
+        # Codex Round-7 asked for this: the paired h=6 CRPS-style test isn't
+        # the same as a real strategy's month-by-month net return stream.
+        lines.append("## True monthly-rebalance strategy backtest (net-of-tcost)")
+        lines.append("")
+        lines.append(
+            "> Sequential strategy: at each month-end t, rebalance to w_t "
+            "(paying 10 bps round-trip × L1 turnover), hold for 1 month. "
+            "Realized return at t = realized_log_return at horizon=1m for w_t. "
+            "Net return stream is GROSS − tcost drag per step. Metrics: "
+            "ann net Sharpe, max drawdown on the actual realized path."
+        )
+        lines.append("")
+        tcost_rt = 0.0010   # 10 bps round-trip per unit turnover
+        strat_rows: list[dict] = []
+        per_method_series: dict[str, np.ndarray] = {}
+        for method in sorted(alloc_df["method"].unique()):
+            sub_s = alloc_df[(alloc_df.method == method) & (alloc_df.horizon == 1)].sort_values("asof").reset_index(drop=True)
+            if len(sub_s) < 12:
+                continue
+            wlist = [json.loads(w) for w in sub_s["weights"].values]
+            keys = sorted({k for wd in wlist for k in wd.keys()})
+            vecs = np.array([[wd.get(k, 0.0) for k in keys] for wd in wlist])
+            # turnover[0] = 0 (no prior weights); turnover[t] = L1 diff t-1→t
+            turnover = np.concatenate([[0.0], np.sum(np.abs(np.diff(vecs, axis=0)), axis=1)])
+            drag = turnover * tcost_rt
+            r_gross = sub_s["realized_log_return"].values
+            r_net = r_gross - drag
+            ann_ret = float(r_net.mean() * 12)
+            ann_vol = float(r_net.std(ddof=1) * np.sqrt(12))
+            sharpe = ann_ret / ann_vol if ann_vol > 0 else float("nan")
+            # Max DD on cum log returns
+            cum = np.cumsum(r_net)
+            run_max = np.maximum.accumulate(cum)
+            max_dd_log = float((cum - run_max).min())
+            max_dd = float(np.exp(max_dd_log) - 1)
+            total_net = float(np.exp(r_net.sum()) - 1)
+            strat_rows.append({
+                "method": method,
+                "n_months": len(r_net),
+                "ann_net_return": ann_ret,
+                "ann_net_vol": ann_vol,
+                "sharpe": sharpe,
+                "total_net": total_net,
+                "max_dd": max_dd,
+                "mean_drag_bps": float(drag.mean() * 10000),
+            })
+            per_method_series[method] = r_net
+        lines.append("| method | n_m | ann net ret | ann vol | Sharpe | total net | max DD | mean drag (bps/m) |")
+        lines.append("|---|---|---|---|---|---|---|---|")
+        for r in strat_rows:
+            lines.append(
+                f"| {r['method']} | {r['n_months']} | {r['ann_net_return']:+.2%} | "
+                f"{r['ann_net_vol']:.2%} | {r['sharpe']:+.2f} | "
+                f"{r['total_net']:+.1%} | {r['max_dd']:+.1%} | {r['mean_drag_bps']:.1f} |"
+            )
+        lines.append("")
+
+        # Paired net-return test for v2 vs MVN sequential strategies
+        if "sp_cvar_6m" in per_method_series and "mvn_sp_cvar_6m" in per_method_series:
+            r_v2 = per_method_series["sp_cvar_6m"]
+            r_mvn = per_method_series["mvn_sp_cvar_6m"]
+            n_align = min(len(r_v2), len(r_mvn))
+            # Align from end (recent asofs are common)
+            r_v2, r_mvn = r_v2[-n_align:], r_mvn[-n_align:]
+            d = r_v2 - r_mvn
+            mean_d, lo_m, hi_m = moving_block_bootstrap_mean(d, block_length=1)
+            ds, ds_lo, ds_hi = moving_block_bootstrap_sharpe_diff(r_v2, r_mvn, block_length=1)
+            sig_m = "✓" if (lo_m > 0 or hi_m < 0) else "—"
+            sig_s = "✓" if (ds_lo > 0 or ds_hi < 0) else "—"
+            lines.append("### Paired NET v2 SP-CVaR vs MVN SP-CVaR (monthly sequential)")
+            lines.append("")
+            lines.append(f"- n_months aligned: {n_align}")
+            lines.append(f"- paired Δmean (monthly log): {mean_d:+.5f} "
+                         f"CI [{lo_m:+.5f}, {hi_m:+.5f}] {sig_m}  →  ann {mean_d*12:+.2%}")
+            lines.append(f"- paired ΔSharpe (monthly): {ds:+.3f} "
+                         f"CI [{ds_lo:+.3f}, {ds_hi:+.3f}] {sig_s}")
+            lines.append("")
+
         # Turnover analysis — how much tradeable edge survives transaction cost
         lines.append("## Turnover & transaction-cost drag")
         lines.append("")
