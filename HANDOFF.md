@@ -63,40 +63,50 @@ with rule-based segmentation (VIX quantile / NBER dates / rolling
   + BTC parametric:       -1.3%  (+0.7pp, real win; BTC -7% → -3%)
   + Bond parametric:      -1.1%  (+0.2pp, real but modest)
 
-**Downstream allocation evaluation (Phase 3b.8 + 3b.9)**:
+**Downstream allocation evaluation (Phase 3b.8-3b.10, with stat rigor)**:
 
-  Method (6m)          AnnRet   Vol    Sharpe
-  60/40                 5.8%    5.9%   0.70
-  MVN SP-CVaR           5.1%    3.8%   0.95    ← fair benchmark
-  v2 SP-CVaR            6.7%    4.3%   **1.10**  ← joint structure win
-  v2 MV BL             34.4%   32.6%   0.75    ⚠ Gold/BTC cap-binding
+  Raw outcomes (overlapping monthly obs — Sharpe SE ≈ 0.11):
+    Method (6m)          AnnRet   AnnVol   Sharpe
+    60/40                 5.8%    8.3%    0.70
+    MVN SP-CVaR           5.1%    5.4%    0.95
+    v2 SP-CVaR            6.7%    6.1%    **1.10**
+    v2 MV BL             34.4%   46.1%    0.75    ⚠ Gold/BTC cap-bound
 
-  **Clean isolation**: v2 SP-CVaR beats MVN SP-CVaR (same optimizer,
-  same cap, only difference is scenarios) by +0.15 Sharpe at 6m.
-  This isolates the value of v2's joint analog structure from the
-  value of the CVaR optimizer itself.
+  **Paired analysis on COMMON asofs + block-bootstrap 95% CI**
+  (block length = horizon; this is the honest test codex Round-6
+  demanded):
 
-  Across horizons (v2 − MVN Sharpe):
-    1m: +0.02  3m: +0.05  **6m: +0.15**  12m: -0.18
-  v2's edge is strongest at the horizon matching the CVaR
-  optimization window. At 12m hold, v2 weights become stale (more
-  concentrated → higher realized vol). Implies rebalancing cadence
-  ≤ 6m for CVaR-optimized v2 portfolios.
+  v2 SP-CVaR vs MVN SP-CVaR (99 common asofs):
+    h=1m:  ann +1.63%, CI [−0.04, +0.32]  not sig
+    h=3m:  ann +2.37%, CI [+0.24, +0.97]  **SIGNIFICANT**
+    h=6m:  ann +2.33%, CI [+0.48, +1.80]  **SIGNIFICANT**
+    h=12m: ann +2.60%, CI [+1.04, +3.38]  **SIGNIFICANT**
 
-  MV BL's 34% annualized is misleading — optimizer hits Gold cap
-  (50%) and piles into BTC (27%) because they had the biggest
-  2015-24 run. Sharpe 0.74 ≈ 60/40 despite 6× return — risk-adjusted
-  is similar. Under position caps ~25% it would moderate.
+  On same asofs, same optimizer, same 50% cap — v2's joint-structure
+  scenarios deliver +2.3-2.6% annualized realized return over MVN
+  scenarios at 3/6/12m, block-bootstrap CI excludes zero. **First
+  statistically significant v2 win.**
 
-**Joint structure validation (Phase 3b.7, Energy Score)**:
-  Multivariate Energy Score v2 vs MVN-benchmark (historical Σ):
-    h=1m:  +1.1%   h=3m:  +1.2%
-    h=6m:  +0.6%   h=12m: +0.7%
-  All horizons positive. First positive KAF-core result: cross-asset
-  joint structure in v2 scenarios carries information beyond what a
-  multivariate Gaussian with historical covariance captures. Small
-  but consistent — this is the "earn your keep" evidence for joint
-  scenarios as inputs to BL/SP-CVaR allocation.
+  v2 SP-CVaR vs 60/40 (119 obs):
+    All horizons: paired return diff CI covers zero.
+    → Sharpe 1.10 vs 0.70 advantage comes from vol reduction, not
+      mean return premium. That's a valid portfolio property but
+      doesn't pass paired-mean significance test.
+
+**Joint Energy Score (Phase 3b.7) — NOT statistically significant**:
+  Paired v2 vs MVN, block-bootstrap 95% CI:
+    h=1m:  +0.0014 [−0.0003, +0.0030]  not sig
+    h=3m:  +0.0029 [−0.0007, +0.0062]  marginal
+    h=6m:  +0.0024 [−0.0033, +0.0081]  not sig
+    h=12m: +0.0039 [−0.0032, +0.0142]  not sig
+  All point estimates positive but 0 inside every CI. Earlier
+  "+0.6-1.2% skill" claim was noise, not signal. Retracted.
+
+  Interesting: the joint structure appears to manifest at the
+  ALLOCATION layer (significant paired return diff) but not at the
+  raw multivariate Energy Score layer. Possible explanation: the CVaR
+  optimizer's tail focus amplifies asymmetric joint structure that
+  symmetric Energy Score averages out.
 
 **AR(1) benchmark (Phase 3b.7, stronger than unconditional Gaussian)**:
   Many Gaussian "wins" are AR(1) losses — AR(1) captures mean-reverting/
