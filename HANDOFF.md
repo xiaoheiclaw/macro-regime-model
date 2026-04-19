@@ -163,11 +163,25 @@ RegimeCond benchmark kills the per-asset KAF claim:
   → At 1m horizon v2 still slightly wins (Gold +1.4% vs RC).
   State distance matters short-term; regime label matters long-term.
 
-**Model architecture implication**: Phase 1 (mask) + Phase 3 (KAF
-analog ranking) is over-engineered for long horizons. A simpler
-v3 architecture (Phase 2 regime → direct regime-conditional
-sampling → CVaR allocation) would likely preserve the allocation
-edge with fewer layers.
+**Model architecture implication** (tested and refuted — see next):
+  Preliminary: Phase 1 + Phase 3 look over-engineered because
+  regime-conditional sampling matches KAF per-asset CRPS.
+  But v3 proof-of-concept (Phase 3b.13, commit 4d8c62c) shows this
+  refactor LOSES 0.2 Sharpe vs v2 at the allocation layer.
+
+  v3 Sharpe (6m): 0.86 vs v2's 1.08, MVN's 0.89. v3 underperforms
+  BOTH v2 and MVN. Root cause: regime-matched pool has only 30-100
+  past months; sampling 200 with replacement produces high
+  duplication → low joint diversity → worse CVaR tail estimation.
+
+  **KAF state-distance ranking IS justified at the joint/allocation
+  layer** even though it's marginal at per-asset CRPS. The layers
+  do different jobs: Phase 2 (regime) provides the conditioning
+  label, Phase 3 (KAF) selects 200 DIVERSE analogs that are still
+  state-similar from the full history. Dropping either collapses
+  the pipeline's value.
+
+  Conclusion: v2 architecture stands. Simpler replacements refuted.
 
 **Remaining limitations**:
 - Joint structure broken at VALUE level for BTC/Bond (parametric);
