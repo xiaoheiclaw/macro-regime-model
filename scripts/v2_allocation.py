@@ -281,11 +281,13 @@ def _load_v1_comparison() -> dict | None:
     return out if out["bl"] or out["sp"] else None
 
 
-def run(asof: str | None = None) -> dict:
+def run(asof: str | None = None, exclude_assets: set[str] | None = None) -> dict:
     scn = _load_scenarios()
     if scn.empty:
         sys.exit("empty scenarios file")
     asof_ts = pd.Timestamp(asof) if asof else pd.Timestamp(scn["asof_date"].max())
+    if exclude_assets:
+        scn = scn[~scn["asset"].isin(exclude_assets)].copy()
 
     # MV (BL-style) on 12m horizon
     R12, w12, labels12 = _scenario_matrix(scn, BL_HORIZON_M)

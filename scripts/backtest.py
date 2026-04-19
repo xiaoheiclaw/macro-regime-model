@@ -258,6 +258,9 @@ def main() -> None:
     ap.add_argument("--allocate", action="store_true",
                     help="also run v2 allocation (MV + SP-CVaR) per asof and "
                          "track realized portfolio forward returns")
+    ap.add_argument("--exclude-assets", type=str, default=None,
+                    help="comma-separated forecast asset names to exclude "
+                         "from allocation (e.g. 'btc_ret' to test no-BTC)")
     args = ap.parse_args()
 
     state = pd.read_parquet(Path(DATA_DIR) / "state_features.parquet")
@@ -413,7 +416,8 @@ def main() -> None:
                     if args.allocate:
                         try:
                             import v2_allocation
-                            alloc_meta = v2_allocation.run(asof=asof_str)
+                            excl = set(args.exclude_assets.split(",")) if args.exclude_assets else None
+                            alloc_meta = v2_allocation.run(asof=asof_str, exclude_assets=excl)
                             for method, weights in [
                                 ("mv_bl_12m", alloc_meta.get("bl_weights", {})),
                                 ("sp_cvar_6m", alloc_meta.get("cvar_weights", {})),
