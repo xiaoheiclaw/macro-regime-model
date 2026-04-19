@@ -98,30 +98,41 @@ def _portfolio_realized(
     weights: dict[str, float],
     asof: pd.Timestamp,
     h: int,
+    missing_tol: float = 0.02,
 ) -> float | None:
     """
     Realized portfolio log-return over t+1 .. t+h for given weights.
     Converts per-asset cumulative log returns to arithmetic then weights,
     returns log of 1+arith.
+
+    Codex Round-6 Important #6: if any weighted asset has missing realized
+    data, the "truncated portfolio" would misrepresent returns. Reject
+    scenarios with > missing_tol fraction of weight on missing assets.
     """
     total = 0.0
-    any_ok = False
+    missing_w = 0.0
+    covered_w = 0.0
     for label, w in weights.items():
         if w == 0:
             continue
         col = V1_LABEL_TO_RET.get(label, label)
         if col not in state.columns:
+            missing_w += w
             continue
         fwd = _forward_cum_return(state[col], h)
         if asof not in fwd.index:
+            missing_w += w
             continue
         v = fwd.loc[asof]
         if not np.isfinite(v):
+            missing_w += w
             continue
         total += w * (np.exp(float(v)) - 1.0)
-        any_ok = True
-    if not any_ok:
+        covered_w += w
+    if covered_w == 0:
         return None
+    if missing_w / (missing_w + covered_w) > missing_tol:
+        return None    # too much portfolio weight on missing assets — reject
     return float(np.log1p(total))
 
 
@@ -345,9 +356,13 @@ def main() -> None:
                             "n_scn": len(samples),
                         })
 
-                    # Energy Score per (asof, horizon) — tests joint dependence
+                    # Energy Score per (asof, horizon) — tests joint dependence.
+                    # Pin to a fixed asset set across asofs (codex Round-6
+                    # Important #8): ES dimensionality matters for comparability.
+                    ES_ASSETS = ["spx_ret", "bond_ret", "gold_ret", "oil_ret", "dxy_ret"]
                     for h_int in scn["horizon"].unique():
-                        sub_h = scn[scn["horizon"] == int(h_int)]
+                        sub_h = scn[(scn["horizon"] == int(h_int)) &
+                                    (scn["asset"].isin(ES_ASSETS))]
                         if sub_h.empty:
                             continue
                         wide = sub_h.pivot_table(
@@ -355,8 +370,12 @@ def main() -> None:
                             columns="asset",
                             values="log_return",
                             aggfunc="first",
-                        ).dropna(axis=1, how="any").dropna(axis=0, how="any")
-                        if wide.empty or wide.shape[1] < 2:
+                        )
+                        # Require all pinned assets present; drop incomplete scenarios
+                        if not set(ES_ASSETS).issubset(set(wide.columns)):
+                            continue
+                        wide = wide[ES_ASSETS].dropna(how="any")
+                        if wide.empty:
                             continue
                         # Realized vector for these assets at asof
                         realized_vec = np.array([
