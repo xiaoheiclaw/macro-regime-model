@@ -147,6 +147,34 @@ def energy_score_mvn(
     return energy_score_sample(samples, realized)
 
 
+def moving_block_bootstrap_mean(
+    x: np.ndarray,
+    block_length: int,
+    n_resamples: int = 2000,
+    seed: int = 42,
+) -> tuple[float, float, float]:
+    """
+    Moving-block bootstrap CI for the mean of an overlapping/autocorrelated
+    series. Returns (mean, ci_low_95, ci_high_95). Block length should be
+    at least the forward-return horizon to preserve dependence.
+    """
+    x = np.asarray(x, dtype=float)
+    x = x[np.isfinite(x)]
+    n = len(x)
+    if n < 2 * block_length:
+        return float(np.mean(x)) if n else float("nan"), float("nan"), float("nan")
+    rng = np.random.default_rng(seed)
+    n_blocks = int(np.ceil(n / block_length))
+    starts_space = n - block_length + 1
+    means = np.empty(n_resamples)
+    for i in range(n_resamples):
+        starts = rng.integers(0, starts_space, size=n_blocks)
+        resample = np.concatenate([x[s:s + block_length] for s in starts])[:n]
+        means[i] = resample.mean()
+    lo, hi = np.quantile(means, [0.025, 0.975])
+    return float(np.mean(x)), float(lo), float(hi)
+
+
 def ar1_forecast(
     series: pd.Series,
     h: int,

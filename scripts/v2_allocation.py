@@ -170,16 +170,35 @@ def cvar_weights(
     w0 = np.full(n, 1.0 / n)
 
     # COBYLA handles non-smooth objective better than SLSQP here
-    res = minimize(neg_cvar, w0, method="COBYLA",
-                   constraints=[
-                       {"type": "eq", "fun": lambda w: w.sum() - 1.0},
-                       *[{"type": "ineq", "fun": (lambda w, i=i: w[i])} for i in range(n)],
-                       *[{"type": "ineq", "fun": (lambda w, i=i: max_w - w[i])} for i in range(n)],
-                   ],
-                   options={"rhobeg": 0.05, "maxiter": 1000, "catol": 1e-6})
-    w = np.clip(res.x, 0.0, max_w)
-    if w.sum() > 0:
-        w /= w.sum()
+    # Codex Round-6 Important #3: COBYLA on non-smooth CVaR with only
+    # ~10 tail scenarios can be unstable. Multiple restarts + keep best.
+    constraints = [
+        {"type": "eq", "fun": lambda w: w.sum() - 1.0},
+        *[{"type": "ineq", "fun": (lambda w, i=i: w[i])} for i in range(n)],
+        *[{"type": "ineq", "fun": (lambda w, i=i: max_w - w[i])} for i in range(n)],
+    ]
+    rng_opt = np.random.default_rng(42)
+    best_x = None
+    best_obj = np.inf
+    n_restarts = 4
+    for trial in range(n_restarts):
+        if trial == 0:
+            start = w0
+        else:
+            start = rng_opt.dirichlet(np.ones(n))
+            start = np.minimum(start, max_w)
+            start = start / start.sum() if start.sum() > 0 else w0
+        res_t = minimize(neg_cvar, start, method="COBYLA", constraints=constraints,
+                         options={"rhobeg": 0.05, "maxiter": 1000, "catol": 1e-6})
+        x_t = np.clip(res_t.x, 0.0, max_w)
+        x_t = x_t / x_t.sum() if x_t.sum() > 0 else start
+        try:
+            obj_t = neg_cvar(x_t)
+            if obj_t < best_obj:
+                best_obj, best_x = obj_t, x_t
+        except Exception:
+            continue
+    w = best_x if best_x is not None else np.full(n, 1.0 / n)
     port = R_arith @ w
     exp_ret = float(np.average(port, weights=scn_weights))
     realized_cvar = float(neg_cvar(w))

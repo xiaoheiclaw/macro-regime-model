@@ -47,6 +47,7 @@ from lib.schema import base_meta  # type: ignore
 from lib.metrics import (  # type: ignore
     crps_sample, crps_normal, pit_sample, pit_normal,
     energy_score_sample, energy_score_mvn, ar1_forecast,
+    moving_block_bootstrap_mean,
 )
 
 
@@ -581,47 +582,94 @@ def main() -> None:
 
     doc_dir = Path(ANALYSIS_DIR) / "v2"
     doc_dir.mkdir(parents=True, exist_ok=True)
-    # Energy Score + AR(1) sections
+    # Energy Score — PAIRED analysis with moving-block bootstrap CI.
+    # Each (asof, horizon) has both ES_v2 and ES_MVN (same scenarios, same
+    # realized), so the clean test is paired d_t = ES_MVN - ES_v2 > 0
+    # (positive = v2 wins). Overlapping h-month forwards require block
+    # length = h.
     if energy_rows:
         es_df = pd.DataFrame(energy_rows)
         es_df.to_parquet(out_dir / f"energy_{tag}.parquet", index=False)
-        es_summary = es_df.groupby("horizon").agg(
-            n=("es_v2", "count"),
-            es_v2_mean=("es_v2", "mean"),
-            es_mvn_mean=("es_mvn", "mean"),
-        ).round(4)
-        es_summary["skill"] = 1.0 - es_summary["es_v2_mean"] / es_summary["es_mvn_mean"]
-        lines.append("## Multivariate Energy Score (tests joint dependence)")
+        lines.append("## Multivariate Energy Score — paired v2 vs MVN")
         lines.append("")
-        lines.append("| horizon | n | ES v2 | ES MVN-bench | skill |")
-        lines.append("|---|---|---|---|---|")
-        for h, r in es_summary.iterrows():
+        lines.append(
+            "> MVN benchmark uses 500 Monte Carlo samples (single-seed). "
+            "d = ES_MVN − ES_v2 at each (asof, horizon); positive = v2 wins. "
+            "95% CI via moving-block bootstrap with block=horizon to handle "
+            "overlapping monthly forecasts."
+        )
+        lines.append("")
+        lines.append("| horizon | n | mean ES v2 | mean ES MVN | mean diff | 95% CI (blk-bootstrap) | skill % |")
+        lines.append("|---|---|---|---|---|---|---|")
+        for h, sub in es_df.groupby("horizon"):
+            sub = sub.dropna(subset=["es_v2", "es_mvn"])
+            if sub.empty:
+                continue
+            diff = (sub["es_mvn"] - sub["es_v2"]).values
+            mean_d, lo, hi = moving_block_bootstrap_mean(diff, block_length=int(h))
+            mean_v2 = float(sub["es_v2"].mean())
+            mean_mvn = float(sub["es_mvn"].mean())
+            skill_pct = 1.0 - mean_v2 / mean_mvn if mean_mvn > 0 else float("nan")
+            sig = "✓" if (lo > 0 or hi < 0) else "—"
             lines.append(
-                f"| {h}m | {int(r['n'])} | {r['es_v2_mean']:.4f} | "
-                f"{r['es_mvn_mean']:.4f} | {r['skill']:+.1%} |"
+                f"| {h}m | {len(sub)} | {mean_v2:.4f} | {mean_mvn:.4f} | "
+                f"{mean_d:+.4f} | [{lo:+.4f}, {hi:+.4f}] {sig} | {skill_pct:+.1%} |"
             )
         lines.append("")
 
     if alloc_rows:
         alloc_df = pd.DataFrame(alloc_rows)
         alloc_df.to_parquet(out_dir / f"allocation_{tag}.parquet", index=False)
-        lines.append("## Downstream allocation outcomes (realized forward returns)")
+        lines.append("## Downstream allocation — overall outcomes")
         lines.append("")
-        lines.append("| method | h | n | mean log-ret | ann log-ret | vol (h) | Sharpe (ann) |")
+        lines.append("| method | h | n | mean log-ret | ann log-ret | ann vol | ann Sharpe |")
         lines.append("|---|---|---|---|---|---|---|")
         for (method, h), sub in alloc_df.groupby(["method", "horizon"]):
             r = sub["realized_log_return"]
             mean_r = float(r.mean())
             vol_r = float(r.std())
-            # Annualize (log returns scale linearly; vol by sqrt)
             ann_r = mean_r * (12 / h)
             ann_vol = vol_r * np.sqrt(12 / h)
             sharpe = ann_r / ann_vol if ann_vol > 0 else float("nan")
             lines.append(
                 f"| {method} | {h}m | {len(sub)} | {mean_r:+.4f} | "
-                f"{ann_r:+.2%} | {vol_r:.4f} | {sharpe:+.2f} |"
+                f"{ann_r:+.2%} | {ann_vol:.2%} | {sharpe:+.2f} |"
             )
         lines.append("")
+
+        # Paired comparison on common asofs — the honest isolation
+        for (a, b, label) in [
+            ("sp_cvar_6m", "mvn_sp_cvar_6m", "v2 SP-CVaR vs MVN SP-CVaR"),
+            ("sp_cvar_6m", "bench_60_40",   "v2 SP-CVaR vs 60/40"),
+        ]:
+            lines.append(f"## Paired comparison: {label}")
+            lines.append("")
+            lines.append(
+                "> Inner-joined on common asofs. Paired return diff per asof, "
+                "then moving-block bootstrap (block=horizon) 95% CI. "
+                "Monthly asofs with h-month forward are overlapping → do NOT "
+                "treat 119 obs as independent."
+            )
+            lines.append("")
+            lines.append("| horizon | n_common | mean diff | 95% CI | sig? | ann mean diff |")
+            lines.append("|---|---|---|---|---|---|")
+            for h in sorted(alloc_df["horizon"].unique()):
+                a_sub = alloc_df[(alloc_df.method == a) & (alloc_df.horizon == h)]
+                b_sub = alloc_df[(alloc_df.method == b) & (alloc_df.horizon == h)]
+                if a_sub.empty or b_sub.empty:
+                    continue
+                paired = a_sub.merge(b_sub, on="asof", suffixes=("_a", "_b"))
+                if paired.empty:
+                    continue
+                d = (paired["realized_log_return_a"] - paired["realized_log_return_b"]).values
+                mean_d, lo, hi = moving_block_bootstrap_mean(d, block_length=int(h))
+                sig = "✓" if (lo > 0 or hi < 0) else "—"
+                ann_md = mean_d * (12 / h)
+                lines.append(
+                    f"| {h}m | {len(paired)} | {mean_d:+.4f} | "
+                    f"[{lo:+.4f}, {hi:+.4f}] | {sig} | {ann_md:+.2%} |"
+                )
+            lines.append("")
 
     if "crps_ar1" in df.columns and df["crps_ar1"].notna().any():
         lines.append("## AR(1) benchmark (stronger than unconditional Gaussian)")
