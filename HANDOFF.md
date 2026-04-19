@@ -134,6 +134,29 @@ with rule-based segmentation (VIX quantile / NBER dates / rolling
   Honest recalibration: Gold and Silver are the only assets that
   genuinely beat both benchmarks.
 
+**Subsample stability — v2 edge is literally stress-period-specific**:
+
+Mechanical 50/50 split of the 10-year backtest, paired v2 vs MVN
+SP-CVaR Δmean bootstrap with block=horizon:
+
+  Period         3m                      6m                      12m
+  2015-19 calm   +2.39% [−0.27, +5.43] — +2.01% [−0.32, +5.65] — +1.98% [−0.37, +4.62] —
+  2020-24 stress +2.24% [+0.54, +3.90] ✓ +2.50% [+0.89, +3.33] ✓ +2.95% [+1.39, +3.44] ✓
+
+Point estimates directionally consistent (both halves ~+2% ann positive),
+but statistical significance confined to 2020-24. Full-sample sig is
+driven by the second five years. **v2 edge is stress-period-specific
+with statistical backing on a mechanical (not hand-picked) split.**
+
+v2 vs 60/40 at 12m in CALM period: Sharpe diff −0.63 CI [−1.51, −0.16]
+✓ v2 significantly LOSES to 60/40 at long holds during calm expansion.
+Tail-defensive posture costs Sharpe when tails don't materialize.
+
+Honest deployment implication: v2 is not uniform alpha. It's stress-
+insurance you pay for during calm. Ideal would be regime-aware on/off
+gating; VIX threshold was rejected (Phase 3b.6), better gating signal
+remains open.
+
 **OOS 2002-2014 + matched-horizon + RegimeCond benchmark findings**:
 
 Ran the same pipeline on 13-year pre-inception window (2002-2014)
