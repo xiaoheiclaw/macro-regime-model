@@ -417,6 +417,21 @@ if pd.notna(stress_prob):
     lines.append(synthesis)
     lines.append("")
 
+# ── 加载 v2 配置（如存在） ──
+v2_weights = {"mv_bl_12m": {}, "sp_cvar_6m": {}}
+v2_meta: dict = {}
+try:
+    v2_path = Path(DATA_DIR) / "v2" / "weights_v2.parquet"
+    if v2_path.exists():
+        _v2_df = pd.read_parquet(v2_path)
+        for method, grp in _v2_df.groupby("method"):
+            v2_weights[str(method)] = {r.asset: float(r.weight) for r in grp.itertuples()}
+        _v2_meta_path = Path(DATA_DIR) / "v2" / "allocation_v2_meta.json"
+        if _v2_meta_path.exists():
+            v2_meta = json.load(open(_v2_meta_path))
+except Exception as _e:
+    print(f"v2 weights load failed: {_e}")
+
 # ── 配置建议 ──
 lines.append("## 配置建议")
 lines.append("")
@@ -432,8 +447,10 @@ asset_display = [
 ]
 has_bl = bool(bl_summary.get("sharpe_weights"))
 has_sp = "SP-CVaR" in sp_weights
+has_v2_bl = bool(v2_weights.get("mv_bl_12m"))
+has_v2_cvar = bool(v2_weights.get("sp_cvar_6m"))
 
-if has_bl or has_sp:
+if has_bl or has_sp or has_v2_bl or has_v2_cvar:
     # BL output uses display names like "S&P 500"; map to our column names
     _bl_name_map = {
         "S&P 500": "SPX", "10Y Treasury": "US10Y_yield", "Gold": "Gold",
@@ -448,11 +465,13 @@ if has_bl or has_sp:
     header = "| 资产 | 市场 |"
     sep = "|------|------|"
     if has_bl:
-        header += " BL-Sharpe |"
-        sep += "-----------|"
+        header += " v1 BL |"; sep += "-------|"
     if has_sp:
-        header += " SP-CVaR |"
-        sep += "---------|"
+        header += " v1 CVaR |"; sep += "---------|"
+    if has_v2_bl:
+        header += " v2 BL |"; sep += "-------|"
+    if has_v2_cvar:
+        header += " v2 CVaR |"; sep += "---------|"
     lines.append(header)
     lines.append(sep)
 
@@ -468,6 +487,16 @@ if has_bl or has_sp:
             w_pct = int(round(sp_w * 100))
             bold = "**" if w_pct >= 30 else ""
             row += f" {bold}{w_pct}%{bold} |"
+        if has_v2_bl:
+            v2bl = v2_weights["mv_bl_12m"].get(col, 0)
+            v2bl_pct = int(round(v2bl * 100))
+            bold = "**" if v2bl_pct >= 30 else ""
+            row += f" {bold}{v2bl_pct}%{bold} |"
+        if has_v2_cvar:
+            v2cv = v2_weights["sp_cvar_6m"].get(col, 0)
+            v2cv_pct = int(round(v2cv * 100))
+            bold = "**" if v2cv_pct >= 30 else ""
+            row += f" {bold}{v2cv_pct}%{bold} |"
         lines.append(row)
     lines.append("")
 
@@ -475,10 +504,25 @@ if has_bl or has_sp:
     if has_bl:
         bl_perf = sp_weights.get("BL-Sharpe", {}).get("perf", {})
         if bl_perf:
-            lines.append(f"- BL-Sharpe: Return {bl_perf.get('ann_return', 0)*100:+.1f}%, Vol {bl_perf.get('ann_vol', 0)*100:.1f}%, Sharpe {bl_perf.get('sharpe', 0):.2f}")
+            lines.append(f"- v1 BL: Return {bl_perf.get('ann_return', 0)*100:+.1f}%, Vol {bl_perf.get('ann_vol', 0)*100:.1f}%, Sharpe {bl_perf.get('sharpe', 0):.2f}")
     if has_sp:
         sp_perf = sp_weights["SP-CVaR"]["perf"]
-        lines.append(f"- SP-CVaR: Return {sp_perf.get('ann_return', 0)*100:+.1f}%, Vol {sp_perf.get('ann_vol', 0)*100:.1f}%, CVaR {sp_perf.get('cvar_95', 0)*100:.1f}%")
+        lines.append(f"- v1 CVaR: Return {sp_perf.get('ann_return', 0)*100:+.1f}%, Vol {sp_perf.get('ann_vol', 0)*100:.1f}%, CVaR {sp_perf.get('cvar_95', 0)*100:.1f}%")
+    if has_v2_bl or has_v2_cvar:
+        v2_ann = v2_meta.get("bl_portfolio_vol")
+        bl_exp = ""
+        if "bl_weights" in v2_meta:
+            # BL MV returns 12m log E[r] via scenario mean
+            bl_mu = sum(v2_meta.get("bl_weights", {}).get(k, 0) *
+                        v2_meta.get("bl_weights", {}).get(k, 0) for k in v2_meta.get("bl_weights", {}))
+        if has_v2_bl:
+            lines.append(f"- v2 BL: scenario-derived 12m portfolio vol {v2_ann*100:.1f}%" if v2_ann else "- v2 BL")
+        if has_v2_cvar:
+            er = v2_meta.get("cvar_expected_return", 0)*100
+            cvar = v2_meta.get("cvar_realized_cvar", 0)*100
+            lines.append(f"- v2 CVaR: E[r_6m] {er:+.1f}%, realised CVaR(5%) {cvar:.1f}%")
+    if has_v2_cvar:
+        lines.append("- _v2 SP-CVaR backtest 2015-24: paired ΔSharpe +0.24 vs MVN 6m (CI excl 0), turnover 0.31% drag_")
     lines.append("")
 
 # Direction
