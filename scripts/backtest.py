@@ -124,6 +124,44 @@ def _portfolio_realized(
     return float(np.log1p(total))
 
 
+def _mvn_allocate(
+    state: pd.DataFrame,
+    asof: pd.Timestamp,
+    h: int = 6,
+    n_scn: int = 200,
+    alpha: float = 0.05,
+    max_weight: float = 0.50,
+) -> dict[str, float] | None:
+    """
+    Fair benchmark for v2 SP-CVaR: generate n_scn scenarios from a
+    multivariate Normal fit to rolling 120m of asset returns (not KAF
+    analog ranking), then run the SAME SP-CVaR optimizer on them.
+    If v2 SP-CVaR realized Sharpe > MVN SP-CVaR realized Sharpe,
+    joint-structure information is real at the allocation layer.
+    """
+    import v2_allocation
+    labels = [lbl for lbl, _ in v2_allocation.V1_UNIVERSE]
+    ret_cols = [v2_allocation.V1_LABEL_TO_RET[lbl] for lbl in labels]
+    present = [(lbl, col) for lbl, col in zip(labels, ret_cols) if col in state.columns]
+    if not present:
+        return None
+    cols = [col for _, col in present]
+    labs = [lbl for lbl, _ in present]
+    hist = state[cols].loc[:asof].dropna(how="any").tail(120)
+    if len(hist) < max(24, len(cols) + 2):
+        return None
+    mu = hist.mean().values * h
+    Sigma = hist.cov().values * h + 1e-8 * np.eye(len(cols))
+    rng = np.random.default_rng(pd.Timestamp(asof).toordinal() + 9999)
+    try:
+        R_log = rng.multivariate_normal(mu, Sigma, size=n_scn)
+    except np.linalg.LinAlgError:
+        return None
+    w_eq = np.full(n_scn, 1.0 / n_scn)
+    w_opt, _, _ = v2_allocation.cvar_weights(R_log, w_eq, alpha=alpha, max_w=max_weight)
+    return {lab: float(w_opt[i]) for i, lab in enumerate(labs)}
+
+
 def _joint_gaussian_benchmark(
     state: pd.DataFrame,
     assets: list[str],
@@ -381,6 +419,22 @@ def main() -> None:
                                     "realized_log_return": pr,
                                     "weights": json.dumps({"SPX": 0.6, "US10Y_yield": 0.4}),
                                 })
+                            # MVN-scenario allocation: fair isolation of
+                            # "does joint structure help optimizer?" vs
+                            # "does optimizer help at all?"
+                            mvn_weights = _mvn_allocate(state, asof, h=6, n_scn=200)
+                            if mvn_weights is not None:
+                                for h_alloc in (1, 3, 6, 12):
+                                    pr = _portfolio_realized(state, mvn_weights, asof, h_alloc)
+                                    if pr is None:
+                                        continue
+                                    alloc_rows.append({
+                                        "asof": asof,
+                                        "method": "mvn_sp_cvar_6m",
+                                        "horizon": h_alloc,
+                                        "realized_log_return": pr,
+                                        "weights": json.dumps(mvn_weights),
+                                    })
                         except Exception as e:
                             print(f"  ⚠ allocation at {asof_str} failed: {e}")
 
