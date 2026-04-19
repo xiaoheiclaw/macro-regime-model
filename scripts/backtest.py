@@ -48,6 +48,7 @@ from lib.metrics import (  # type: ignore
     crps_sample, crps_normal, pit_sample, pit_normal,
     energy_score_sample, energy_score_mvn, ar1_forecast,
     moving_block_bootstrap_mean, moving_block_bootstrap_sharpe_diff,
+    regime_conditional_samples,
 )
 
 
@@ -318,6 +319,14 @@ def main() -> None:
                     alpha_val = float(alpha) if alpha is not None else float("nan")
                     gamma_val = float(gamma) if gamma is not None else float("nan")
                     kernel_val = kernel if kernel is not None else ""
+                    # Load current asof's global templates for regime-cond benchmark
+                    _tmpl_series = None
+                    try:
+                        _g_df = pd.read_parquet(Path(DATA_DIR) / "v2" / "global_templates.parquet")
+                        _tmpl_series = _g_df["template_id"]
+                    except Exception:
+                        pass
+
                     for (asset, h), grp in scn.groupby(["asset", "horizon"]):
                         samples = grp["log_return"].values
                         weights = grp["weight"].values
@@ -342,6 +351,16 @@ def main() -> None:
                             crps_ar = crps_normal(ar_mu, ar_sigma, realized)
                             pit_ar = pit_normal(ar_mu, ar_sigma, realized)
 
+                        # Regime-conditional historical benchmark
+                        crps_rc, pit_rc = float("nan"), float("nan")
+                        if _tmpl_series is not None and asset in state.columns:
+                            rc_samples = regime_conditional_samples(
+                                state[asset], _tmpl_series, asof, int(h)
+                            )
+                            if rc_samples is not None and len(rc_samples) > 0:
+                                crps_rc = crps_sample(rc_samples, realized)
+                                pit_rc = pit_sample(rc_samples, realized)
+
                         rows.append({
                             "asof": asof,
                             "alpha": alpha_val,
@@ -353,9 +372,11 @@ def main() -> None:
                             "crps_v2": crps_v2,
                             "crps_bench": crps_bench,
                             "crps_ar1": crps_ar,
+                            "crps_rc": crps_rc,
                             "pit_v2": pit_v2,
                             "pit_bench": pit_bench,
                             "pit_ar1": pit_ar,
+                            "pit_rc": pit_rc,
                             "n_scn": len(samples),
                         })
 
@@ -871,17 +892,33 @@ def main() -> None:
         lines.append("")
 
     if "crps_ar1" in df.columns and df["crps_ar1"].notna().any():
-        lines.append("## AR(1) benchmark (stronger than unconditional Gaussian)")
+        lines.append("## Per-asset skill vs multiple benchmarks")
         lines.append("")
-        lines.append("| asset | h | skill vs AR(1) | skill vs Gaussian |")
-        lines.append("|---|---|---|---|")
+        has_rc = "crps_rc" in df.columns and df["crps_rc"].notna().any()
+        if has_rc:
+            lines.append("| asset | h | skill vs AR(1) | skill vs Gaussian | skill vs RegimeCond |")
+            lines.append("|---|---|---|---|---|")
+        else:
+            lines.append("| asset | h | skill vs AR(1) | skill vs Gaussian |")
+            lines.append("|---|---|---|---|")
         for (asset, h), sub in df.groupby(["asset", "horizon"]):
             s_ar = sub["crps_ar1"].mean()
             s_g = sub["crps_bench"].mean()
             s_v = sub["crps_v2"].mean()
             skill_ar = 1 - s_v / s_ar if s_ar > 0 else float("nan")
             skill_g = 1 - s_v / s_g if s_g > 0 else float("nan")
-            lines.append(f"| {asset} | {h}m | {skill_ar:+.1%} | {skill_g:+.1%} |")
+            if has_rc:
+                sub_rc = sub.dropna(subset=["crps_rc"])
+                if len(sub_rc) >= 10:
+                    s_rc = sub_rc["crps_rc"].mean()
+                    s_v_rc = sub_rc["crps_v2"].mean()
+                    skill_rc = 1 - s_v_rc / s_rc if s_rc > 0 else float("nan")
+                    rc_str = f"{skill_rc:+.1%}"
+                else:
+                    rc_str = "—"
+                lines.append(f"| {asset} | {h}m | {skill_ar:+.1%} | {skill_g:+.1%} | {rc_str} |")
+            else:
+                lines.append(f"| {asset} | {h}m | {skill_ar:+.1%} | {skill_g:+.1%} |")
         lines.append("")
 
     doc_path = doc_dir / f"backtest_{tag}.md"
