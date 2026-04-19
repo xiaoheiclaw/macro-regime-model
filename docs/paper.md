@@ -1,6 +1,6 @@
 # 市场有两个隐形裁判——一个宏观体制识别与资产配置系统
 
-> DT | 2026-04-03
+> DT | 2026-04-03（v1 原文）· 2026-04-19（v2 后记）
 
 ---
 
@@ -293,6 +293,91 @@ Stress 体制下，标普和原油挨打，美元和黄金是避风港。BTC 两
 这个系统的核心贡献是**把三种不同视角的体制判断叠在一起**——参数法看均值方差跳变、非参数法看分布形状变化、Kalman 看因子敞口的连续漂移——减少任何单一方法的误判。TimesFM 的集成不是为了让 AI 替你做决定，而是让它的不确定性（分位数带宽）自动校准你该多大胆。
 
 下一步：用 TimesFM 的置信带宽变化率作为体制切换的前兆信号——如果模型突然对所有资产都变得不确定，这本身就是一个警报。
+
+---
+
+## 后记：v2 升级（2026-04）
+
+第一版系统上线三周后，做了一轮严格的 peer review（用 codex 做外部 reviewer）。指出七八个问题，核心有两个：
+
+**一、评测不够硬。** v1 输出看着合理，没人真验证过它是不是比"什么都不做"强。直接看出的产出（每天哪个资产多少权重）没有办法用来判断模型对不对——需要对比基线和做显著性检验。
+
+**二、架构耦合。** v1 把"宏观体制判断"和"资产预测"混在一起做 allocation，没法单独升级一块。想换分析器或换预测器都要动整个管线。
+
+v2 针对这两点做了重构。
+
+### 分层：状态 / 体制 / 预测 / 配置
+
+把原来的四个 Phase 拆成六层：
+
+1. **数据层** — state_features 月度面板。关键升级：接入 ALFRED vintage 做 point-in-time 数据（2008 年 9 月看到的就业数据，不是今天修订过的）。加入 Shiller CAPE 给模型"估值维度"，加入 Moody's AAA/BAA 替代 ICE OAS（ICE 把信用利差历史给截了）。
+2. **Mask 层** — 每个资产单独算哪些宏观指标对它最重要（mutual information）。
+3. **全局体制** — K-Means 在状态向量上识别宏观模板（4 个）。T0 紧缩周期、T1 ZIRP 恢复、T2 晚周期泡沫、T3 深度衰退。
+4. **资产体制** — 每个资产单独跑 GMM，分 bear/neutral/bull。
+5. **Forecast** — KAF（类比预测）。给定当前状态，在历史上找最相似的月份，把它们的 forward path 组成 scenarios。200 条 joint 路径（同一 scenario_id = 同一历史月）。
+6. **Allocation** — MV BL + SP-CVaR 吃这些 joint scenarios 做配置。
+
+这一层分工让每层都可以独立替换——比如体制层可以升级成 Wasserstein-HMM，Forecast 可以升级成 diffusion kernel，互不干扰。
+
+### 严格回测：120 个月，paired bootstrap
+
+架构好不好看单次输出不够。搭了一个月频滚动 backtest（2015-01 到 2024-12，120 个月），每个时点重新训练 regime 层（避免 look-ahead），用 CRPS 和 Energy Score 衡量分布预测质量，用 SP-CVaR 算实盘权重并追踪真实 forward return。
+
+对比基线放了四档：
+
+- 60/40 SPX+Bond（最天真）
+- Rolling-120m Gaussian（无条件 normal）
+- AR(1)（有一阶自回归）
+- **MVN SP-CVaR**（关键的公平基线：同样用 rolling 120m 估 μ,Σ，采样 200 条 scenarios，用**一模一样**的 CVaR 优化器）
+
+前三个只测"v2 有没有预测能力"，最后一个测"v2 的 joint scenario 结构有没有独立价值"——如果 v2 贏 MVN SP-CVaR，那赢的就是**联合结构信息**，不是优化器本身。
+
+### 结果：什么是真的，什么不是
+
+按严格的 paired moving-block bootstrap（block = horizon 来处理重叠样本依赖）得到的 95% CI，最后站得住的 claim：
+
+**真 win**（CI 不覆盖 0）：
+- Gold 和 Silver 对 AR(1) 基线的 CRPS skill 在 12m horizon 分别是 +7.6% / +4.8%。贵金属的体制依赖是真的。
+- v2 SP-CVaR 对 MVN SP-CVaR 的 paired 年化 return 差：6m +2.33%（CI +0.48% 到 +1.80%），Sharpe 差 +0.24（CI +0.04 到 +0.39）。**同样本同优化器同 cap 下，v2 的 joint 结构在 allocation 层兑现了 +0.24 Sharpe 的 edge**。
+
+**不是真的**（CI 覆盖 0，或被重新校准）：
+- 一开始声称的"overall skill -1.1%"。这是 per-asset CRPS 的加总，用 Gaussian 做基线很容易"赢"但意义不大。对更严的 AR(1) 基线，大多数资产 skill 消失。
+- 第一次报的"Joint Energy Score +1%"。更严的 5000×3 seed 平均 + paired bootstrap 做出来 1m 勉强 CI [0.0000, 0.0018]——名义上"sig"但下界贴零，不当硬结论。
+- 算力换来的纯 KAF 改进——α（regime 权重）、γ（tether 权重）、kernel 类型的网格搜索都是 ≤0.3pp 浮动。**距离度量微调没用，识别哪些资产不该走 KAF（BTC 和 Bond 切 Gaussian fallback）才是大头**。
+
+**有趣但不是 headline**：v2 的 CVaR 组合 vs 60/40 的 Sharpe（1.10 vs 0.70）优势来自 vol 降低，不是 return 溢价。这是一种不同类型的"赢"——纳入更多资产 + 做 tail optimization 让你以同样收益吃更少波动。但 paired-mean 检验不能识别这个。
+
+### 为什么 stress-specialist 的故事站不硬
+
+按日历窗口分段看（2015-19 平静扩张，2020 COVID，2022 通胀冲击，2024 recent），v2 在每个非平静窗口都赢 3-6 个百分点，在 2015-19 输 7.8%。看起来像"v2 在 regime 变动期特长"。
+
+但 codex 正确指出这是**后验窗口**——手选的时间段，不是规则化的划分，容易讲故事。试了 VIX 分位数阈值做 data-driven 的切分（VIX 高时用 KAF，低时用 Gaussian），反而让整体 skill 变差（-1.1% → -2.0%）。说明"stress 信号 = 高 VIX"这种简单映射不对，真正的分界更复杂。
+
+这个 hypothesis 记在 HANDOFF 里，以后用 rolling 24-month skill curve 做 data-driven 分段再回来验证。
+
+### 部署
+
+Phase 4 的验收项之一是 v1/v2 并排出现在 daily dashboard。现在打开每天的 dashboard 能看到：
+
+```
+资产   市场   v1 BL   v1 CVaR   v2 BL   v2 CVaR
+SPX    40%    38%     2%        2%      2%
+10Y    25%    27%     36%       0%      24%
+Gold   10%    10%     4%        50%     33%
+...
+```
+
+2026-04 当前两个 CVaR（v1 和 v2）都防御，但结构分歧：v1 用 Bond+USD，v2 用 Gold+USD。这种分歧正是设计文档预期的——多体制情形下两者应该分歧，因为它们用的条件信息不同。
+
+v2 BL 的 50% Gold + 40% BTC 是 MV 优化器在 2015-24 Gold/BTC 大涨样本里的期望最大化——hits cap，不是可持仓建议。Backtest 里 v2 BL 的 Sharpe 0.75 和 60/40 基本一样，说明它的高 return 是 vol 买来的，不是 skill。
+
+### 写完这一轮的感受
+
+写 v2 的主要功夫不在"加新模块"，在"证明加的模块真的有用"。45 个 commits 里大概 1/3 是加功能，2/3 是回应 reviewer 的各种质疑——paired samples、overlapping returns、MC noise、非对齐样本、CVaR 数值稳定性。每轮 review 都有东西站不住要缩回去。
+
+最后留下的是：**Gold/Silver 的体制预测真实**，**joint scenario 在 CVaR 下游真的加了 +0.24 Sharpe**，其他主张都收敛成"还在假设阶段"或"方向对但证据不够"。
+
+这个写法比 v1 那版"所有方法都好"更诚实，也更接近真实的量化工作常态——大部分想法不 work，少数 work 的也需要反复证实。
 
 ---
 
