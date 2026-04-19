@@ -47,7 +47,7 @@ from lib.schema import base_meta  # type: ignore
 from lib.metrics import (  # type: ignore
     crps_sample, crps_normal, pit_sample, pit_normal,
     energy_score_sample, energy_score_mvn, ar1_forecast,
-    moving_block_bootstrap_mean,
+    moving_block_bootstrap_mean, moving_block_bootstrap_sharpe_diff,
 )
 
 
@@ -645,13 +645,13 @@ def main() -> None:
             lines.append(f"## Paired comparison: {label}")
             lines.append("")
             lines.append(
-                "> Inner-joined on common asofs. Paired return diff per asof, "
-                "then moving-block bootstrap (block=horizon) 95% CI. "
-                "Monthly asofs with h-month forward are overlapping → do NOT "
-                "treat 119 obs as independent."
+                "> Inner-joined on common asofs. Paired mean-diff + Sharpe-diff "
+                "via moving-block bootstrap (block=horizon) 95% CIs. Monthly "
+                "asofs with h-month forward are overlapping, so block bootstrap "
+                "rather than iid resampling."
             )
             lines.append("")
-            lines.append("| horizon | n_common | mean diff | 95% CI | sig? | ann mean diff |")
+            lines.append("| horizon | n | paired Δmean (CI) | sig? | paired ΔSharpe (CI) | sig? |")
             lines.append("|---|---|---|---|---|---|")
             for h in sorted(alloc_df["horizon"].unique()):
                 a_sub = alloc_df[(alloc_df.method == a) & (alloc_df.horizon == h)]
@@ -661,15 +661,47 @@ def main() -> None:
                 paired = a_sub.merge(b_sub, on="asof", suffixes=("_a", "_b"))
                 if paired.empty:
                     continue
-                d = (paired["realized_log_return_a"] - paired["realized_log_return_b"]).values
-                mean_d, lo, hi = moving_block_bootstrap_mean(d, block_length=int(h))
-                sig = "✓" if (lo > 0 or hi < 0) else "—"
-                ann_md = mean_d * (12 / h)
+                r_a = paired["realized_log_return_a"].values
+                r_b = paired["realized_log_return_b"].values
+                d = r_a - r_b
+                mean_d, lo_m, hi_m = moving_block_bootstrap_mean(d, block_length=int(h))
+                sig_m = "✓" if (lo_m > 0 or hi_m < 0) else "—"
+                ds, ds_lo, ds_hi = moving_block_bootstrap_sharpe_diff(r_a, r_b, block_length=int(h))
+                sig_s = "✓" if (ds_lo > 0 or ds_hi < 0) else "—"
                 lines.append(
-                    f"| {h}m | {len(paired)} | {mean_d:+.4f} | "
-                    f"[{lo:+.4f}, {hi:+.4f}] | {sig} | {ann_md:+.2%} |"
+                    f"| {h}m | {len(paired)} | {mean_d:+.4f} "
+                    f"[{lo_m:+.4f}, {hi_m:+.4f}] | {sig_m} | "
+                    f"{ds:+.2f} [{ds_lo:+.2f}, {ds_hi:+.2f}] | {sig_s} |"
                 )
             lines.append("")
+
+        # Turnover analysis — how much tradeable edge survives transaction cost
+        lines.append("## Turnover & transaction-cost drag")
+        lines.append("")
+        lines.append(
+            "> L1 monthly turnover = Σ|w_t − w_{t-1}|; weights emitted at each "
+            "asof. Cost drag assumes 10 bps round-trip per unit turnover, "
+            "applied at the monthly rebalance cadence (realistic for h=1, "
+            "upper-bound for longer holds). Only the v2 methods have meaningful "
+            "turnover — 60/40 is static."
+        )
+        lines.append("")
+        lines.append("| method | mean L1 turnover / month | ann drag (10 bps rt) |")
+        lines.append("|---|---|---|")
+        for method in sorted(alloc_df["method"].unique()):
+            if method == "bench_60_40":
+                continue
+            sub_m = alloc_df[(alloc_df.method == method) & (alloc_df.horizon == 6)].sort_values("asof")
+            if len(sub_m) < 2:
+                continue
+            weights_list = [json.loads(w) for w in sub_m["weights"].values]
+            all_keys = sorted({k for wd in weights_list for k in wd.keys()})
+            vecs = np.array([[wd.get(k, 0.0) for k in all_keys] for wd in weights_list])
+            turn = np.sum(np.abs(np.diff(vecs, axis=0)), axis=1)
+            mean_turn = float(turn.mean())
+            ann_drag = mean_turn * 0.0010 * 12   # 10bps round-trip × 12 months
+            lines.append(f"| {method} | {mean_turn:.3f} | {ann_drag:.2%} |")
+        lines.append("")
 
     if "crps_ar1" in df.columns and df["crps_ar1"].notna().any():
         lines.append("## AR(1) benchmark (stronger than unconditional Gaussian)")

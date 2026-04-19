@@ -175,6 +175,43 @@ def moving_block_bootstrap_mean(
     return float(np.mean(x)), float(lo), float(hi)
 
 
+def moving_block_bootstrap_sharpe_diff(
+    r_a: np.ndarray,
+    r_b: np.ndarray,
+    block_length: int,
+    n_resamples: int = 2000,
+    seed: int = 42,
+) -> tuple[float, float, float]:
+    """
+    Moving-block bootstrap CI for Sharpe(a) − Sharpe(b) on PAIRED return
+    series (same asofs). Block length = h preserves overlapping-forward
+    dependence. Returns (point_estimate, ci_lo_95, ci_hi_95).
+    """
+    r_a = np.asarray(r_a, dtype=float)
+    r_b = np.asarray(r_b, dtype=float)
+    mask = np.isfinite(r_a) & np.isfinite(r_b)
+    r_a, r_b = r_a[mask], r_b[mask]
+    n = len(r_a)
+    if n < 2 * block_length:
+        return float("nan"), float("nan"), float("nan")
+
+    def sharpe(x):
+        s = x.std(ddof=1)
+        return float(x.mean() / s) if s > 0 else 0.0
+
+    point = sharpe(r_a) - sharpe(r_b)
+    rng = np.random.default_rng(seed)
+    n_blocks = int(np.ceil(n / block_length))
+    starts_space = n - block_length + 1
+    diffs = np.empty(n_resamples)
+    for i in range(n_resamples):
+        starts = rng.integers(0, starts_space, size=n_blocks)
+        idx = np.concatenate([np.arange(s, s + block_length) for s in starts])[:n]
+        diffs[i] = sharpe(r_a[idx]) - sharpe(r_b[idx])
+    lo, hi = np.quantile(diffs, [0.025, 0.975])
+    return float(point), float(lo), float(hi)
+
+
 def ar1_forecast(
     series: pd.Series,
     h: int,
