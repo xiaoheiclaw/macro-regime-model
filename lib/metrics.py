@@ -222,6 +222,40 @@ def moving_block_bootstrap_sharpe_diff(
     return float(point), float(lo), float(hi)
 
 
+def regime_conditional_samples(
+    state_series: pd.Series,
+    global_template_series: pd.Series,
+    asof: pd.Timestamp,
+    h: int,
+    min_samples: int = 10,
+) -> np.ndarray | None:
+    """
+    Regime-conditional historical bootstrap: at asof, identify current global
+    regime (argmax of global template probabilities), then sample h-month
+    forward cumulative log returns from all PAST asofs in the same regime.
+
+    global_template_series: date-indexed series of int template IDs
+        (argmax already taken — use global_templates['template_id']).
+    Returns sample array or None if < min_samples matching months.
+    """
+    if asof not in global_template_series.index:
+        return None
+    cur_regime = int(global_template_series.loc[asof])
+    past_tmpl = global_template_series.loc[:asof].iloc[:-1]
+    matching = past_tmpl[past_tmpl == cur_regime].index
+    if len(matching) < min_samples:
+        return None
+
+    def _fwd(s, hh):
+        return s.shift(-1).rolling(hh).sum().shift(-(hh - 1))
+
+    fwd = _fwd(state_series, h)
+    samples = fwd.reindex(matching).dropna().values
+    if len(samples) < min_samples:
+        return None
+    return samples.astype(float)
+
+
 def ar1_forecast(
     series: pd.Series,
     h: int,
