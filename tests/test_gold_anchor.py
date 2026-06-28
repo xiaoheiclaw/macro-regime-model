@@ -638,15 +638,15 @@ def test_gh_summary_majority_rule_not_any_stat():
     assert _gh_summary(res_maj)["any_reject"] is True
 
 
-def test_gh_independent_walks_size_smoke():
-    # Lightweight size smoke test (kept small/fast — capped lag, modest n & seeds):
-    # the empirical 5% rejection rate on independent walks must stay low, not ~1.0
-    # (a broken impl that always "finds" a break would fail here).
+def test_gh_independent_walks_no_majority_reject():
+    # Behavior regression on a handful of FIXED independent-walk seeds: under the
+    # pre-registered ≥2/3 majority rule, none should be flagged as cointegrated.
+    # (A broken impl that always "finds" a break would fail here.) Fixed seeds +
+    # the decision criterion (majority_reject) make this robust, not a chancy
+    # empirical-rate threshold.
     n = 150
     idx = pd.date_range("1980-01-31", periods=n, freq="ME")
-    rejects = 0
-    trials = 8
-    for s in range(trials):
+    for s in range(6):
         df = pd.DataFrame(
             {"ln_gold_nominal": np.cumsum(np.random.default_rng(1000 + 2 * s).standard_normal(n)),
              "ln_debt_gdp": np.cumsum(np.random.default_rng(1001 + 2 * s).standard_normal(n))},
@@ -654,8 +654,7 @@ def test_gh_independent_walks_size_smoke():
         )
         gh = gregory_hansen_test(df, "ln_gold_nominal", ["ln_debt_gdp"],
                                  model="C/S", max_lag=2)
-        rejects += int(gh["adf"]["reject_no_coint"])
-    assert rejects / trials <= 0.4  # empirical size near nominal, not ~1.0
+        assert gh["majority_reject"] is False, f"seed {s} spuriously majority-rejected"
 
 
 def test_gh_trivariate_m_and_cv_lookup():
@@ -704,6 +703,41 @@ def test_gh_validates_inputs():
     nodate = df.reset_index(drop=True)
     with pytest.raises(ValueError):
         gregory_hansen_test(nodate, "ln_gold_nominal", ["ln_debt_gdp"])
+    # unsorted time index → ValueError (break search is row-ordered)
+    shuffled = df.iloc[np.argsort(np.random.default_rng(0).standard_normal(len(df)))]
+    with pytest.raises(ValueError, match="time-sorted"):
+        gregory_hansen_test(shuffled, "ln_gold_nominal", ["ln_debt_gdp"])
+    # duplicate timestamps → ValueError (row↔date mapping ambiguous)
+    dup = pd.concat([df.iloc[:5], df])
+    with pytest.raises(ValueError, match="unique time index"):
+        gregory_hansen_test(dup.sort_index(), "ln_gold_nominal", ["ln_debt_gdp"])
+
+
+def test_gh_ct_model_reports_trend_coef():
+    # the publicly-supported C/T (level+trend) model must expose the linear trend
+    # coefficient so the regression is reconstructable; C / C/S have trend_coef None.
+    df, _ = _regime_shift_cointegrated()
+    ct = gregory_hansen_test(df, "ln_gold_nominal", ["ln_debt_gdp"], model="C/T")
+    for s in ("adf", "zt", "zalpha"):
+        assert ct["coint_vectors"][s]["trend_coef"] is not None
+    c = gregory_hansen_test(df, "ln_gold_nominal", ["ln_debt_gdp"], model="C")
+    assert c["coint_vectors"]["adf"]["trend_coef"] is None
+
+
+def test_gh_summary_counts_missing_system_as_incomplete():
+    # P1 hardening: _gh_summary must gate on the EXPECTED system set, so a gh_res
+    # that is MISSING the trivariate system entirely counts it as incomplete
+    # (kill condition must not fire on the bivariate evidence alone).
+    from scripts.gold_anchor_analysis import _gh_summary, GH_MODELS
+
+    res = {"systems": {  # trivariate deliberately absent
+        "bivariate": {"skip": None,
+                      "models": {m: {"majority_reject": False} for m in GH_MODELS}},
+    }}
+    s = _gh_summary(res)
+    assert s["n_completed"] == len(GH_MODELS)
+    assert s["n_incomplete"] >= len(GH_MODELS)  # the missing trivariate counts
+    assert s["any_reject"] is False
 
 
 def test_gh_min_obs_helper_matches_test_gate():
@@ -731,7 +765,7 @@ def test_gh_rank_deficient_break_is_skipped():
         index=idx,
     )
     # every break design is rank-deficient (const ≡ flat) → all fail → ValueError
-    with pytest.raises(ValueError, match="every candidate break"):
+    with pytest.raises(ValueError, match="no statistic produced a valid break"):
         gregory_hansen_test(df, "ln_gold_nominal", ["flat"], model="C/S")
 
 

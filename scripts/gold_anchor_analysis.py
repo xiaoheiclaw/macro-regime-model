@@ -417,7 +417,7 @@ GH_MODEL_LABEL = {"C": "level shift (C)", "C/S": "regime shift (C/S)"}
 GH_SYSTEMS = ("bivariate", "trivariate")
 
 
-def _run_gregory_hansen(df, notes) -> dict:
+def _run_gregory_hansen(df, notes, trim=0.15, max_lag=6, alpha=0.05) -> dict:
     """Step 3 (PR #3): Gregory-Hansen single-endogenous-break cointegration on
     (a) bivariate [ln金价, ln(债务/GDP)] (full sample) and (b) trivariate
     [+实利率] on the clean post-TIPS (≥2003) subsample. PR #1/#2 ordinary
@@ -460,7 +460,7 @@ def _run_gregory_hansen(df, notes) -> dict:
             continue
         usable = sub[[ycol] + xcols].dropna()
         # gate on the SAME bound the lib enforces (no divergent magic threshold).
-        need = gregory_hansen_min_obs(len(xcols))
+        need = gregory_hansen_min_obs(len(xcols), max_lag)
         if len(usable) < need:
             entry["skip"] = f"too few complete rows (n={len(usable)} < {need})"
             out["systems"][key] = entry
@@ -468,7 +468,8 @@ def _run_gregory_hansen(df, notes) -> dict:
         for model in GH_MODELS:
             try:
                 entry["models"][model] = gregory_hansen_test(
-                    sub, ycol, xcols, model=model)
+                    sub, ycol, xcols, model=model,
+                    trim=trim, max_lag=max_lag, alpha=alpha)
             except (ValueError, np.linalg.LinAlgError) as e:
                 # short message for the report; full message in error_full for debugging
                 entry["models"][model] = {
@@ -554,8 +555,13 @@ def _gh_summary(gh_res: dict) -> dict:
     any_reject = False  # pre-registered: a cell rejects iff ≥2/3 stats reject
     n_completed = 0
     n_incomplete = 0
-    for e in gh_res["systems"].values():
-        if e.get("skip"):
+    systems = gh_res.get("systems", {})
+    # iterate the EXPECTED system set (not whatever happens to be present): a
+    # missing required system must count as incomplete so the completeness gate
+    # never depends on the producer always being correct.
+    for key in GH_SYSTEMS:
+        e = systems.get(key)
+        if e is None or e.get("skip"):
             n_incomplete += len(GH_MODELS)
             continue
         for model in GH_MODELS:
@@ -584,8 +590,14 @@ def _gh_verdict_lines(gh_res: dict) -> list:
     L.append("> 预注册主判据: 单元「拒绝无协整」**当且仅当 3 个统计量中 ≥2 个拒绝**(多数决),"
              "防止孤立单统计量显著被当作研究结论;ADF* 为头条统计量。\n")
     diag_0822 = []  # argmin breaks near 2008/2022 — DIAGNOSTIC position, not evidence
-    # render per-cell lines (no decision counting here — that's _gh_summary's job)
-    for key, e in gh_res["systems"].items():
+    systems = gh_res.get("systems", {})
+    # render per-cell lines over the EXPECTED system set (no decision counting
+    # here — that's _gh_summary's job). A required-but-missing system is shown.
+    for key in GH_SYSTEMS:
+        e = systems.get(key)
+        if e is None:
+            L.append(f"- **{key}: 缺失(未产出该系统)** → 计为未完成,不参与裁决 (推理)。")
+            continue
         if e.get("skip"):
             L.append(f"- **{e['label']}: skipped ({e['skip']})** → 该系统未参与裁决 (推理)。")
             continue
@@ -849,6 +861,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--start", default="1968-01-01")
     ap.add_argument("--end", default=None)
+    # Gregory-Hansen sensitivity knobs (defaults match the lib defaults)
+    ap.add_argument("--gh-trim", type=float, default=0.15,
+                    help="GH break-search trim fraction (default 0.15)")
+    ap.add_argument("--gh-max-lag", type=int, default=6,
+                    help="GH ADF* max augmentation lag (AIC ≤ this; default 6)")
+    ap.add_argument("--gh-alpha", type=float, default=0.05,
+                    choices=[0.01, 0.05, 0.10],
+                    help="GH reject level (default 0.05)")
     args = ap.parse_args()
 
     # data/ and analysis/ are gitignored → may not exist on a fresh checkout
@@ -935,7 +955,8 @@ def main():
         print(f"  trivariate verdict: {tri['verdict']}")
 
     print("[5/6] Gregory-Hansen break cointegration (bivariate + trivariate; C / C/S)...")
-    gh_res = _run_gregory_hansen(df, panel.notes)
+    gh_res = _run_gregory_hansen(df, panel.notes, trim=args.gh_trim,
+                                 max_lag=args.gh_max_lag, alpha=args.gh_alpha)
     for key, e in gh_res["systems"].items():
         if e.get("skip"):
             print(f"  GH {key}: skipped — {e['skip']}")

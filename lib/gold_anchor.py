@@ -1026,6 +1026,16 @@ def gregory_hansen_test(
         raise ValueError(
             "gregory_hansen_test requires a DatetimeIndex (break dates are "
             f"reported from it); got {type(sub.index).__name__}")
+    # GH searches breaks by ROW ORDER and interprets trend/break_date by time. An
+    # unsorted or duplicated index would search breaks in the wrong temporal order
+    # while start/end (min/max) hide it — reject rather than silently mis-search.
+    if not sub.index.is_monotonic_increasing:
+        raise ValueError(
+            "gregory_hansen_test requires a time-sorted index "
+            "(break search is row-ordered); sort the frame first")
+    if sub.index.has_duplicates:
+        raise ValueError("gregory_hansen_test requires a unique time index "
+                         "(duplicate timestamps break the row↔date mapping)")
     if not np.isfinite(sub.values).all():
         raise ValueError(f"gregory_hansen_test got non-finite values in {cols}")
     T = len(sub)
@@ -1058,8 +1068,12 @@ def gregory_hansen_test(
         "zt": {"stat": np.inf, "k": None},
         "zalpha": {"stat": np.inf, "k": None},
     }
-    n_breaks = 0
-    n_failed = 0
+    # per-statistic valid-break counts, tracked INDEPENDENTLY: a Phillips-Z
+    # failure (non-positive long-run variance) at a break must NOT drop that
+    # break's ADF* result from the ADF min search, and vice-versa.
+    n_valid = {"adf": 0, "zt": 0, "zalpha": 0}
+    n_breaks = 0  # breaks where the design was identified (>=1 stat could be tried)
+    n_failed = 0  # breaks where the design itself was unusable (rank-deficient)
     for k in range(lo, hi + 1):
         X = _gh_design(y2, k, model)
         # OLS via lstsq. A rank-deficient design (collinear break regressors at
@@ -1075,32 +1089,41 @@ def gregory_hansen_test(
             n_failed += 1
             continue
         resid = y - X @ coef
+        n_breaks += 1
+        # ADF* and the Phillips Z's are computed and counted SEPARATELY so one's
+        # numerical failure never contaminates the other's min-statistic search.
         try:
             adf_stat, used_lag = _adf_resid_stat(resid, max_lag)
-            za, zt, _rho, _bw = _phillips_z_resid(resid, bandwidth)
+            if adf_stat < best["adf"]["stat"]:
+                best["adf"] = {"stat": adf_stat, "k": k, "lag": used_lag}
+            n_valid["adf"] += 1
         except (ValueError, np.linalg.LinAlgError):
-            n_failed += 1
-            continue
-        n_breaks += 1
-        if adf_stat < best["adf"]["stat"]:
-            best["adf"] = {"stat": adf_stat, "k": k, "lag": used_lag}
-        if zt < best["zt"]["stat"]:
-            best["zt"] = {"stat": zt, "k": k}
-        if za < best["zalpha"]["stat"]:
-            best["zalpha"] = {"stat": za, "k": k}
+            pass
+        try:
+            za, zt, _rho, _bw = _phillips_z_resid(resid, bandwidth)
+            if zt < best["zt"]["stat"]:
+                best["zt"] = {"stat": zt, "k": k}
+            if za < best["zalpha"]["stat"]:
+                best["zalpha"] = {"stat": za, "k": k}
+            n_valid["zt"] += 1
+            n_valid["zalpha"] += 1
+        except (ValueError, np.linalg.LinAlgError):
+            pass
 
-    if n_breaks == 0:
+    if all(v == 0 for v in n_valid.values()):
         raise ValueError(
-            "gregory_hansen_test: every candidate break regression failed "
-            f"(T={T}, model={model})"
+            "gregory_hansen_test: no statistic produced a valid break "
+            f"(T={T}, model={model}; all designs rank-deficient or degenerate)"
         )
 
     def _pack(stat_key: str) -> Dict[str, object]:
         b = best[stat_key]
         cv = _gh_critical_values(model, m, "zalpha" if stat_key == "zalpha" else "adf")
-        stat_val = float(b["stat"])
-        reject = bool(cv is not None and stat_val < cv[alpha])
         k = b["k"]
+        # a statistic with zero valid breaks is UNAVAILABLE — not "fail to reject".
+        available = k is not None
+        stat_val = float(b["stat"]) if available else None
+        reject = bool(available and cv is not None and stat_val < cv[alpha])
         # the break dummy is φ_t = 1{t > k}: row k is the LAST pre-break period and
         # row k+1 is the FIRST post-break period. Report the latter as the break
         # date (the period the structure actually shifts), and expose both.
@@ -1108,6 +1131,8 @@ def gregory_hansen_test(
         first_post = None if k is None else idx[min(k + 1, T - 1)].date().isoformat()
         out = {
             "stat": stat_val,
+            "available": available,
+            "n_valid_breaks": int(n_valid[stat_key]),
             "break_index": (None if k is None else int(k)),
             "break_date": first_post,
             "last_pre_break_date": last_pre,
@@ -1134,10 +1159,14 @@ def gregory_hansen_test(
         if rk < Xk.shape[1]:
             return None
         mu1, mu2 = float(coef[0]), float(coef[1])
+        trend_coef = None
         if model == "C/S":
             betas_pre = [float(c) for c in coef[2:2 + m]]
             betas_post = [float(coef[2 + m + i] + coef[2 + i]) for i in range(m)]
         elif model == "C/T":
+            # design = [const, φ, trend, y2] → coef[2] is the linear trend slope;
+            # without it the C/T regression can't be reconstructed.
+            trend_coef = float(coef[2])
             betas_pre = betas_post = [float(c) for c in coef[3:3 + m]]
         else:  # C
             betas_pre = betas_post = [float(c) for c in coef[2:2 + m]]
@@ -1147,6 +1176,7 @@ def gregory_hansen_test(
             "break_date": idx[min(k + 1, T - 1)].date().isoformat(),
             "intercept_pre": mu1,
             "intercept_post": mu1 + mu2,
+            "trend_coef": trend_coef,  # None unless model == "C/T" (per-period slope)
             "betas_pre": betas_pre,
             "betas_post": betas_post,
         }
