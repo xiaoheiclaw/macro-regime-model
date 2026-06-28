@@ -28,6 +28,7 @@ from lib.gold_anchor import (
     build_anchor_panel,
     combined_verdict,
     estimate_vecm,
+    gregory_hansen_test,
     integration_segments,
     integration_table,
     johansen_robustness,
@@ -403,24 +404,188 @@ def _fmt_vecm(tri) -> list:
     return L
 
 
-def _build_report(df, notes, itab, jres, args, rr_segs=None, tri=None) -> str:
+# PR #3: Gregory-Hansen models run on each system — level shift (C) and
+# regime shift (C/S). C/T (level+trend) is available in the lib but omitted here
+# to keep the report focused on the two shifts the spec names.
+GH_MODELS = ("C", "C/S")
+GH_MODEL_LABEL = {"C": "level shift (C)", "C/S": "regime shift (C/S)"}
+
+
+def _run_gregory_hansen(df, notes) -> dict:
+    """Step 3 (PR #3): Gregory-Hansen single-endogenous-break cointegration on
+    (a) bivariate [ln金价, ln(债务/GDP)] (full sample) and (b) trivariate
+    [+实利率] on the clean post-TIPS (≥2003) subsample. PR #1/#2 ordinary
+    Johansen found no STABLE constant-vector cointegration; GH asks whether a
+    relation exists once ONE level/regime shift is allowed (the spec §2 'is 2022
+    the anchor itself breaking?' cross-check). Each system is run under both
+    model C (level shift) and C/S (regime shift)."""
+    out = {"systems": {}, "tips_start": notes.get("real_rate_tips_start", "n/a")}
+
+    systems = [
+        ("bivariate", "双变量 [ln金价, ln(债务/GDP)] · 全样本",
+         "ln_gold_nominal", ["ln_debt_gdp"], df),
+    ]
+    cutoff = notes.get("real_rate_tips_start", "n/a")
+    if cutoff and cutoff != "n/a":
+        tri_df = df.loc[df.index >= pd.Timestamp(cutoff)]
+        systems.append(
+            ("trivariate", f"三变量 [ln金价, ln(债务/GDP), 实利率] · clean TIPS (≥{cutoff})",
+             "ln_gold_nominal", ["ln_debt_gdp", "real_rate_10y"], tri_df))
+
+    for key, label, ycol, xcols, sub in systems:
+        entry = {"label": label, "y": ycol, "x": xcols, "models": {}, "skip": None}
+        usable = sub[[ycol] + xcols].dropna()
+        if len(usable) < 60:
+            entry["skip"] = f"too few complete rows (n={len(usable)})"
+            out["systems"][key] = entry
+            continue
+        for model in GH_MODELS:
+            try:
+                entry["models"][model] = gregory_hansen_test(
+                    sub, ycol, xcols, model=model)
+            except (ValueError, np.linalg.LinAlgError) as e:
+                entry["models"][model] = {"error": f"{type(e).__name__}: {str(e)[:80]}"}
+        out["systems"][key] = entry
+    return out
+
+
+def _fmt_gh_one(gh: dict) -> list:
+    """Render one Gregory-Hansen model result (a single system × model)."""
     L = []
-    L.append("# 黄金「锚 + 偏离」— 单整 + 协整 + 三变量 VECM\n")
+    if "error" in gh:
+        L.append(f"- **error: {gh['error']}** — 该设定未产出 GH 统计量 (推理)。")
+        return L
+    L.append(f"- n_obs={gh['n_obs']}, m={gh['m']}, trim={gh['trim']}, "
+             f"样本 {gh['start']}..{gh['end']}, 评估断点数={gh['n_breaks_evaluated']} "
+             f"(失败 {gh['n_breaks_failed']}) (事实)")
+    L.append(f"- α={gh['alpha_level']};临界值更负于普通 ADF/PP(因对断点取了最小)。统计量 < 临界值 ⇒ 拒绝「无协整」。")
+    L.append("")
+    L.append(f"  {'统计量':<10}{'值':>9}{'断点日期':>13}{'τ':>7}   "
+             f"{'cv@1%':>8}{'cv@5%':>8}{'cv@10%':>8}  裁决@5%")
+    name = {"adf": "ADF*", "zt": "Zt*", "zalpha": "Zα*"}
+    for s in ("adf", "zt", "zalpha"):
+        r = gh[s]
+        cv = r["critical_values"] or {}
+        cvs = (f"{cv.get(0.01, float('nan')):>8.2f}{cv.get(0.05, float('nan')):>8.2f}"
+               f"{cv.get(0.10, float('nan')):>8.2f}") if cv else f"{'n/a':>24}"
+        rej = "✓ 拒绝(协整)" if r["reject_no_coint"] else "✗ 不拒绝"
+        lag = f" (lag={r['adf_lag']})" if s == "adf" and r.get("adf_lag") is not None else ""
+        L.append(f"  {name[s]:<10}{r['stat']:>9.2f}{str(r['break_date']):>13}"
+                 f"{(r['break_fraction'] or float('nan')):>7.2f}   {cvs}  {rej}{lag}")
+    cvtr = gh.get("coint_vector")
+    if cvtr:
+        if gh["model"] == "C/S":
+            L.append(f"- 协整向量(ADF* 断点处, 断点前/后): "
+                     f"截距 {cvtr['intercept_pre']:.3f}→{cvtr['intercept_post']:.3f}; "
+                     f"β {[round(b,3) for b in cvtr['betas_pre']]}"
+                     f"→{[round(b,3) for b in cvtr['betas_post']]} (事实)")
+        else:
+            L.append(f"- 协整向量(ADF* 断点处): 截距 {cvtr['intercept_pre']:.3f}"
+                     f"(前)→{cvtr['intercept_post']:.3f}(后), β(常定)"
+                     f"={[round(b,3) for b in cvtr['betas_pre']]} (事实)")
+    return L
+
+
+def _fmt_gregory_hansen(gh_res: dict) -> list:
+    L = []
+    L.append("\n## 4. Gregory-Hansen 断点协整 — 允许一个内生结构断点后,锚是否「分段存在」\n")
+    L.append("PR #1(双变量)与 PR #2(三变量)的**普通 Johansen** 都测不出稳健的常参数协整。"
+             "GH (1996) 把原假设设为「无协整」、备择设为「存在一个未知断点的协整(level/regime "
+             "shift)」:对每个候选断点重估带断点哑变量的协整回归并对残差做单位根检验,"
+             "**GH 统计量 = 所有断点上最负的 ADF*/Zt*/Zα***,argmin 即内生断点。"
+             "这直接回答 spec §2 的「2008/2022 是不是锚关系本身断了」。\n")
+    L.append("> ⚠️ **功效限制 (事实)**: 干净 TIPS 仅 2003+,三变量 GH 在该短样本上的断点检验功效有限;"
+             "短样本里「测不出」既可能是真无协整,也可能是检验功效不足——不可只凭它下定论。\n")
+    for key, e in gh_res["systems"].items():
+        L.append(f"\n### {e['label']}\n")
+        if e.get("skip"):
+            L.append(f"- **skipped: {e['skip']}** (推理)")
+            continue
+        for model in GH_MODELS:
+            gh = e["models"].get(model)
+            if gh is None:
+                continue
+            L.append(f"\n**模型 {GH_MODEL_LABEL[model]}**\n")
+            L.extend(_fmt_gh_one(gh))
+    return L
+
+
+def _gh_verdict_lines(gh_res: dict) -> list:
+    """Honest GH verdict + kill condition (spec §杀死条件 extension)."""
+    L = []
+    L.append("\n### Gregory-Hansen 裁决(诚实)\n")
+    any_reject_overall = False
+    near_0822 = []  # breaks landing near 2008 / 2022
+    for key, e in gh_res["systems"].items():
+        if e.get("skip"):
+            L.append(f"- **{e['label']}: skipped ({e['skip']})** (推理)。")
+            continue
+        sys_rejects = []
+        for model in GH_MODELS:
+            gh = e["models"].get(model)
+            if gh is None or "error" in gh:
+                L.append(f"- {e['label']} · {GH_MODEL_LABEL[model]}: "
+                         f"未产出/出错 (推理)。")
+                continue
+            rejecters = [s for s in ("adf", "zt", "zalpha") if gh[s]["reject_no_coint"]]
+            if rejecters:
+                any_reject_overall = True
+                sys_rejects.append(model)
+                bdate = gh["adf"]["break_date"]
+                bstats = ", ".join(s.upper() for s in rejecters)
+                L.append(f"- **{e['label']} · {GH_MODEL_LABEL[model]}: 拒绝「无协整」"
+                         f"({bstats} 显著)→ 断点调整后协整成立 (推理)。** "
+                         f"ADF* 断点 {bdate};协整向量见 §4 (事实)。")
+                for s in ("adf", "zt", "zalpha"):
+                    bd = gh[s]["break_date"]
+                    if bd and (bd[:4] in {"2007", "2008", "2009", "2021", "2022", "2023"}):
+                        near_0822.append(f"{e['label']}/{GH_MODEL_LABEL[model]}/{s.upper()}={bd}")
+            else:
+                L.append(f"- {e['label']} · {GH_MODEL_LABEL[model]}: "
+                         f"三统计量均不拒绝「无协整」(ADF*={gh['adf']['stat']:.2f} vs "
+                         f"cv@5%={(gh['adf']['critical_values'] or {}).get(0.05, float('nan')):.2f}) "
+                         f"→ 即便允许断点也无协整 (推理)。")
+    L.append("")
+    if near_0822:
+        uniq = sorted(set(near_0822))
+        L.append(f"- **断点落在 2008/2022 附近**: {'; '.join(uniq)} → 与「2008 危机 / 2022 "
+                 "通胀-加息」结构变化吻合 (推理)。")
+    if any_reject_overall:
+        L.append("- **对照普通 Johansen (PR #2)**: 普通常参数 Johansen 测不出稳健协整,"
+                 "但允许单一断点的 GH 能在上述设定下拒绝「无协整」→ **锚是「分段存在」的**:"
+                 "协整关系在断点前后各自成立、但向量本身发生了位移,这正是常参数检验失败的原因 (推理)。")
+    else:
+        L.append("- **对照普通 Johansen (PR #2)**: 普通 Johansen 测不出协整,GH 允许单一断点后"
+                 "**仍测不出** → 连「单断点线性锚」也被否定 (推理)。")
+        L.append("- ⚠️ **杀死条件触发 (spec §杀死条件扩展)**: 双变量与三变量、level 与 regime "
+                 "shift 下 GH 均不拒绝「无协整」→ 线性(含单断点)锚被双向证伪。下一步只能上"
+                 "**Markov-switching / TVP**(时变参数协整,PR #4),不再做常参数/单断点线性设定 (推测)。")
+        L.append("- 注:三变量 clean TIPS 子样本短(2003+),GH 断点检验**功效有限**,"
+                 "「测不出」需谨慎解读(见 §4 功效限制) (事实)。")
+    return L
+
+
+def _build_report(df, notes, itab, jres, args, rr_segs=None, tri=None, gh_res=None) -> str:
+    L = []
+    L.append("# 黄金「锚 + 偏离」— 单整 + 协整 + 三变量 VECM + GH 断点协整\n")
     L.append(f"> 生成时间区间: {df.index.min().date()} .. {df.index.max().date()} "
-             f"({len(df)} 个月)。对应 `docs/gold-anchor-vecm-spec.md` 第 0–2 步。\n")
+             f"({len(df)} 个月)。对应 `docs/gold-anchor-vecm-spec.md` 第 0–3 步。\n")
     L.append("> PR #1: 单整检验 + 双变量协整生死门。PR #2: 长端实利率两段 I(d) 复核 + "
              "**三变量 Johansen [金价,债务/GDP,实利率]** + (若稳健协整) **VECM** 拆长期锚/短期偏离。"
-             "**2022 分解 / Gregory-Hansen 断点**留作 PR #3。\n")
+             "PR #3: **Gregory-Hansen 断点协整**——允许一个内生结构断点后,锚是否「分段存在」"
+             "(双变量 + 三变量,level shift / regime shift)。**Markov-switching / TVP** 留作 PR #4。\n")
 
     L.append("\n## 0. 数据与口径\n")
     for k, v in notes.items():
         L.append(f"- **{k}**: {v}")
 
-    L.append("\n## ⚠️ Limitations(本 PR 已知假设,留待 PR #3 处理)\n")
+    L.append("\n## ⚠️ Limitations(本 PR 已知假设,留待后续 PR 处理)\n")
     L.append("- **季度 GDP/debt → 月末 ffill 含前视偏差** (事实):季度值被前填到季度内各月末,"
              "**这不是实时(发布日)历史协整**——某月用到的 GDP/debt 在当时可能尚未发布。本 PR 为全样本"
-             "结构检验,可接受;**发布日对齐 + 对该假设的敏感性**留待 PR #3 (推测)。")
+             "结构检验,可接受;**发布日对齐 + 对该假设的敏感性**留待后续 (推测)。")
     L.append("- 实利率 1997 前(实为 DFII10 起点 2003 前)为 GS10−CPI 拼接代理,见 §0 注记 (事实)。")
+    L.append("- **GH 断点检验功效有限** (事实):干净 TIPS 仅 2003+,三变量 GH 在短样本上断点功效弱;"
+             "且 GH 只允许**单个**内生断点——多断点 / 平滑时变参数留待 Markov-switching / TVP (PR #4) (推测)。")
 
     L.append("\n## 1a. 单整阶数 (ADF + PP + KPSS, regression ∈ {c, ct})\n")
     L.append("ADF/PP 原假设 = 单位根 (I(1));KPSS 原假设 = 平稳 (I(0))。"
@@ -480,6 +645,11 @@ def _build_report(df, notes, itab, jres, args, rr_segs=None, tri=None) -> str:
     if tri is not None:
         L.extend(_fmt_trivariate(tri))
         L.extend(_fmt_vecm(tri))
+
+    # PR #3: Gregory-Hansen break cointegration
+    if gh_res is not None:
+        L.extend(_fmt_gregory_hansen(gh_res))
+        L.extend(_gh_verdict_lines(gh_res))
 
     L.append("\n## 核心结论(稳健性视角)\n")
     main = jres.get("debt_gdp")
@@ -562,8 +732,8 @@ def _build_report(df, notes, itab, jres, args, rr_segs=None, tri=None) -> str:
             L.append("- ⚠️ **杀死条件触发 (spec 修订版条件 1+扩展)**: 线性常参数三变量锚不稳健/无协整 → "
                      "留待 regime-switching / 断点协整 (Gregory-Hansen, PR #3)。")
 
-    L.append("\n- 下一步 (下一 PR) (推测): 若三变量锚成立但 λ/β₂ 边际,或不稳健 → "
-             "Gregory-Hansen 断点协整 + regime-switching VECM;并做发布日对齐 + 2022 分解 (spec §3–§4)。")
+    L.append("\n- 下一步 (下一 PR) (推测): GH 断点协整若成立则进入 regime-switching/TVP VECM 估时变锚;"
+             "若 GH 也证伪线性单断点锚 → 直接上 Markov-switching / TVP (PR #4);并做发布日对齐 + 2022 分解 (spec §3–§4)。")
     L.append("\n> Claim types: 检验统计量与样本 β 估计值为 (事实);I(d) 判定、协整成立与否、"
              "「β≈1 支持纯贬值假说」等模型判读为 (推理);未来路径与机制故事为 (推测)。")
     return "\n".join(L) + "\n"
@@ -579,7 +749,7 @@ def main():
     Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
     Path(ANALYSIS_DIR).mkdir(parents=True, exist_ok=True)
 
-    print("[1/5] Building monthly gold-anchor panel...")
+    print("[1/6] Building monthly gold-anchor panel...")
     panel = build_anchor_panel(start=args.start, end=args.end)
     df = panel.data
     if df.empty:
@@ -596,11 +766,11 @@ def main():
         json.dump(panel.notes, f, indent=2, ensure_ascii=False)
     print(f"  saved → {panel_path}")
 
-    print("[2/5] Unit-root tests (ADF + PP + KPSS)...")
+    print("[2/6] Unit-root tests (ADF + PP + KPSS)...")
     itab = integration_table(df, [c for c in LEVEL_COLS if c in df.columns])
     print(itab.to_string())
 
-    print("[3/5] Johansen cointegration (debt/GDP main; Fed, M2 controls)...")
+    print("[3/6] Johansen cointegration (debt/GDP main; Fed, M2 controls)...")
     # Johansen assumes all series are I(1); the I(1) check is done on the SAME
     # pairwise complete-case subsample Johansen actually uses (not the full
     # column), under both 'c' and 'ct' regressions. Lag is selected per pair.
@@ -643,7 +813,7 @@ def main():
               f"coint_rank={point['coint_rank']} valid={point['valid_coint']} β={beta_s}; "
               f"robust ranks across lag×det={ranks}")
 
-    print("[4/5] Trivariate anchor (Johansen + VECM) & real-rate I(d) segments...")
+    print("[4/6] Trivariate anchor (Johansen + VECM) & real-rate I(d) segments...")
     rr_segs = _run_real_rate_segments(df, panel.notes)
     for name, seg in rr_segs.items():
         if name != "_cutoff":
@@ -658,9 +828,24 @@ def main():
                   f"(failed {w['n_failed']}/{w['n_cells']}); {vm}")
         print(f"  trivariate verdict: {tri['verdict']}")
 
-    print("[5/5] Writing analysis report...")
+    print("[5/6] Gregory-Hansen break cointegration (bivariate + trivariate; C / C/S)...")
+    gh_res = _run_gregory_hansen(df, panel.notes)
+    for key, e in gh_res["systems"].items():
+        if e.get("skip"):
+            print(f"  GH {key}: skipped — {e['skip']}")
+            continue
+        for model in GH_MODELS:
+            gh = e["models"].get(model, {})
+            if "error" in gh:
+                print(f"  GH {key} [{model}]: error — {gh['error']}")
+                continue
+            rej = [s.upper() for s in ("adf", "zt", "zalpha") if gh[s]["reject_no_coint"]]
+            print(f"  GH {key} [{model}]: ADF*={gh['adf']['stat']:.2f} @ {gh['adf']['break_date']} "
+                  f"→ reject={rej or 'none'}")
+
+    print("[6/6] Writing analysis report...")
     today = (args.end or datetime.now().strftime("%Y-%m-%d"))
-    report = _build_report(df, panel.notes, itab, jres, args, rr_segs=rr_segs, tri=tri)
+    report = _build_report(df, panel.notes, itab, jres, args, rr_segs=rr_segs, tri=tri, gh_res=gh_res)
     out = os.path.join(ANALYSIS_DIR, f"gold_anchor_cointegration_{today}.md")
     with open(out, "w", encoding="utf-8") as f:
         f.write(report)
