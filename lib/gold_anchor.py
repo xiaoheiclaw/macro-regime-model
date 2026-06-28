@@ -881,9 +881,11 @@ def gregory_hansen_min_obs(m: int, max_lag: int = 6) -> int:
 def _gh_critical_values(model: str, m: int, stat: str) -> Optional[Dict[float, float]]:
     """GH (1996) Table 1 critical values for ``model`` (C / C/T / C/S), ``m``
     I(1) regressors, and ``stat`` ('adf'/'zt' share a table; 'zalpha' its own).
-    Returns {0.01,0.05,0.10: cv} or None if m is outside the tabulated 1..4."""
+    Returns {0.01,0.05,0.10: cv} or None if m is outside the tabulated 1..4. A
+    COPY is returned so a caller mutating it cannot corrupt the module table."""
     table = _GH_CV[model]["zalpha" if stat == "zalpha" else "adf_zt"]
-    return table.get(m)
+    cv = table.get(m)
+    return dict(cv) if cv is not None else None
 
 
 def _adf_resid_stat(resid: np.ndarray, max_lag: int) -> tuple:
@@ -934,7 +936,11 @@ def _phillips_z_resid(resid: np.ndarray, bandwidth: Optional[int] = None) -> tup
         cov = float(u[j:] @ u[:-j]) / n
         lam2 += 2.0 * w * cov
     if lam2 <= 0:
-        lam2 = gamma0  # guard: kernel can dip ≤0 in tiny samples
+        # a non-positive Bartlett long-run variance makes Zα/Zt undefined. Do NOT
+        # silently fall back to γ̂₀ (that would disguise an invalid statistic as a
+        # valid one and could flip reject_no_coint). Raise so the caller marks
+        # this break/stat as failed rather than scoring it.
+        raise ValueError("phillips_z: non-positive long-run variance (λ̂²≤0)")
     z_alpha = n * (rho - 1.0) - 0.5 * (lam2 - gamma0) * n * n / M
     z_t = (np.sqrt(gamma0 / lam2) * t_rho
            - ((lam2 - gamma0) / (2.0 * np.sqrt(lam2))) * (n / np.sqrt(M)))
@@ -1116,19 +1122,18 @@ def gregory_hansen_test(
 
     results = {s: _pack(s) for s in ("adf", "zt", "zalpha")}
 
-    # cointegrating-vector coefficients at the ADF*-optimal break (the headline
-    # statistic). For C/S report pre/post regime slopes; for C/C-T the slope is
-    # constant and only the intercept shifts.
-    coint = None
-    k_star = best["adf"]["k"]
-    if k_star is not None:
-        Xs = _gh_design(y2, k_star, model)
-        coef, _res, rank_s, _sv = np.linalg.lstsq(Xs, y, rcond=None)
-    else:
-        rank_s = 0
-    if k_star is not None and rank_s >= Xs.shape[1]:
-        mu1 = float(coef[0])
-        mu2 = float(coef[1])
+    # cointegrating-vector coefficients at a given break. For C/S report pre/post
+    # regime slopes; for C/C-T the slope is constant and only the intercept shifts.
+    # Computed PER STATISTIC at that statistic's own optimal break, so a Zt*- or
+    # Zα*-driven rejection is explained by ITS break/vector, not ADF*'s.
+    def _coint_vector_at(k: Optional[int]) -> Optional[Dict[str, object]]:
+        if k is None:
+            return None
+        Xk = _gh_design(y2, k, model)
+        coef, _r, rk, _s = np.linalg.lstsq(Xk, y, rcond=None)
+        if rk < Xk.shape[1]:
+            return None
+        mu1, mu2 = float(coef[0]), float(coef[1])
         if model == "C/S":
             betas_pre = [float(c) for c in coef[2:2 + m]]
             betas_post = [float(coef[2 + m + i] + coef[2 + i]) for i in range(m)]
@@ -1136,13 +1141,21 @@ def gregory_hansen_test(
             betas_pre = betas_post = [float(c) for c in coef[3:3 + m]]
         else:  # C
             betas_pre = betas_post = [float(c) for c in coef[2:2 + m]]
-        coint = {
+        return {
             "x_cols": x_cols,
+            "break_index": int(k),
+            "break_date": idx[min(k + 1, T - 1)].date().isoformat(),
             "intercept_pre": mu1,
             "intercept_post": mu1 + mu2,
             "betas_pre": betas_pre,
             "betas_post": betas_post,
         }
+
+    coint_vectors = {s: _coint_vector_at(best[s]["k"]) for s in ("adf", "zt", "zalpha")}
+    # majority rule (pre-registered primary criterion): a cell "rejects" only when
+    # at least 2 of the 3 statistics reject — guards against an isolated single-
+    # statistic rejection being read as a research conclusion.
+    n_reject = sum(int(results[s]["reject_no_coint"]) for s in ("adf", "zt", "zalpha"))
 
     return {
         "model": model,
@@ -1159,9 +1172,12 @@ def gregory_hansen_test(
         "adf": results["adf"],
         "zt": results["zt"],
         "zalpha": results["zalpha"],
-        "coint_vector": coint,
-        "any_reject": bool(results["adf"]["reject_no_coint"]
-                           or results["zt"]["reject_no_coint"]
-                           or results["zalpha"]["reject_no_coint"]),
+        # coint_vector = the ADF* (headline) break vector, back-compat; per-stat
+        # vectors in coint_vectors so a Zt*/Zα*-driven reject shows its own break.
+        "coint_vector": coint_vectors["adf"],
+        "coint_vectors": coint_vectors,
+        "n_reject": int(n_reject),
+        "any_reject": bool(n_reject >= 1),         # raw: ≥1 statistic rejects
+        "majority_reject": bool(n_reject >= 2),    # pre-registered primary rule
         "cv_available": bool(_gh_critical_values(model, m, "adf") is not None),
     }

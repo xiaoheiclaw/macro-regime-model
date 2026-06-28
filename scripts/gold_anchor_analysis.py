@@ -470,7 +470,10 @@ def _run_gregory_hansen(df, notes) -> dict:
                 entry["models"][model] = gregory_hansen_test(
                     sub, ycol, xcols, model=model)
             except (ValueError, np.linalg.LinAlgError) as e:
-                entry["models"][model] = {"error": f"{type(e).__name__}: {str(e)[:80]}"}
+                # short message for the report; full message in error_full for debugging
+                entry["models"][model] = {
+                    "error": f"{type(e).__name__}: {str(e)[:80]}",
+                    "error_full": f"{type(e).__name__}: {e}"}
         out["systems"][key] = entry
     return out
 
@@ -498,17 +501,25 @@ def _fmt_gh_one(gh: dict) -> list:
         lag = f" (lag={r['adf_lag']})" if s == "adf" and r.get("adf_lag") is not None else ""
         L.append(f"  {name[s]:<10}{r['stat']:>9.2f}{str(r['break_date']):>13}"
                  f"{(r['break_fraction'] or float('nan')):>7.2f}   {cvs}  {rej}{lag}")
-    cvtr = gh.get("coint_vector")
-    if cvtr:
+    mr = gh.get("n_reject", 0)
+    L.append(f"- 多数决: {mr}/3 统计量拒绝 → "
+             f"{'**达门槛(≥2/3)→ 计为协整证据**' if gh.get('majority_reject') else '未达 ≥2/3 门槛 → 不计为证据'} (推理)")
+    # per-statistic cointegrating vectors at EACH statistic's own break (so a
+    # Zt*/Zα*-driven result is explained by ITS break/vector, not ADF*'s).
+    cvs_by_stat = gh.get("coint_vectors") or {}
+    for s in ("adf", "zt", "zalpha"):
+        cvtr = cvs_by_stat.get(s)
+        if not cvtr:
+            continue
         if gh["model"] == "C/S":
-            L.append(f"- 协整向量(ADF* 断点处, 断点前/后): "
+            L.append(f"- 协整向量({name[s]} 断点 {cvtr['break_date']}, 断点前/后): "
                      f"截距 {cvtr['intercept_pre']:.3f}→{cvtr['intercept_post']:.3f}; "
                      f"β {[round(b,3) for b in cvtr['betas_pre']]}"
                      f"→{[round(b,3) for b in cvtr['betas_post']]} (事实)")
         else:
-            L.append(f"- 协整向量(ADF* 断点处): 截距 {cvtr['intercept_pre']:.3f}"
-                     f"(前)→{cvtr['intercept_post']:.3f}(后), β(常定)"
-                     f"={[round(b,3) for b in cvtr['betas_pre']]} (事实)")
+            L.append(f"- 协整向量({name[s]} 断点 {cvtr['break_date']}): 截距 "
+                     f"{cvtr['intercept_pre']:.3f}(前)→{cvtr['intercept_post']:.3f}(后), "
+                     f"β(常定)={[round(b,3) for b in cvtr['betas_pre']]} (事实)")
     return L
 
 
@@ -540,7 +551,7 @@ def _gh_summary(gh_res: dict) -> dict:
     """Tally GH cells: how many system×model COMPLETED, how many were skipped/
     errored, and whether any completed cell rejected 'no cointegration'. Shared
     by the verdict block and the next-step text so they never disagree."""
-    any_reject = False
+    any_reject = False  # pre-registered: a cell rejects iff ≥2/3 stats reject
     n_completed = 0
     n_incomplete = 0
     for e in gh_res["systems"].values():
@@ -553,7 +564,7 @@ def _gh_summary(gh_res: dict) -> dict:
                 n_incomplete += 1
                 continue
             n_completed += 1
-            if any(gh[s]["reject_no_coint"] for s in ("adf", "zt", "zalpha")):
+            if gh.get("majority_reject"):
                 any_reject = True
     return {"any_reject": any_reject, "n_completed": n_completed,
             "n_incomplete": n_incomplete}
@@ -570,7 +581,9 @@ def _gh_verdict_lines(gh_res: dict) -> list:
     as **inconclusive** instead of killing the linear anchor."""
     L = []
     L.append("\n### Gregory-Hansen 裁决(诚实)\n")
-    near_0822 = []  # breaks landing near 2008 / 2022
+    L.append("> 预注册主判据: 单元「拒绝无协整」**当且仅当 3 个统计量中 ≥2 个拒绝**(多数决),"
+             "防止孤立单统计量显著被当作研究结论;ADF* 为头条统计量。\n")
+    diag_0822 = []  # argmin breaks near 2008/2022 — DIAGNOSTIC position, not evidence
     # render per-cell lines (no decision counting here — that's _gh_summary's job)
     for key, e in gh_res["systems"].items():
         if e.get("skip"):
@@ -583,27 +596,36 @@ def _gh_verdict_lines(gh_res: dict) -> list:
                 L.append(f"- {e['label']} · {GH_MODEL_LABEL[model]}: "
                          f"**{err} → 不计入裁决(测试未产出≠不拒绝)** (推理)。")
                 continue
+            # collect argmin breaks for ALL completed cells (diagnostic only)
+            for s in ("adf", "zt", "zalpha"):
+                bd = gh[s]["break_date"]
+                if bd and (bd[:4] in {"2007", "2008", "2009", "2021", "2022", "2023"}):
+                    tag = "证据" if gh.get("majority_reject") else "仅诊断位置"
+                    diag_0822.append(f"{e['label']}/{GH_MODEL_LABEL[model]}/{s.upper()}={bd}({tag})")
             rejecters = [s for s in ("adf", "zt", "zalpha") if gh[s]["reject_no_coint"]]
-            if rejecters:
-                bdate = gh["adf"]["break_date"]
+            if gh.get("majority_reject"):
                 bstats = ", ".join(s.upper() for s in rejecters)
+                # cite the break/vector of the statistic(s) that actually rejected
+                cited = ", ".join(f"{s.upper()}@{gh[s]['break_date']}" for s in rejecters)
                 L.append(f"- **{e['label']} · {GH_MODEL_LABEL[model]}: 拒绝「无协整」"
-                         f"({bstats} 显著)→ 断点调整后协整成立 (推理)。** "
-                         f"ADF* 断点 {bdate};协整向量见 §4 (事实)。")
-                for s in ("adf", "zt", "zalpha"):
-                    bd = gh[s]["break_date"]
-                    if bd and (bd[:4] in {"2007", "2008", "2009", "2021", "2022", "2023"}):
-                        near_0822.append(f"{e['label']}/{GH_MODEL_LABEL[model]}/{s.upper()}={bd}")
+                         f"(多数决 {len(rejecters)}/3: {bstats})→ 断点调整后协整成立 (推理)。** "
+                         f"触发统计量断点 {cited};各统计量协整向量见 §4 (事实)。")
+            elif rejecters:
+                # 1/3 rejects → below the pre-registered majority bar: corroborating only
+                bstats = ", ".join(s.upper() for s in rejecters)
+                L.append(f"- {e['label']} · {GH_MODEL_LABEL[model]}: 仅 {bstats} 单独拒绝"
+                         f"(1/3 < 多数决门槛)→ **不计为协整证据**,仅作旁证 (推理)。")
             else:
                 L.append(f"- {e['label']} · {GH_MODEL_LABEL[model]}: "
                          f"三统计量均不拒绝「无协整」(ADF*={gh['adf']['stat']:.2f} vs "
                          f"cv@5%={(gh['adf']['critical_values'] or {}).get(0.05, float('nan')):.2f}) "
                          f"→ 在此设定下未找到(单断点)协整证据 (推理)。")
     L.append("")
-    if near_0822:
-        uniq = sorted(set(near_0822))
-        L.append(f"- **断点落在 2008/2022 附近**: {'; '.join(uniq)} → 与「2008 危机 / 2022 "
-                 "通胀-加息」结构变化吻合 (推理)。")
+    if diag_0822:
+        uniq = sorted(set(diag_0822))
+        L.append(f"- **argmin 断点落在 2008/2022 附近(区分诊断位置 vs 协整证据)**: "
+                 f"{'; '.join(uniq)} (推理)。「仅诊断位置」指最优断点恰在该时段,但该单元未达多数决"
+                 "拒绝门槛,不构成协整证据。")
 
     # decision is driven SOLELY by the shared tally (single source of truth, P3).
     s = _gh_summary(gh_res)

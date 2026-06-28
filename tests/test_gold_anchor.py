@@ -572,12 +572,21 @@ def test_gh_detects_regime_shift_cointegration():
     assert gh["adf"]["reject_no_coint"] is True
     assert gh["zt"]["reject_no_coint"] is True
     assert gh["zalpha"]["reject_no_coint"] is True
+    # pre-registered majority rule: ≥2/3 reject → majority_reject True
+    assert gh["n_reject"] == 3
+    assert gh["majority_reject"] is True
     # estimated break (ADF*) lands near the true break (within ~12% of sample)
     est = pd.Timestamp(gh["adf"]["break_date"])
     assert abs((est.year - true_break.year) * 12 + est.month - true_break.month) <= 48
     # regime-shift coint vector recovers the slope change b_pre=1 → b_post=2
     cv = gh["coint_vector"]
     assert cv["betas_pre"][0] < cv["betas_post"][0]
+    # per-statistic vectors exist (each at its own break) — a Zt*/Zα*-driven
+    # rejection is explained by ITS break, not ADF*'s.
+    assert set(gh["coint_vectors"]) == {"adf", "zt", "zalpha"}
+    assert gh["coint_vector"] == gh["coint_vectors"]["adf"]
+    for s in ("adf", "zt", "zalpha"):
+        assert gh["coint_vectors"][s]["break_date"] == gh[s]["break_date"]
 
 
 def test_gh_does_not_reject_independent_walks():
@@ -593,6 +602,40 @@ def test_gh_does_not_reject_independent_walks():
     gh = gregory_hansen_test(df, "ln_gold_nominal", ["ln_debt_gdp"], model="C/S")
     assert gh["adf"]["reject_no_coint"] is False
     assert gh["any_reject"] is False
+    assert gh["majority_reject"] is False
+
+
+def test_gh_critical_values_returned_copy_is_isolated():
+    # mutating a returned critical_values dict must NOT corrupt the module table
+    df, _ = _regime_shift_cointegrated()
+    gh1 = gregory_hansen_test(df, "ln_gold_nominal", ["ln_debt_gdp"], model="C")
+    gh1["adf"]["critical_values"][0.05] = 999.0  # caller scribbles on it
+    gh2 = gregory_hansen_test(df, "ln_gold_nominal", ["ln_debt_gdp"], model="C")
+    assert gh2["adf"]["critical_values"][0.05] == -4.61  # table intact
+
+
+def test_gh_summary_majority_rule_not_any_stat():
+    # _gh_summary must treat a cell as 'reject' only by the pre-registered
+    # majority rule (majority_reject), never by a single stray statistic.
+    from scripts.gold_anchor_analysis import _gh_summary, GH_MODELS
+
+    def cell(majority):
+        return {"majority_reject": majority, "adf": {"reject_no_coint": True}}
+
+    # one cell with a lone-stat reject (majority False) → summary any_reject False
+    res_lone = {"systems": {
+        "bivariate": {"skip": None, "models": {m: cell(False) for m in GH_MODELS}},
+        "trivariate": {"skip": "n/a"},
+    }}
+    s = _gh_summary(res_lone)
+    assert s["any_reject"] is False and s["n_completed"] == len(GH_MODELS)
+    # a cell that meets the majority bar → any_reject True
+    res_maj = {"systems": {
+        "bivariate": {"skip": None, "models": {GH_MODELS[0]: cell(True),
+                                               GH_MODELS[1]: cell(False)}},
+        "trivariate": {"skip": "n/a"},
+    }}
+    assert _gh_summary(res_maj)["any_reject"] is True
 
 
 def test_gh_independent_walks_size_smoke():
