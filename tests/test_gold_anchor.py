@@ -4,15 +4,13 @@ All tests use synthetic series (injected fetchers) — no network / FRED key
 required. The statistical assertions check that the test wrappers give the
 *right verdict* on series with known integration / cointegration structure.
 """
-import sys
 import zlib
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+# project root is added to sys.path by tests/conftest.py
 from lib.gold_anchor import (
     build_anchor_panel,
     classify_integration,
@@ -37,6 +35,27 @@ def test_unit_root_tests_keys():
     out = unit_root_tests(_white_noise())
     for k in ["adf_pvalue", "pp_pvalue", "kpss_pvalue", "n"]:
         assert k in out
+
+
+def test_unit_root_tests_rejects_bad_input():
+    from lib.gold_anchor import unit_root_tests
+    idx = pd.date_range("1980-01-31", periods=50, freq="ME")
+    with pytest.raises(ValueError):
+        unit_root_tests(pd.Series([1.0] * 50, index=idx))            # constant
+    with pytest.raises(ValueError):
+        unit_root_tests(pd.Series(np.arange(5.0)))                   # too few
+    bad = pd.Series(np.arange(50.0), index=idx)
+    bad.iloc[3] = np.inf
+    with pytest.raises(ValueError):
+        unit_root_tests(bad)                                         # non-finite
+
+
+def test_integration_table_reports_invalid_data():
+    idx = pd.date_range("1980-01-31", periods=60, freq="ME")
+    df = pd.DataFrame({"const": np.ones(60), "rw": _random_walk(60, seed=4).values}, index=idx)
+    tab = integration_table(df, ["const", "rw"])
+    assert tab.loc["const", "verdict"] == "invalid data"  # constant → caught
+    assert tab.loc["rw", "verdict"] in {"I(1)", "ambiguous"}
 
 
 def test_white_noise_is_I0():

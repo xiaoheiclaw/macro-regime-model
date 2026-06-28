@@ -145,12 +145,12 @@ def _build_report(df, notes, itab, jres, args) -> str:
     L.append("```")
     L.append(itab.to_string())
     L.append("```")
-    L.append("\n判读 (推理):")
+    L.append("\n判读(检验统计量/p 值为 (事实);I(d) 判定为 (推理)):")
     for s, row in itab.iterrows():
-        L.append(f"- `{s}`: **{row['verdict']}**")
+        L.append(f"- `{s}`: **{row['verdict']}** (推理)")
     rr = itab.loc["real_rate_10y", "verdict"] if "real_rate_10y" in itab.index else "n/a"
-    L.append(f"\n- 实利率 `real_rate_10y` 判定 **{rr}**。若 I(0)→只能进短期 ECM(下一 PR),"
-             "符合「实利率是偏离驱动、不是锚」的直觉;若 I(1)→可进长期向量,需另行解释 (spec §1)。")
+    L.append(f"\n- 实利率 `real_rate_10y` 判定 **{rr}** (推理)。若 I(0)→只能进短期 ECM(下一 PR),"
+             "符合「实利率是偏离驱动、不是锚」的直觉 (推测);若 I(1)→可进长期向量,需另行解释 (spec §1)。")
 
     L.append("\n## 1b. 协整 (Johansen, trace + max-eigen)\n")
     L.append("系统 = [ln(名义金价), ln(锚/GDP)],仅当两者都判 I(1) 才跑。"
@@ -168,18 +168,18 @@ def _build_report(df, notes, itab, jres, args) -> str:
     if main:
         label, j, skip = main
         if j is None:
-            L.append(f"- **主锚 Debt/GDP: 未跑 Johansen({skip})** — 前置单整条件不满足,不作锚判定。")
+            L.append(f"- **主锚 Debt/GDP: 未跑 Johansen({skip})** — 前置单整条件不满足,不作锚判定 (推理)。")
         elif j["full_rank_stationary"]:
             L.append(f"- **主锚 Debt/GDP: 满秩(raw rank=n)→ 序列疑似平稳/模型假设不成立,"
-                     f"协整解读无效,不作锚成立判定(需复查单整阶数)。**")
+                     f"协整解读无效,不作锚成立判定(需复查单整阶数)** (推理)。")
         elif j["valid_coint"]:
             beta_note = ("接近 1(纯贬值假说获支持)" if abs(j["beta"] - 1.0) < 0.25
                          else "显著偏离 1(贬值故事需进一步解释,见 spec §2)")
-            L.append(f"- **主锚 Debt/GDP: coint_rank = {j['coint_rank']} ≥ 1 → 锚成立(非伪趋势)。** "
-                     f"长期弹性 β = {j['beta']:.3f},{beta_note}。")
+            L.append(f"- **主锚 Debt/GDP: coint_rank = {j['coint_rank']} (事实) ≥ 1 → 锚成立(非伪趋势)(推理)。** "
+                     f"长期弹性 β = {j['beta']:.3f} (事实),{beta_note} (推理)。")
         else:
-            L.append(f"- **主锚 Debt/GDP: coint_rank = 0 → 没有协整,基准线是伪共同趋势,"
-                     f"用户「锚」假说在此被证伪(spec 杀死条件 1)。**")
+            L.append(f"- **主锚 Debt/GDP: coint_rank = 0 (事实) → 没有协整,基准线是伪共同趋势,"
+                     f"用户「锚」假说在此被证伪(spec 杀死条件 1)(推理)。**")
     for key in ("fed_gdp", "m2_gdp"):
         if key in jres:
             label, j, skip = jres[key]
@@ -187,8 +187,8 @@ def _build_report(df, notes, itab, jres, args) -> str:
                 L.append(f"- 对照 {label}: skipped({skip})。")
             else:
                 beta_s = "n/a" if j["beta"] is None else f"{j['beta']:.3f}"
-                L.append(f"- 对照 {label}: coint_rank={j['coint_rank']}, valid={j['valid_coint']}, β={beta_s}。")
-    L.append("\n- 下一步 (下一 PR): 对协整成立的锚估 VECM,看误差修正项 λ 是否显著、"
+                L.append(f"- 对照 {label}: coint_rank={j['coint_rank']}, valid={j['valid_coint']}, β={beta_s} (事实)。")
+    L.append("\n- 下一步 (下一 PR) (推测): 对协整成立的锚估 VECM,看误差修正项 λ 是否显著、"
              "实利率 δ 是否在偏离项里现形,并做 2022 分解 (spec §2–§3)。")
     L.append("\n> Claim types: 检验统计量与样本 β 估计值为 (事实);I(d) 判定、协整成立与否、"
              "「β≈1 支持纯贬值假说」等模型判读为 (推理);未来路径与机制故事为 (推测)。")

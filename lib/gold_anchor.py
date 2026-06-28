@@ -29,6 +29,8 @@ Design notes
 """
 from __future__ import annotations
 
+import hashlib
+import io
 import os
 import warnings
 from dataclasses import dataclass, field
@@ -86,6 +88,20 @@ def _fred_api_key() -> Optional[str]:
     return None
 
 
+def _http_get_text(url: str, timeout: float = 30.0) -> str:
+    """GET a URL with an explicit timeout + HTTP status check, returning the
+    body text. Avoids pandas hanging forever or silently parsing an error
+    page as CSV on a network blip."""
+    import httpx
+
+    try:
+        r = httpx.get(url, timeout=timeout, follow_redirects=True)
+        r.raise_for_status()
+    except httpx.HTTPError as e:
+        raise RuntimeError(f"download failed for {url}: {type(e).__name__}: {e}") from e
+    return r.text
+
+
 def fetch_fred_series(series_id: str, start: str = "1968-01-01") -> pd.Series:
     """Fetch a single FRED series via fredapi, falling back to the public CSV
     endpoint when no API key is available. Returns a float Series indexed by
@@ -108,7 +124,8 @@ def fetch_fred_series(series_id: str, start: str = "1968-01-01") -> pd.Series:
             )
 
     url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}&cosd={start}"
-    s = pd.read_csv(url, index_col=0, parse_dates=True).iloc[:, 0]
+    text = _http_get_text(url)
+    s = pd.read_csv(io.StringIO(text), index_col=0, parse_dates=True).iloc[:, 0]
     s = pd.to_numeric(s.replace(".", np.nan), errors="coerce").dropna()
     s.index = pd.to_datetime(s.index)
     return s
@@ -117,8 +134,12 @@ def fetch_fred_series(series_id: str, start: str = "1968-01-01") -> pd.Series:
 def fetch_gold_monthly(start: str = "1968-01-01") -> pd.Series:
     """Monthly nominal gold (USD/oz) from the public-domain datasets.io gold
     price dataset (Measuring Worth / LBMA), 1833→present. Used in place of the
-    discontinued FRED LBMA series. Returns a float Series at month-end."""
-    df = pd.read_csv(GOLD_CSV_URL)
+    discontinued FRED LBMA series. Returns a float Series at month-end whose
+    ``.attrs`` carry source_url / sha256 / n_rows for reproducibility auditing
+    (the upstream is a moving `main` branch, so the content hash is the audit
+    handle — a changed snapshot is visible rather than silent)."""
+    text = _http_get_text(GOLD_CSV_URL)
+    df = pd.read_csv(io.StringIO(text))
     missing = {"Date", "Price"} - set(df.columns)
     if missing:
         raise ValueError(
@@ -127,7 +148,13 @@ def fetch_gold_monthly(start: str = "1968-01-01") -> pd.Series:
         )
     s = pd.Series(df["Price"].values, index=pd.PeriodIndex(df["Date"], freq="M").to_timestamp("M"))
     s = pd.to_numeric(s, errors="coerce").dropna()
-    return s[s.index >= pd.Timestamp(start)]
+    s = s[s.index >= pd.Timestamp(start)]
+    s.attrs = {
+        "source_url": GOLD_CSV_URL,
+        "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        "n_rows": int(len(df)),
+    }
+    return s
 
 
 def _parse_month_boundary(x: str, side: str) -> pd.Timestamp:
@@ -226,8 +253,15 @@ def build_anchor_panel(
             "real_rate_10y": real_rate,
         }
     )
-    # ln transforms (real rate can be negative → not logged)
+    # ln transforms (real rate can be negative → not logged). A price/ratio that
+    # is <=0 is a data error; mask it to NaN (so it drops out of the tests)
+    # rather than producing -inf/NaN, and record how many were dropped.
+    nonpositive = {}
     for col in ["gold_nominal", "debt_gdp", "m2_gdp", "fed_gdp"]:
+        bad = df[col].notna() & (df[col] <= 0)
+        if bool(bad.any()):
+            nonpositive[col] = int(bad.sum())
+            df.loc[bad, col] = np.nan
         df[f"ln_{col}"] = np.log(df[col])
 
     # enforce the [start, end] contract on the final panel — injected fetchers
@@ -261,21 +295,39 @@ def build_anchor_panel(
         "(2002+; effectively a post-2008 anchor — short sample, use with care)."
     )
     notes["coverage"] = "; ".join(f"{c}:{_cov(df[c])}" for c in df.columns)
+    gattrs = getattr(raw.get("gold_nominal", pd.Series(dtype=float)), "attrs", {})
+    notes["gold_source"] = (
+        f"{gattrs.get('source_url', 'n/a')} sha256={gattrs.get('sha256', 'n/a')} "
+        f"n_rows={gattrs.get('n_rows', 'n/a')} (moving main branch — hash is the "
+        "reproducibility handle; a changed snapshot is auditable, not silent)."
+    )
+    if nonpositive:
+        notes["nonpositive_dropped"] = "; ".join(f"{k}:{v}" for k, v in nonpositive.items())
 
     return AnchorPanel(data=df, notes=notes)
 
 
 # ── Unit-root tests (step 0) ───────────────────────────────────────────
-def unit_root_tests(series: pd.Series, regression: str = "c") -> Dict[str, float]:
+def unit_root_tests(series: pd.Series, regression: str = "c", min_obs: int = 12) -> Dict[str, float]:
     """Run ADF + PP + KPSS on a series (levels). Returns stats & p-values.
 
     ADF/PP null = unit root (I(1)); KPSS null = stationarity (I(0)).
+    Validates the input (finite, enough non-NaN points, non-constant) and
+    raises a descriptive ValueError instead of letting statsmodels/arch fail
+    with a cryptic error.
     """
     from statsmodels.tsa.stattools import adfuller, kpss
     from statsmodels.tools.sm_exceptions import InterpolationWarning
     from arch.unitroot import PhillipsPerron
 
     x = pd.Series(series).dropna().astype(float)
+    name = getattr(series, "name", None)
+    if len(x) < min_obs:
+        raise ValueError(f"unit_root_tests: series {name!r} has {len(x)} obs (<{min_obs})")
+    if not np.isfinite(x.values).all():
+        raise ValueError(f"unit_root_tests: series {name!r} contains non-finite values")
+    if x.nunique() <= 1:
+        raise ValueError(f"unit_root_tests: series {name!r} is constant")
     out: Dict[str, float] = {"n": int(len(x))}
 
     adf = adfuller(x, regression=regression, autolag="AIC")
@@ -356,7 +408,15 @@ def integration_table(df: pd.DataFrame, columns, min_obs: int = 20) -> pd.DataFr
                  "pp_p": np.nan, "kpss_p": np.nan, "diff_stationary": None, "n": n_obs}
             )
             continue
-        c = classify_integration(df[col])
+        try:
+            c = classify_integration(df[col])
+        except ValueError:
+            # non-finite / constant series etc. — report instead of crashing
+            rows.append(
+                {"series": col, "verdict": "invalid data", "adf_p": np.nan,
+                 "pp_p": np.nan, "kpss_p": np.nan, "diff_stationary": None, "n": n_obs}
+            )
+            continue
         lvl = c["levels"]
         rows.append(
             {
