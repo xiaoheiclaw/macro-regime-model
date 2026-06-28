@@ -46,7 +46,11 @@ def _fmt_johansen(j: dict) -> str:
     for r in range(n):
         mark = "✓ reject" if j["maxeig_stat"][r] > j["maxeig_cv"][r] else "✗ fail"
         lines.append(f"    r={r}: stat={j['maxeig_stat'][r]:.2f} vs cv={j['maxeig_cv'][r]:.2f}  {mark}")
-    lines.append(f"- **rank = {j['rank']}** (trace={j['trace_rank']}, max-eigen={j['maxeig_rank']})")
+    lines.append(f"- **coint rank = {j['rank']}** (trace={j['trace_rank']}, max-eigen={j['maxeig_rank']}; "
+                 f"raw trace/max-eigen={j['raw_trace_rank']}/{j['raw_maxeig_rank']})")
+    if j["full_rank_stationary"]:
+        lines.append("- ⚠️ **full-rank** (raw rank = n): series look stationary / model assumptions "
+                     "may not hold — this is NOT evidence the anchor holds.")
     lines.append(f"- cointegrating vector (normalized on gold): {[round(x,4) for x in j['coint_vector_normalized']]}")
     lines.append(f"- **long-run elasticity β = {j['beta']:.4f}** (gold vs anchor)")
     return "\n".join(lines)
@@ -58,6 +62,10 @@ def main():
     ap.add_argument("--end", default=None)
     args = ap.parse_args()
 
+    # data/ and analysis/ are gitignored → may not exist on a fresh checkout
+    Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
+    Path(ANALYSIS_DIR).mkdir(parents=True, exist_ok=True)
+
     print("[1/4] Building monthly gold-anchor panel...")
     panel = build_anchor_panel(start=args.start, end=args.end)
     df = panel.data
@@ -66,7 +74,7 @@ def main():
 
     panel_path = os.path.join(DATA_DIR, "gold_anchor_panel.csv")
     df.to_csv(panel_path)
-    with open(os.path.join(DATA_DIR, "gold_anchor_panel_notes.json"), "w") as f:
+    with open(os.path.join(DATA_DIR, "gold_anchor_panel_notes.json"), "w", encoding="utf-8") as f:
         json.dump(panel.notes, f, indent=2, ensure_ascii=False)
     print(f"  saved → {panel_path}")
 
@@ -89,7 +97,7 @@ def main():
     today = (args.end or datetime.now().strftime("%Y-%m-%d"))
     report = _build_report(df, panel.notes, itab, jres, args)
     out = os.path.join(ANALYSIS_DIR, f"gold_anchor_cointegration_{today}.md")
-    with open(out, "w") as f:
+    with open(out, "w", encoding="utf-8") as f:
         f.write(report)
     print(f"  saved → {out}")
     print("\nDone.")
@@ -129,10 +137,13 @@ def _build_report(df, notes, itab, jres, args) -> str:
     main = jres.get("debt_gdp")
     if main:
         label, j = main
-        if j["rank"] >= 1:
+        if j["full_rank_stationary"]:
+            L.append(f"- **主锚 Debt/GDP: 满秩(raw rank=n)→ 序列疑似平稳/模型假设不成立,"
+                     f"协整解读无效,不作锚成立判定(需复查单整阶数)。**")
+        elif j["rank"] >= 1:
             beta_note = ("接近 1(纯贬值假说获支持)" if abs(j["beta"] - 1.0) < 0.25
                          else "显著偏离 1(贬值故事需进一步解释,见 spec §2)")
-            L.append(f"- **主锚 Debt/GDP: rank = {j['rank']} ≥ 1 → 锚成立(非伪趋势)。** "
+            L.append(f"- **主锚 Debt/GDP: coint rank = {j['rank']} ≥ 1 → 锚成立(非伪趋势)。** "
                      f"长期弹性 β = {j['beta']:.3f},{beta_note}。")
         else:
             L.append(f"- **主锚 Debt/GDP: rank = 0 → 没有协整,基准线是伪共同趋势,"

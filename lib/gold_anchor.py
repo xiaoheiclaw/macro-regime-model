@@ -25,6 +25,7 @@ Design notes
 from __future__ import annotations
 
 import os
+import warnings
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Optional
 
@@ -92,8 +93,13 @@ def fetch_fred_series(series_id: str, start: str = "1968-01-01") -> pd.Series:
             s = pd.Series(s, dtype="float64").dropna()
             s.index = pd.to_datetime(s.index)
             return s
-        except Exception:
-            pass  # fall through to CSV
+        except Exception as e:
+            # don't swallow silently — surface the cause, then try CSV fallback
+            warnings.warn(
+                f"fredapi failed for {series_id} ({type(e).__name__}: {e}); "
+                "falling back to public CSV endpoint",
+                stacklevel=2,
+            )
 
     url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}&cosd={start}"
     s = pd.read_csv(url, index_col=0, parse_dates=True).iloc[:, 0]
@@ -196,18 +202,24 @@ def build_anchor_panel(
         df = df[df.index <= pd.Timestamp(end)]
 
     # provenance / coverage notes
+    def _cov(s: pd.Series) -> str:
+        sv = s.dropna()
+        if len(sv) == 0:
+            return "no observations (n=0)"
+        return f"{sv.index.min().date()}..{sv.index.max().date()} (n={len(sv)})"
+
     notes["units"] = "debt & fed_assets rescaled $M→$B; gdp,m2 already $B."
     notes["frequency"] = (
         "monthly (ME). daily→mean (gold, rates), weekly/monthly stocks→last, "
         "quarterly (debt, gdp)→ffill within quarter."
     )
+    fed_raw = raw["fed_assets"].dropna()
+    fed_start = fed_raw.index.min().date() if len(fed_raw) else "n/a"
     notes["fed_gdp_coverage"] = (
-        f"WALCL starts {raw['fed_assets'].index.min().date()} "
+        f"WALCL starts {fed_start} "
         "(2002+; effectively a post-2008 anchor — short sample, use with care)."
     )
-    cov = {c: f"{df[c].dropna().index.min().date()}..{df[c].dropna().index.max().date()}"
-           f" (n={int(df[c].notna().sum())})" for c in df.columns}
-    notes["coverage"] = "; ".join(f"{k}:{v}" for k, v in cov.items())
+    notes["coverage"] = "; ".join(f"{c}:{_cov(df[c])}" for c in df.columns)
 
     return AnchorPanel(data=df, notes=notes)
 
@@ -218,8 +230,6 @@ def unit_root_tests(series: pd.Series, regression: str = "c") -> Dict[str, float
 
     ADF/PP null = unit root (I(1)); KPSS null = stationarity (I(0)).
     """
-    import warnings
-
     from statsmodels.tsa.stattools import InterpolationWarning, adfuller, kpss
     from arch.unitroot import PhillipsPerron
 
@@ -259,12 +269,14 @@ def classify_integration(series: pd.Series, alpha: float = 0.05) -> Dict[str, ob
 
     stationary_votes = int(adf_rej) + int(pp_rej) + int(not kpss_rej)
     if stationary_votes >= 2 and (adf_rej or pp_rej):
+        # ADF/PP reject unit root AND KPSS fails to reject stationarity → I(0)
         verdict = "I(0)"
     elif (not adf_rej) and (not pp_rej) and kpss_rej:
+        # ADF/PP fail to reject unit root AND KPSS rejects stationarity → I(1)
         verdict = "I(1)"
-    elif (not adf_rej) and (not pp_rej):
-        verdict = "I(1)"  # both fail to reject unit root → treat as I(1)
     else:
+        # everything else (incl. ADF/PP/KPSS all fail to reject = low power /
+        # inconclusive, and ADF↔PP↔KPSS disagreement) is genuinely ambiguous
         verdict = "ambiguous"
 
     res: Dict[str, object] = {"verdict": verdict, "levels": lvl}
@@ -277,10 +289,19 @@ def classify_integration(series: pd.Series, alpha: float = 0.05) -> Dict[str, ob
     return res
 
 
-def integration_table(df: pd.DataFrame, columns) -> pd.DataFrame:
-    """Build the I(0)/I(1) verdict table for the given columns."""
+def integration_table(df: pd.DataFrame, columns, min_obs: int = 20) -> pd.DataFrame:
+    """Build the I(0)/I(1) verdict table for the given columns. Columns with
+    fewer than ``min_obs`` non-NaN observations are reported as "insufficient
+    data" instead of being fed to the (crash-prone) test routines."""
     rows = []
     for col in columns:
+        n_obs = int(df[col].notna().sum())
+        if n_obs < min_obs:
+            rows.append(
+                {"series": col, "verdict": "insufficient data", "adf_p": np.nan,
+                 "pp_p": np.nan, "kpss_p": np.nan, "diff_stationary": None, "n": n_obs}
+            )
+            continue
         c = classify_integration(df[col])
         lvl = c["levels"]
         rows.append(
@@ -323,18 +344,25 @@ def johansen_test(
     cvc = _CV_COL[alpha]
     n = len(columns)
 
-    trace_rank = 0
+    raw_trace_rank = 0
     for r in range(n):
         if res.lr1[r] > res.cvt[r, cvc]:
-            trace_rank = r + 1
+            raw_trace_rank = r + 1
         else:
             break
-    maxeig_rank = 0
+    raw_maxeig_rank = 0
     for r in range(n):
         if res.lr2[r] > res.cvm[r, cvc]:
-            maxeig_rank = r + 1
+            raw_maxeig_rank = r + 1
         else:
             break
+
+    # A valid cointegration rank is in [0, n-1]; raw rank == n means the system
+    # is full-rank (the series themselves look stationary / model assumptions
+    # don't hold), which is NOT "the anchor holds". Cap and flag it.
+    full_rank_stationary = (raw_trace_rank == n) or (raw_maxeig_rank == n)
+    trace_rank = min(raw_trace_rank, n - 1)
+    maxeig_rank = min(raw_maxeig_rank, n - 1)
 
     # cointegrating vector = first eigenvector, normalized on gold (col 0)
     vec = res.evec[:, 0]
@@ -349,9 +377,12 @@ def johansen_test(
         "trace_cv": [float(x) for x in res.cvt[:, cvc]],
         "maxeig_stat": [float(x) for x in res.lr2],
         "maxeig_cv": [float(x) for x in res.cvm[:, cvc]],
+        "raw_trace_rank": int(raw_trace_rank),
+        "raw_maxeig_rank": int(raw_maxeig_rank),
         "trace_rank": int(trace_rank),
         "maxeig_rank": int(maxeig_rank),
         "rank": int(min(trace_rank, maxeig_rank)),
+        "full_rank_stationary": bool(full_rank_stationary),
         "coint_vector_normalized": [float(x) for x in norm],
         "beta": beta,
         "alpha_level": alpha,

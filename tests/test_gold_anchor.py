@@ -5,6 +5,7 @@ required. The statistical assertions check that the test wrappers give the
 *right verdict* on series with known integration / cointegration structure.
 """
 import sys
+import zlib
 from pathlib import Path
 
 import numpy as np
@@ -90,10 +91,24 @@ def test_johansen_no_cointegration_for_independent_walks():
     assert j["rank"] == 0
 
 
+def test_johansen_full_rank_flagged_and_capped():
+    # two stationary (white-noise) series → full rank; must NOT read as anchor
+    n = 500
+    idx = pd.date_range("1980-01-31", periods=n, freq="ME")
+    g = np.random.default_rng(5).standard_normal(n)
+    a = np.random.default_rng(6).standard_normal(n)
+    df = pd.DataFrame({"ln_gold_nominal": g, "ln_anchor": a}, index=idx)
+    j = johansen_test(df, ["ln_gold_nominal", "ln_anchor"])
+    assert j["full_rank_stationary"] is True
+    assert j["rank"] <= 1  # capped to n-1
+    assert j["raw_trace_rank"] == 2 or j["raw_maxeig_rank"] == 2
+
+
 # ── panel builder (injected synthetic fetchers) ────────────────────────
 def _synthetic_fred(series_id, start="1968-01-01"):
     """Return a synthetic series with the right native frequency per series."""
-    rng = np.random.default_rng(abs(hash(series_id)) % (2**32))
+    # crc32 is a stable cross-process seed (hash() is randomized per process)
+    rng = np.random.default_rng(zlib.crc32(series_id.encode()))
     if series_id == "GFDEBTN":  # quarterly debt, $M, rising
         idx = pd.date_range("1968-01-01", "2025-12-31", freq="QS")
         return pd.Series(np.linspace(3e5, 3.5e7, len(idx)) * (1 + 0.01 * rng.standard_normal(len(idx))), index=idx)
@@ -146,6 +161,18 @@ def test_build_panel_notes_and_splice():
     rr = panel.data["real_rate_10y"].dropna()
     assert (rr.index < pd.Timestamp("2003-01-01")).any()
     assert (rr.index >= pd.Timestamp("2003-01-01")).any()
+
+
+def test_panel_coverage_handles_all_nan_column():
+    # end before WALCL starts (2002) → fed_gdp/ln_fed_gdp all NaN; coverage
+    # note must not crash on NaT min/max (P1 regression guard).
+    panel = build_anchor_panel(
+        start="1968-01-01", end="2000-12-31",
+        fetch_fn=_synthetic_fred, gold_fetch_fn=_synthetic_gold,
+    )
+    assert panel.data["fed_gdp"].notna().sum() == 0
+    assert "no observations (n=0)" in panel.notes["coverage"]
+    assert isinstance(panel.notes["fed_gdp_coverage"], str)
 
 
 def test_units_rescaled_to_billions():
