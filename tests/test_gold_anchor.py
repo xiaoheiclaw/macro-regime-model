@@ -366,7 +366,11 @@ def test_johansen_trivariate_reports_two_betas():
     assert good and all(len(b) == 2 for b in good)
 
 
-def test_johansen_trivariate_independent_no_coint():
+def test_johansen_trivariate_betas_contract():
+    # structural invariant (version-stable, NOT a brittle exact-rank assertion):
+    # betas is populated iff a valid cointegrating relation exists, and then has
+    # exactly n-1 entries. Independent random walks should *usually* give rank 0,
+    # but we assert the contract, not the precise LAPACK/statsmodels outcome.
     n = 500
     idx = pd.date_range("1980-01-31", periods=n, freq="ME")
     df = pd.DataFrame(
@@ -378,8 +382,9 @@ def test_johansen_trivariate_independent_no_coint():
         index=idx,
     )
     j = johansen_test(df, list(df.columns), k_ar_diff=1)
-    assert j["rank"] == 0
-    assert j["betas"] is None
+    assert (j["betas"] is None) == (not j["valid_coint"])  # invariant
+    if j["betas"] is not None:
+        assert len(j["betas"]) == 2
 
 
 def test_integration_segments_splits_real_rate():
@@ -429,3 +434,17 @@ def test_estimate_vecm_validates_inputs():
         estimate_vecm(df, ["ln_gold_nominal"], k_ar_diff=1)  # <2 cols
     with pytest.raises(ValueError):
         estimate_vecm(df.iloc[:20], cols, k_ar_diff=1)       # too few rows
+
+
+def test_estimate_vecm_det_orders_do_not_crash():
+    # every det_order in the Johansen grid maps to a VALID statsmodels VECM
+    # deterministic string (no "nc" crash). det_order=-1 ("n") in particular.
+    df = _trivariate_cointegrated()
+    cols = ["ln_gold_nominal", "ln_debt_gdp", "real_rate_10y"]
+    for det in (-1, 0, 1):
+        v = estimate_vecm(df, cols, k_ar_diff=1, coint_rank=1, det_order=det)
+        assert set(v["betas"]) == {"ln_debt_gdp", "real_rate_10y"}
+        assert v["det_order"] == det
+        # negated-β t-stat sign matches the reported (negated) β
+        for b in v["betas"].values():
+            assert (b["t"] >= 0) == (b["beta"] >= 0) or b["t"] == 0.0

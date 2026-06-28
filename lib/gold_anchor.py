@@ -648,10 +648,11 @@ def johansen_robustness(df: pd.DataFrame, columns, lags=(1, 2, 3, 4),
 
 
 # ── VECM (step 2: long-run vector + short-run error correction) ─────────
-# det_order (Johansen) → statsmodels VECM `deterministic` string. det_order=0
-# (constant restricted to the cointegrating relation) ↔ "ci"; -1 ↔ "nc";
-# 1 (linear trend) ↔ "cili" (constant + linear trend inside CE).
-_DET_ORDER_TO_VECM = {-1: "nc", 0: "ci", 1: "cili"}
+# det_order (Johansen) → statsmodels VECM `deterministic` string. Valid VECM
+# strings are {"n","co","ci","lo","li"} (and combinations); -1 (no deterministic)
+# is "n" — NOT "nc" (undocumented, fragile). det_order=0 (constant restricted to
+# the CE) ↔ "ci"; 1 (linear trend) ↔ "cili" (constant + linear trend inside CE).
+_DET_ORDER_TO_VECM = {-1: "n", 0: "ci", 1: "cili"}
 
 
 def estimate_vecm(
@@ -721,9 +722,12 @@ def estimate_vecm(
     pb = np.asarray(res.pvalues_beta)[:n, 0].astype(float)
     betas = {}
     for i in range(1, n):
+        # β is the raw VECM loading negated (moved to the RHS): G = -Σ β_i·X_i.
+        # Negate the t-stat too so its sign matches the reported β (t=coef/se,
+        # se>0 → sign flips with the coef). The two-sided p-value is unchanged.
         betas[cols[i]] = {
-            "beta": float(-beta_norm[i]),   # long-run coef moved to RHS
-            "t": float(tb[i]),
+            "beta": float(-beta_norm[i]),
+            "t": float(-tb[i]),
             "p": float(pb[i]),
             "significant": bool(pb[i] < 0.05),
         }
