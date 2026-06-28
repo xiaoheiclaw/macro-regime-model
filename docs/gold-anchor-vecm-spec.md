@@ -132,3 +132,25 @@ PR #1 测的是**双变量** `[ln金价, ln(债务/GDP)]` 协整,实利率因被
 2. **三变量 Johansen** `[ln金价, ln(债务/GDP), 实利率]`,复用 PR #1 的 lag/det 稳健性网格,报告 rank 与协整向量 (β₁, β₂)。
 3. 若稳健 rank≥1 → **估 VECM**:长期 β₁/β₂ + 短期 ECM(误差修正速度 λ、短期 Δ实利率系数),明确回答"实利率在锚里(β₂ 显著)还是在偏离里(短期显著)还是两者皆有"。
 4. 杀死条件不变:三变量仍无稳健协整 → 线性常参数锚(含实利率)证伪,再转 regime-switching/断点协整。
+
+---
+
+## PR #4(2026-06-28)— 时变锚之一:Markov-switching 回归(离散跳变)
+
+PR #1–#3 否定了所有**线性 / 常参数 / 单断点**锚(双变量、三变量 Johansen、Gregory-Hansen 断点协整全否)。与 Baur (2013)「驱动系数逐十年翻正负」互证 → **锚若存在,系数随 regime 时变,常参数工具按定义抓不住。** PR #4 测第一种时变形式:**离散跳变**——世界在 2–3 个 regime 间跳,每个 regime 一套驱动系数。
+
+**实现**(`lib/gold_anchor.py` + `scripts/gold_anchor_markov.py`):
+- 主模型:对**平稳的 Δln金价**(非 I(1) levels,避免伪回归)跑 `statsmodels MarkovRegression`,自变量 [Δln(债务/GDP), Δ实利率],**回归系数与残差方差均 regime 依赖**(`switching_variance=True`)。先 2 态、再 3 态,按 **BIC + 经济可读性**选 K。
+- 样本两段(对 spec 的 full-vs-clean 口径):**全样本 1968+** 用 debt-only MS(实利率拼接代理脏);**post-2003** 加干净 TIPS 实利率,做「实利率进 regime」的检验(回答「长端是锚」的 regime 条件版:Δ实利率在**哪些 regime** 显著/量级有别)。
+- 报告:每个 regime 的系数表(t/p、显著性)、转移矩阵(列和=1)、各 regime 期望持续期、**平滑 regime 概率时序**(交叉核对 1970s 高通胀 / Volcker / 2008 GFC / 2022 这些已知段能否被自动复现)、年度主导 regime 时序。
+- 「regime 区分度」三判据:系数跨 regime **符号翻转** ∨ **仅部分 regime 显著**(regime 条件) ∨ **量级显著有别**(range > 2·SE,同号但配方不同)。三者任一成立即「driver distinct」。
+- 重协整版(进阶,本 PR 不做):Markov-switching VECM(Krolzig / Hall-Psaradakis-Sola)让协整向量本身 regime 依赖,计算重。
+
+**坑(如实标注)**:① MS 似然多峰、对初值敏感 → 默认 EM 起点 + 多随机重启(`search_reps`,seeded 可复现)取最高似然;② regime 标签不可识别(重排序号似然不变)→ 必须**事后按系数**解释,勿按序号;③ 短样本下 3 态易过拟合 → BIC + 持续期/显著性双核;④ 干净实利率仅 2003+,限制「实利率进 regime」检验只在 post-2003。
+
+**杀死条件(PR #4)**:若两样本均找不到可解释、系数显著有别的 regime 结构 → **连离散时变锚也不成立**,转 **TVP / Kalman(PR #5)**;若 TVP 也无结构,则黄金「无稳定锚,只剩 regime/叙事」。
+
+运行:`uv run python scripts/gold_anchor_markov.py [--start 1968-01-01] [--end YYYY-MM]`,报告写到 `analysis/gold_anchor_markov_<date>.md`,平滑概率与 meta 写到 `data/`。
+
+### PR #5(后续):TVP / Kalman — 平滑漂移
+系数走随机游走,Kalman 滤波估 β₁ₜ(债务敏感度)、β₂ₜ(实利率敏感度)的平滑时间路径 + 置信带。与 Markov 对照:漂移是**突跳**(支持 regime)还是**平滑**(支持 TVP)。
