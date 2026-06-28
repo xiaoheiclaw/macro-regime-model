@@ -262,6 +262,11 @@ def build_anchor_panel(
         "pre-TIPS proxy = GS10 − trailing-12m CPI YoY (realized, not ex-ante). "
         "Splice break is a known weakness (spec §0)."
     )
+    # clean machine-readable splice cutoff so callers can split the real-rate
+    # series into spliced-full vs clean-TIPS subsamples for the I(d) double read.
+    notes["real_rate_tips_start"] = (
+        tips_start.date().isoformat() if tips_start is not None else "n/a"
+    )
 
     df = pd.DataFrame(
         {
@@ -467,6 +472,39 @@ def integration_table(df: pd.DataFrame, columns, min_obs: int = 20) -> pd.DataFr
     return pd.DataFrame(rows).set_index("series")
 
 
+def integration_segments(series, segments: Dict[str, tuple], alpha: float = 0.05,
+                         min_obs: int = 20) -> Dict[str, Dict[str, object]]:
+    """Run the dual-regression (c + ct) I(d) verdict on named sub-windows of a
+    single series. ``segments`` maps a label → (start, end) bounds (either may
+    be None for open-ended). Returns label → {combined, c, ct, n, start, end}
+    — lightweight, JSON-serializable fields only (the full c_res/ct_res test
+    objects are intentionally NOT returned; callers only need the verdicts).
+
+    Used to read the long-end real rate on two regimes separately: the full
+    spliced series (GS10−CPI proxy pre-TIPS + DFII10) vs the clean post-TIPS
+    DFII10 subsample. PR #1 judged the (full) real rate I(0) and dropped it from
+    the cointegrating vector; the split makes that verdict auditable per segment
+    rather than letting the splice break drive a single ambiguous label.
+    """
+    s = pd.Series(series).dropna().astype(float)
+    out: Dict[str, Dict[str, object]] = {}
+    for name, bounds in segments.items():
+        start, end = bounds
+        seg = s
+        if start is not None:
+            seg = seg[seg.index >= pd.Timestamp(start)]
+        if end is not None:
+            seg = seg[seg.index <= pd.Timestamp(end)]
+        cv = combined_verdict(seg, alpha=alpha, min_obs=min_obs)
+        out[name] = {
+            "combined": cv["combined"], "c": cv["c"], "ct": cv["ct"],
+            "n": int(len(seg)),
+            "start": (seg.index.min().date().isoformat() if len(seg) else None),
+            "end": (seg.index.max().date().isoformat() if len(seg) else None),
+        }
+    return out
+
+
 # ── Cointegration (step 1) ─────────────────────────────────────────────
 # Johansen critical-value columns: [90%, 95%, 99%]
 _CV_COL = {0.10: 0, 0.05: 1, 0.01: 2}
@@ -540,10 +578,18 @@ def johansen_test(
             f"near-zero loading {vec[0]:.2e} for {cols} (n_obs={len(sub)})"
         )
     norm = vec / vec[0]
-    # G = α + β·A  ⇒  G - β·A ~ I(0); evec row encodes G + c1*A, so β = -c1
-    # (coefficient on the anchor moved to the RHS). β is only a long-run
-    # elasticity when a valid cointegrating relation exists — None otherwise.
-    beta = float(-norm[1]) if (valid_coint and n >= 2) else None
+    # G = α + β·A  ⇒  G - β·A ~ I(0); evec row encodes G + c_i·A_i, so the
+    # long-run coefficient on anchor i is β_i = -c_i (moved to the RHS). For a
+    # bivariate system β = β_1; for the trivariate anchor [gold, debt, real
+    # rate] `betas` carries (β_debt, β_real). β/βs are interpretable ONLY when
+    # coint_rank == 1: with rank>1 the single eigenvector is not unique, so the
+    # first column is an arbitrary basis vector — report None, not a misleading β.
+    # β interpretable only for a VALID (valid_coint rules out full-rank-stationary)
+    # and UNIQUE (coint_rank == 1; rank>1 → first eigenvector is a non-unique
+    # basis vector) cointegrating relation.
+    interpretable = valid_coint and (coint_rank == 1) and (n >= 2)
+    beta = float(-norm[1]) if interpretable else None
+    betas = [float(-norm[i]) for i in range(1, n)] if interpretable else None
 
     return {
         "columns": cols,
@@ -561,6 +607,7 @@ def johansen_test(
         "full_rank_stationary": bool(full_rank_stationary),
         "coint_vector_normalized": [float(x) for x in norm],
         "beta": beta,
+        "betas": betas,
         "alpha_level": alpha,
         "k_ar_diff": int(k_ar_diff),
         "det_order": int(det_order),
@@ -597,9 +644,157 @@ def johansen_robustness(df: pd.DataFrame, columns, lags=(1, 2, 3, 4),
                 j = johansen_test(df, columns, det_order=det, k_ar_diff=lag, alpha=alpha)
                 rec.update(coint_rank=j["coint_rank"], valid_coint=j["valid_coint"],
                            beta=(None if j["beta"] is None else round(j["beta"], 3)),
+                           betas=(None if j["betas"] is None else [round(b, 3) for b in j["betas"]]),
                            n_obs=j["n_obs"])
-            except ValueError as e:
+            # trivariate systems hit singular/non-PD matrices more often → a bad
+            # cell must degrade to an `error` row, never crash the whole grid.
+            except (ValueError, np.linalg.LinAlgError) as e:
                 rec.update(coint_rank=None, valid_coint=None, beta=None,
-                           n_obs=None, error=str(e)[:50])
+                           betas=None, n_obs=None, error=f"{type(e).__name__}: {str(e)[:40]}")
             rows.append(rec)
     return pd.DataFrame(rows)
+
+
+# ── VECM (step 2: long-run vector + short-run error correction) ─────────
+# det_order (Johansen) → statsmodels VECM `deterministic` string. Valid VECM
+# strings are {"n","co","ci","lo","li"} (and combinations); -1 (no deterministic)
+# is "n" — NOT "nc" (undocumented, fragile). det_order=0 (constant restricted to
+# the CE) ↔ "ci"; 1 (linear trend) ↔ "cili" (constant + linear trend inside CE).
+_DET_ORDER_TO_VECM = {-1: "n", 0: "ci", 1: "cili"}
+
+
+def estimate_vecm(
+    df: pd.DataFrame,
+    columns,
+    k_ar_diff: int = 1,
+    coint_rank: int = 1,
+    det_order: int = 0,
+    alpha: float = 0.05,
+) -> Dict[str, object]:
+    """Estimate a VECM and split the anchor into its long-run and short-run
+    pieces — the step-2 question "is the real rate IN the anchor or in the
+    deviation?".
+
+    Returns, for the gold equation (row 0):
+      * ``betas`` — long-run cointegrating coefficients β_i = -beta_i (gold
+        normalized to 1), with t/p values → β2 (real rate) significant ⇒ the
+        real rate is part of the long-run anchor.
+      * ``ec_speed`` (λ = α on gold) + t/p → λ<0 & significant ⇒ genuine error
+        correction back to the anchor.
+      * ``short_run`` — Δ coefficients in the gold equation (per var × lag) with
+        t/p → a significant short-run Δreal_rate ⇒ the real rate drives the
+        deviation around the anchor.
+
+    Requires ``k_ar_diff>=1`` so at least one short-run difference block exists
+    (a VAR(1)→k_ar_diff=0 Johansen lag carries no Δ dynamics; the caller bumps
+    it to 1 for the VECM and notes the bump).
+    """
+    from statsmodels.tsa.vector_ar.vecm import VECM
+
+    cols = list(columns)
+    n = len(cols)
+    if n < 2:
+        raise ValueError(f"estimate_vecm needs >=2 columns, got {cols}")
+    if k_ar_diff < 1:
+        raise ValueError(
+            f"estimate_vecm needs k_ar_diff>=1 for short-run terms, got {k_ar_diff}"
+        )
+    # single-anchor decomposition: we report ONE long-run vector (β1/β2) + one
+    # error-correction loading λ, which is only meaningful when the cointegrating
+    # space is 1-D. rank>1 → multiple vectors, no unique "anchor" → caller must
+    # handle separately (mirrors the johansen_test rank>1 → β=None contract).
+    if coint_rank != 1:
+        raise ValueError(
+            f"estimate_vecm currently supports only coint_rank==1 (single anchor "
+            f"vector); got {coint_rank}. rank>1 has no unique β1/β2 to report."
+        )
+    if det_order not in _DET_ORDER_TO_VECM:
+        raise ValueError(f"det_order must be one of {sorted(_DET_ORDER_TO_VECM)}")
+
+    sub = df[cols].dropna()
+    min_obs = max(40, n * (k_ar_diff + 3))
+    if len(sub) < min_obs:
+        raise ValueError(
+            f"estimate_vecm needs >={min_obs} complete rows for {cols}, "
+            f"got {len(sub)} after dropna"
+        )
+    if not np.isfinite(sub.values).all():
+        raise ValueError(f"estimate_vecm got non-finite values in {cols}")
+
+    deterministic = _DET_ORDER_TO_VECM[det_order]
+    res = VECM(sub.values, k_ar_diff=k_ar_diff, coint_rank=coint_rank,
+               deterministic=deterministic).fit()
+
+    # cointegrating vector: first `n` rows are the variable loadings (any
+    # deterministic terms come after). statsmodels already normalizes the first
+    # `coint_rank` rows of β to the identity, so for rank==1 res.beta[0]==1 and
+    # the reported t/p line up with the coefficients as-is. Assert that before
+    # reusing t/p — if a future statsmodels stops auto-normalizing, β would
+    # become a ratio and the raw t/p would no longer correspond (P2).
+    beta_vec = np.asarray(res.beta)[:n, 0].astype(float)
+    if abs(beta_vec[0] - 1.0) > 1e-6:
+        raise ValueError(
+            f"estimate_vecm: VECM β not normalized to gold=1 (got {beta_vec[0]:.4g}); "
+            "reusing statsmodels t/p would be inconsistent — refit/normalize needed."
+        )
+    beta_norm = beta_vec  # already gold-normalized (beta_vec[0]==1)
+    tb = np.asarray(res.tvalues_beta)[:n, 0].astype(float)
+    pb = np.asarray(res.pvalues_beta)[:n, 0].astype(float)
+    betas = {}
+    for i in range(1, n):
+        # β is the raw VECM loading negated (moved to the RHS): G = -Σ β_i·X_i.
+        # Negate the t-stat too so its sign matches the reported β (t=coef/se,
+        # se>0 → sign flips with the coef). The two-sided p-value is unchanged.
+        betas[cols[i]] = {
+            "beta": float(-beta_norm[i]),
+            "t": float(-tb[i]),
+            "p": float(pb[i]),
+            "significant": bool(pb[i] < alpha),
+        }
+
+    # deterministic term(s) restricted to the cointegration relation (the ECT
+    # intercept/trend), so the user can reconstruct ECT = G - Σβ_i·X_i + c.
+    # "ci" → one constant; "cili" → constant + linear trend; "n" → none.
+    dcc = getattr(res, "det_coef_coint", None)
+    dcc = np.asarray(dcc) if dcc is not None else None
+    coint_det = [float(x) for x in dcc[:, 0]] if (dcc is not None and dcc.size) else None
+
+    ec_speed = {
+        "lambda": float(np.asarray(res.alpha)[0, 0]),
+        "t": float(np.asarray(res.tvalues_alpha)[0, 0]),
+        "p": float(np.asarray(res.pvalues_alpha)[0, 0]),
+    }
+    ec_speed["significant"] = bool(ec_speed["p"] < alpha)
+    ec_speed["corrects"] = bool(ec_speed["lambda"] < 0 and ec_speed["significant"])
+
+    # short-run Γ for the gold equation (row 0). Γ is (n, n*k_ar_diff) ordered
+    # [lag1: var0..var_{n-1}, lag2: ...].
+    gamma = np.asarray(res.gamma)
+    tg = np.asarray(res.tvalues_gamma)
+    pg = np.asarray(res.pvalues_gamma)
+    short_run = []
+    for lag in range(1, k_ar_diff + 1):
+        for i, c in enumerate(cols):
+            j = (lag - 1) * n + i
+            short_run.append({
+                "var": c, "lag": lag,
+                "coef": float(gamma[0, j]),
+                "t": float(tg[0, j]),
+                "p": float(pg[0, j]),
+                "significant": bool(pg[0, j] < alpha),
+            })
+
+    return {
+        "columns": cols,
+        "coint_rank": int(coint_rank),
+        "k_ar_diff": int(k_ar_diff),
+        "det_order": int(det_order),
+        "deterministic": deterministic,
+        "alpha_level": float(alpha),
+        "n_obs": int(len(sub)),
+        "beta_normalized": [float(x) for x in beta_norm],
+        "betas": betas,
+        "coint_det": coint_det,
+        "ec_speed": ec_speed,
+        "short_run": short_run,
+    }

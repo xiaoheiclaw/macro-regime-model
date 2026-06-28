@@ -16,6 +16,8 @@ from lib.gold_anchor import (
     build_anchor_panel,
     classify_integration,
     combined_verdict,
+    estimate_vecm,
+    integration_segments,
     integration_table,
     johansen_robustness,
     johansen_test,
@@ -327,3 +329,204 @@ def test_end_month_boundary_includes_month_end():
     )
     assert pd.Timestamp("2025-12-31") in panel.data.index
     assert panel.data.index.max() <= pd.Timestamp("2025-12-31")
+
+
+# ── PR #2: trivariate anchor [ln gold, ln(debt/GDP), real rate] ─────────
+def _trivariate_cointegrated(n=500, b1=1.2, b2=-0.5, seed=31):
+    """gold = b1·debt + b2·real + stationary AR(1) error, with debt and real
+    both random walks (I(1)) so the long-run β2 on the real rate is identified.
+    Returns a DataFrame [ln_gold_nominal, ln_debt_gdp, real_rate_10y]."""
+    idx = pd.date_range("1980-01-31", periods=n, freq="ME")
+    rng = np.random.default_rng(seed)
+    debt = np.cumsum(rng.standard_normal(n)) * 0.4 + 0.05 * np.arange(n)
+    real = np.cumsum(rng.standard_normal(n)) * 0.2
+    err = np.zeros(n)
+    for t in range(1, n):  # mean-reverting equilibrium error → cointegration
+        err[t] = 0.55 * err[t - 1] + rng.standard_normal() * 0.25
+    gold = b1 * debt + b2 * real + err
+    return pd.DataFrame(
+        {"ln_gold_nominal": gold, "ln_debt_gdp": debt, "real_rate_10y": real},
+        index=idx,
+    )
+
+
+def test_johansen_trivariate_reports_two_betas():
+    df = _trivariate_cointegrated()
+    cols = ["ln_gold_nominal", "ln_debt_gdp", "real_rate_10y"]
+    j = johansen_test(df, cols, k_ar_diff=1)
+    assert j["coint_rank"] == 1              # unique vector → β interpretable
+    # betas carries (β_debt, β_real) for the 3-var system
+    assert j["betas"] is not None and len(j["betas"]) == 2
+    assert abs(j["betas"][0] - 1.2) < 0.4    # β_debt ≈ 1.2 (true)
+    assert abs(j["betas"][1] - (-0.5)) < 0.4  # β_real ≈ -0.5 (true) — the PR's core add
+    assert j["betas"][0] == j["beta"]        # β alias = first anchor coef
+    # robustness grid carries the betas list per cell
+    rob = johansen_robustness(df, cols)
+    assert "betas" in rob.columns
+    good = [b for b in rob["betas"].tolist() if b is not None]
+    assert good and all(len(b) == 2 for b in good)
+
+
+def test_johansen_trivariate_betas_contract():
+    # structural invariant (version-stable, NOT a brittle exact-rank assertion):
+    # betas is populated iff a valid cointegrating relation exists, and then has
+    # exactly n-1 entries. Independent random walks should *usually* give rank 0,
+    # but we assert the contract, not the precise LAPACK/statsmodels outcome.
+    n = 500
+    idx = pd.date_range("1980-01-31", periods=n, freq="ME")
+    df = pd.DataFrame(
+        {
+            "ln_gold_nominal": np.cumsum(np.random.default_rng(1).standard_normal(n)),
+            "ln_debt_gdp": np.cumsum(np.random.default_rng(2).standard_normal(n)),
+            "real_rate_10y": np.cumsum(np.random.default_rng(3).standard_normal(n)),
+        },
+        index=idx,
+    )
+    j = johansen_test(df, list(df.columns), k_ar_diff=1)
+    # β populated iff the relation is both VALID and UNIQUE (matches the impl)
+    expected = j["valid_coint"] and j["coint_rank"] == 1
+    assert (j["betas"] is not None) == expected
+    if j["betas"] is not None:
+        assert len(j["betas"]) == 2
+
+
+def test_johansen_trivariate_rank_gt1_no_single_beta():
+    # one common stochastic trend shared by all three I(1) series → TWO
+    # independent cointegrating vectors → coint_rank=2. The single eigenvector is
+    # then a non-unique basis vector, so β/βs must be None (not a misleading number).
+    n = 500
+    idx = pd.date_range("1980-01-31", periods=n, freq="ME")
+    f = np.cumsum(np.random.default_rng(40).standard_normal(n))  # common trend
+    rng = np.random.default_rng(41)
+    g = f + rng.standard_normal(n) * 0.3
+    d = 2.0 * f + rng.standard_normal(n) * 0.3
+    r = 0.5 * f + rng.standard_normal(n) * 0.3
+    df = pd.DataFrame({"ln_gold_nominal": g, "ln_debt_gdp": d, "real_rate_10y": r}, index=idx)
+    j = johansen_test(df, list(df.columns), k_ar_diff=1)
+    # contract holds for ANY rank outcome: β/βs populated iff the relation is
+    # both valid AND unique (valid_coint and coint_rank == 1).
+    expected = j["valid_coint"] and j["coint_rank"] == 1
+    assert (j["betas"] is not None) == expected
+    assert (j["beta"] is not None) == expected
+    if j["coint_rank"] > 1:
+        assert j["beta"] is None and j["betas"] is None
+
+
+def test_integration_segments_splits_real_rate():
+    # build a series: I(0) white noise pre-2003, I(1) random walk post-2003.
+    idx = pd.date_range("1990-01-31", periods=480, freq="ME")
+    pre_mask = idx < pd.Timestamp("2003-01-01")
+    vals = np.empty(len(idx))
+    vals[pre_mask] = np.random.default_rng(7).standard_normal(pre_mask.sum())
+    rw = np.cumsum(np.random.default_rng(8).standard_normal((~pre_mask).sum()))
+    vals[~pre_mask] = rw
+    s = pd.Series(vals, index=idx)
+    segs = integration_segments(
+        s, {"full": (None, None), "post_2003": ("2003-01-01", None)}
+    )
+    assert set(segs) == {"full", "post_2003"}
+    for name in segs:
+        assert segs[name]["combined"] in {"I(0)", "I(1)", "ambiguous"}
+        assert segs[name]["c"] is not None and segs[name]["ct"] is not None
+    assert segs["post_2003"]["n"] < segs["full"]["n"]
+    assert segs["post_2003"]["start"] >= "2003-01-01"
+
+
+def test_estimate_vecm_recovers_long_and_short_run():
+    df = _trivariate_cointegrated(b1=1.2, b2=-0.5)
+    cols = ["ln_gold_nominal", "ln_debt_gdp", "real_rate_10y"]
+    v = estimate_vecm(df, cols, k_ar_diff=2, coint_rank=1, det_order=0)
+    # long-run β2 (real rate) recovered with the right sign
+    assert set(v["betas"]) == {"ln_debt_gdp", "real_rate_10y"}
+    assert abs(v["betas"]["ln_debt_gdp"]["beta"] - 1.2) < 0.5
+    assert v["betas"]["real_rate_10y"]["beta"] < 0      # b2 = -0.5 < 0
+    # error-correction speed λ < 0 and significant (constructed mean reversion)
+    assert v["ec_speed"]["lambda"] < 0
+    assert v["ec_speed"]["corrects"] is True
+    # short-run block exists and includes a Δreal_rate term in the gold eq
+    assert len(v["short_run"]) == 2 * len(cols)  # 2 lags × 3 vars
+    rr_terms = [t for t in v["short_run"] if t["var"] == "real_rate_10y"]
+    assert len(rr_terms) == 2
+    assert v["beta_normalized"][0] == 1.0
+
+
+def test_johansen_beta_requires_valid_and_unique_coint():
+    # β/βs must be None unless there is a VALID (not full-rank-stationary) AND
+    # UNIQUE (rank==1) cointegrating relation. Two stationary white-noise series
+    # → full_rank_stationary → valid_coint False → β None even if a raw rank
+    # would otherwise be ≥1.
+    n = 500
+    idx = pd.date_range("1980-01-31", periods=n, freq="ME")
+    df = pd.DataFrame(
+        {"ln_gold_nominal": np.random.default_rng(5).standard_normal(n),
+         "ln_debt_gdp": np.random.default_rng(6).standard_normal(n)},
+        index=idx,
+    )
+    j = johansen_test(df, list(df.columns))
+    # the contract, stated directly (robust to a false-positive rank draw):
+    expected = j["valid_coint"] and j["coint_rank"] == 1
+    assert (j["betas"] is not None) == expected
+    assert (j["beta"] is not None) == expected
+
+
+def test_estimate_vecm_validates_inputs():
+    df = _trivariate_cointegrated()
+    cols = ["ln_gold_nominal", "ln_debt_gdp", "real_rate_10y"]
+    with pytest.raises(ValueError):
+        estimate_vecm(df, cols, k_ar_diff=0)      # no short-run block
+    with pytest.raises(ValueError):
+        estimate_vecm(df, ["ln_gold_nominal"], k_ar_diff=1)  # <2 cols
+    with pytest.raises(ValueError):
+        estimate_vecm(df.iloc[:20], cols, k_ar_diff=1)       # too few rows
+    with pytest.raises(ValueError):
+        estimate_vecm(df, cols, k_ar_diff=1, coint_rank=2)   # rank>1 → no unique β
+
+
+def test_vecm_signature_distinguishes_placement():
+    # cross-window consistency key: opposite β₂ signs (or different significance /
+    # λ-correction) → different signatures → would be flagged window_sensitive.
+    from scripts.gold_anchor_analysis import _vecm_signature
+
+    def fake(beta2, b2_sig, lam_corrects, rr_short_sig, rr_coef=-0.1):
+        return {
+            "betas": {"real_rate_10y": {"beta": beta2, "significant": b2_sig}},
+            "ec_speed": {"corrects": lam_corrects},
+            "short_run": [{"var": "real_rate_10y", "lag": 1,
+                           "coef": rr_coef, "significant": rr_short_sig}],
+        }
+
+    base = _vecm_signature(fake(-0.5, True, True, False))
+    same = _vecm_signature(fake(-0.4, True, True, False))   # same sign/flags
+    flip = _vecm_signature(fake(+0.5, True, True, False))   # β₂ sign flipped
+    assert base == same          # consistent → robust_both allowed
+    assert base != flip          # inconsistent → window_sensitive
+    assert _vecm_signature(None) is None
+    # significant Δreal_rate with OPPOSITE sign → conflicting signatures
+    pos = _vecm_signature(fake(-0.5, False, True, True, rr_coef=+0.2))
+    neg = _vecm_signature(fake(-0.5, False, True, True, rr_coef=-0.2))
+    assert pos != neg
+
+
+def test_estimate_vecm_alpha_threshold_propagates():
+    # significance uses the caller's alpha, and alpha_level is echoed back.
+    df = _trivariate_cointegrated()
+    cols = ["ln_gold_nominal", "ln_debt_gdp", "real_rate_10y"]
+    v = estimate_vecm(df, cols, k_ar_diff=2, coint_rank=1, alpha=0.01)
+    assert v["alpha_level"] == 0.01
+    for b in v["betas"].values():
+        assert b["significant"] == (b["p"] < 0.01)
+    assert v["ec_speed"]["significant"] == (v["ec_speed"]["p"] < 0.01)
+
+
+def test_estimate_vecm_det_orders_do_not_crash():
+    # every det_order in the Johansen grid maps to a VALID statsmodels VECM
+    # deterministic string (no "nc" crash). det_order=-1 ("n") in particular.
+    df = _trivariate_cointegrated()
+    cols = ["ln_gold_nominal", "ln_debt_gdp", "real_rate_10y"]
+    for det in (-1, 0, 1):
+        v = estimate_vecm(df, cols, k_ar_diff=1, coint_rank=1, det_order=det)
+        assert set(v["betas"]) == {"ln_debt_gdp", "real_rate_10y"}
+        assert v["det_order"] == det
+        # negated-β t-stat sign matches the reported (negated) β
+        for b in v["betas"].values():
+            assert (b["t"] >= 0) == (b["beta"] >= 0) or b["t"] == 0.0
