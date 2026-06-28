@@ -133,18 +133,31 @@ def _annual_dominant(fit):
 def _fmt_fit(fit) -> list:
     L = []
     exog = fit["exog"]
-    L.append(f"- 选定 **K={fit['k_regimes']}** (BIC={fit['bic']:.1f}, AIC={fit['aic']:.1f}, "
+    deg = fit.get("degenerate")
+    trust = fit.get("trustworthy")
+    L.append(f"- 展示 **K={fit['k_regimes']}** (BIC={fit['bic']:.1f}, AIC={fit['aic']:.1f}, "
              f"llf={fit['llf']:.1f}, n_obs={fit['n_obs']}, "
              f"switching_variance={fit.get('switching_variance')}, "
-             f"n_restarts={fit.get('n_restarts')}, converged={fit['converged']}) (事实)\n")
+             f"n_restarts={fit.get('n_restarts')}, **converged={fit['converged']}**, "
+             f"non-degenerate regimes={fit.get('n_nondegenerate')}/{fit['k_regimes']}, "
+             f"**trustworthy={trust}**) (事实)\n")
+    if deg or fit.get("converged") is False:
+        L.append(f"- ⚠️ **该解退化/未收敛**(σ² floor={fit.get('var_floor', float('nan')):.2e}, "
+                 f"min duration={fit.get('min_duration')}m, |t| 识别上限={fit.get('t_ident_max'):g}):"
+                 "含退化 regime 或 MLE 未收敛 → 下列系数仅作诊断,**不作 regime 结构证据** (推理)。\n")
     L.append("**各 regime 系数表** (Δln金价 ~ 各驱动的 Δ;系数/方差均 regime 依赖):\n")
     for r in fit["regimes"]:
+        tag = ""
+        if r.get("degenerate"):
+            tag = f" — ⚠️**退化**[{', '.join(r.get('degenerate_reasons', []))}]"
         L.append(f"- **Regime {r['regime']}** — {_regime_label(r, exog)} "
-                 f"(期望持续 {r['expected_duration']:.1f} 月) (事实):")
+                 f"(期望持续 {r['expected_duration']:.1f} 月){tag} (事实):")
         for nm, cell in r["coeffs"].items():
-            sig = "**显著**" if cell["significant"] else "不显著"
+            sig = "**显著**" if cell["significant"] else ("不显著(未识别 |t|>1e6)"
+                  if not cell.get("identified", True) else "不显著")
+            tval = f"{cell['t']:.2e}" if abs(cell["t"]) >= 1e4 or not np.isfinite(cell["t"]) else f"{cell['t']:.2f}"
             L.append(f"    - {DRIVER_LABEL.get(nm, nm)}: coef={cell['coef']:+.4f} "
-                     f"(t={cell['t']:.2f}, p={cell['p']:.3f}, {sig})")
+                     f"(t={tval}, p={cell['p']:.3f}, {sig})")
     tm = np.asarray(fit["transition_matrix"])
     L.append("\n**转移矩阵** P[i,j]=P(s_t=i | s_{t-1}=j),列和=1 (事实):")
     L.append("```")
@@ -155,14 +168,16 @@ def _fmt_fit(fit) -> list:
     L.append("```")
     L.append(f"- 期望持续期 (月): {[round(d, 1) for d in fit['expected_durations']]} (事实)")
 
-    # regime-conditional anchor read
+    # regime-conditional anchor read — degenerate regimes EXCLUDED
     spread = regime_coeff_spread(fit)
-    L.append("\n**驱动的 regime 区分度** (是否「regime 条件锚」):")
+    nd = fit.get("n_nondegenerate", fit["k_regimes"])
+    L.append(f"\n**驱动的 regime 区分度** (仅在 {nd} 个 non-degenerate regime 间比较;退化 regime 已剔除):")
     for nm in exog:
         s = spread[nm]
-        L.append(f"    - {DRIVER_LABEL.get(nm, nm)}: 跨 regime 系数={[round(c, 3) for c in s['coefs']]}, "
-                 f"符号翻转={s['sign_flip']}, 显著 regime 数={s['n_sig']}/{fit['k_regimes']}, "
-                 f"regime条件(部分显著)={s['regime_conditional']} (事实/推理)")
+        L.append(f"    - {DRIVER_LABEL.get(nm, nm)}: 跨 non-deg regime 系数={[round(c, 3) for c in s['coefs']]}, "
+                 f"可比 regime 数={s['n_compared']}, 符号翻转={s['sign_flip']}, "
+                 f"显著 regime 数={s['n_sig']}, regime条件={s['regime_conditional']}, "
+                 f"distinct={s['distinct']} (事实/推理)")
 
     # episode alignment
     L.append("\n**平滑 regime 概率 × 已知宏观段** (描述性交叉核对,模型未对这些段拟合):")
@@ -185,24 +200,30 @@ def _fmt_fit(fit) -> list:
 
 
 def _sample_verdict(fit) -> tuple:
-    """Per-sample structural verdict: is there an interpretable, significantly-
-    distinct regime structure? (interpretable, reason)."""
-    spread = regime_coeff_spread(fit)
+    """Per-sample structural verdict: is there a CREDIBLE, distinct regime
+    structure? (interpretable, reason). Hard gate: the fit must be trustworthy
+    (converged + no degenerate regime + ≥2 non-degenerate regimes); only then do
+    we compare coefficients across the non-degenerate regimes."""
+    # gate 1: trustworthiness (converged, no degenerate regime, ≥2 survive)
+    if not fit.get("trustworthy"):
+        why = []
+        if fit.get("converged") is False:
+            why.append("MLE 未收敛")
+        if fit.get("degenerate"):
+            why.append(f"含退化 regime({fit.get('n_nondegenerate')}/{fit['k_regimes']} non-deg)")
+        if fit.get("n_nondegenerate", 0) < 2:
+            why.append("non-degenerate regime <2(无切换)")
+        return False, "拟合不可信:" + "、".join(why or ["未通过可信门"])
+    # gate 2: distinct coefficients among the non-degenerate regimes
+    spread = regime_coeff_spread(fit)  # nondegenerate_only=True by default
     exog = fit["exog"]
     any_sig = any(spread[nm]["sig_in_any"] for nm in exog)
-    # distinct = sign flip OR only-some-regimes significant OR a beyond-noise
-    # magnitude gap (a driver significant in both regimes but with very different
-    # magnitude is still a different anchor recipe per regime).
     any_distinct = any(spread[nm]["distinct"] for nm in exog)
-    # persistence: at least one regime expected to last > 6 months (not noise)
-    persistent = max(fit["expected_durations"]) > 6.0
-    interpretable = bool(any_sig and any_distinct and persistent)
-    bits = []
-    bits.append("有驱动在某些 regime 显著" if any_sig else "无驱动在任何 regime 显著")
+    interpretable = bool(any_sig and any_distinct)
+    bits = [f"{fit['n_nondegenerate']} 个 non-degenerate 持久 regime、已收敛"]
+    bits.append("有驱动在某些 regime 显著" if any_sig else "无驱动显著(|t|<1e6 口径)")
     bits.append("系数跨 regime 翻转/部分显著/量级显著有别(regime 条件锚特征)" if any_distinct
                 else "系数跨 regime 无实质区别")
-    bits.append(f"最长期望持续 {max(fit['expected_durations']):.1f} 月"
-                + ("(够持久)" if persistent else "(过短,疑噪声)"))
     return interpretable, "; ".join(bits)
 
 
@@ -225,8 +246,14 @@ def _build_report(df, notes, results, args) -> str:
              f"{N_RESTARTS} 次随机重启(`search_reps`,seeded 可复现)取最高似然;不同种子仍可能落不同局部解。")
     L.append("- **regime 标签不可识别** (事实):重排 regime 序号似然不变 → 不能按序号解读,"
              "必须**事后按系数**解释(本报告 regime 标签按显著驱动 + 波动率描述)。")
-    L.append("- **短样本下 3 态可能过拟合** (推理):K 由 BIC + 经济可读性选;K=3 若 BIC 不降或某 regime "
-             "持续期过短/无显著驱动,判过拟合,退回 K=2。")
+    L.append("- **退化解硬化(本轮重点)** (事实):真数据 MS 常返回退化解——某 regime 塌到单个离群点"
+             "(σ²→0、期望持续≈1 月、系数 |t|~1e13 来自 SE≈0)。硬化:① 系数显著须 **|t|<1e6 且 p<α**"
+             "(|t|>1e6 判未识别,不算显著);② regime 退化判据 = σ² < 全样本 Δln金价方差×1e-3 ∨ 期望持续<3 月 "
+             "∨ 任一系数未识别;③ K 选择**作废含退化 regime 的解**,取最大「全 non-degenerate」可信 K"
+             "(可能 K=1=无切换);④ 区分度/「regime 条件锚」只在 non-degenerate regime 间比较;"
+             "⑤ 最优解仍未收敛/退化 → 报告如实标「不可信」,不给「获支持」。")
+    L.append("- **短样本下 3 态可能过拟合** (推理):K 由 BIC 选,但 BIC 会靠退化 regime 撑大 K;"
+             "故可信 K 用上面的退化门约束,而非纯 BIC。")
     L.append("- **干净实利率仅 2003+** (事实):全样本(1968+)只用 debt-only MS(实利率拼接代理脏);"
              "「实利率进 regime」的检验只在 post-2003 子样本做。")
     L.append("- **Δln 一阶差分丢长期信息** (推理):MS-回归测的是「短期驱动系数是否 regime 依赖」;"
@@ -244,29 +271,41 @@ def _build_report(df, notes, results, args) -> str:
         L.append(f"- 差分后样本窗口 {res['window'][0]} .. {res['window'][1]} (n={res['frame_n']}) (事实)")
         if sel["errors"]:
             L.append(f"- K 拟合失败: {sel['errors']} (事实)")
-        L.append(f"- BIC 选阶: {{K: BIC}} = "
-                 f"{ {k: round(v, 1) for k, v in sel['bic'].items()} } → 选 **K={sel['selected_k']}** "
-                 "(BIC 最小;并核对经济可读性) (事实/推理)")
-        if sel["selected_k"] is None:
+        L.append(f"- BIC: {{K: BIC}} = { {k: round(v, 1) for k, v in sel['bic'].items()} }; "
+                 f"BIC 最小 K={sel['bic_selected_k']};各 K 是否可信(收敛+无退化+≥2 non-deg regime): "
+                 f"{sel['clean_k']} (事实)")
+        if sel["selected_k"] is not None:
+            L.append(f"- **可信选 K={sel['selected_k']}**(最大的可信 K;BIC 最小 K 若靠退化 regime 取胜则作废)(推理)")
+        else:
+            L.append("- ⚠️ **无任一 K 可信(全部未收敛/含退化 regime)→ 无可信 regime 切换,等价 K=1=无切换** (推理)")
+        if sel["bic_selected_k"] is None:
             L.append("- **无任一 K 成功拟合 → 该样本无结论** (推理)")
             samples_interpretable.append(None)
             continue
-        fit = sel["fits"][sel["selected_k"]]
+        # display the trusted fit if one exists; else show the BIC fit for
+        # diagnosis (clearly tagged degenerate), with a null verdict.
+        trusted = sel["selected_k"] is not None
+        chosen_k = sel["selected_k"] if trusted else sel["bic_selected_k"]
+        fit = sel["fits"][chosen_k]
+        if not trusted:
+            L.append(f"- 下方展示 BIC 最小 K={chosen_k} 的解**仅作诊断**(不可信,见退化标注):")
         L.extend(_fmt_fit(fit))
         interp, reason = _sample_verdict(fit)
         samples_interpretable.append(interp)
         L.append(f"\n- **本样本裁决 (推理): "
-                 f"{'存在可解释、显著有别的 regime 结构' if interp else '未见可解释/显著有别的 regime 结构'}**"
+                 f"{'存在可信、显著有别的 regime 结构' if interp else '无可信/显著有别的 regime 结构'}**"
                  f" — {reason}。")
-        if fit["exog"] and "d_real_rate_10y" in fit["exog"]:
+        if trusted and fit["exog"] and "d_real_rate_10y" in fit["exog"]:
             sp = regime_coeff_spread(fit)["d_real_rate_10y"]
             where = ("部分 regime" if sp["regime_conditional"]
                      else "所有 regime" if sp["sig_in_all"] else "无 regime")
             rd = ("是(系数量级随 regime 显著有别)" if sp["distinct"] else "否(各 regime 系数无实质差异)")
             L.append(f"- **「长端是锚」的 regime 条件版 (推理)**: Δ实利率在 **{where}** 显著"
-                     f"(显著 regime 数 {sp['n_sig']}/{fit['k_regimes']},符号翻转={sp['sign_flip']},"
+                     f"(可比 regime 数 {sp['n_compared']},显著 regime 数 {sp['n_sig']},符号翻转={sp['sign_flip']},"
                      f"量级显著有别={sp['magnitude_distinct']});regime 依赖={rd}。"
                      "→ 实利率作为驱动是否 regime 依赖,由此判定。")
+        elif not trusted and fit["exog"] and "d_real_rate_10y" in fit["exog"]:
+            L.append("- **「长端是锚」的 regime 条件版**: 拟合不可信 → **不报**实利率的 regime 落点(避免被退化 regime 机械触发)(推理)。")
 
     # ── overall verdict / kill condition ──
     L.append("\n## 核心裁决 — 离散时变锚是否成立\n")
@@ -274,14 +313,14 @@ def _build_report(df, notes, results, args) -> str:
     if not real:
         L.append("- **两样本均无法拟合/无结论 → 离散时变锚未获检验 (推理)。**")
     elif any(real):
-        L.append("- **离散时变锚获支持 (推理/事实)**: 至少一个样本出现可解释、系数显著有别的 regime 结构"
-                 "(系数跨 regime 翻转或 regime 条件显著、regime 持久)。"
+        L.append("- **离散时变锚获支持 (推理/事实)**: 至少一个样本出现**可信**(收敛、无退化 regime、"
+                 "≥2 个 non-degenerate 持久 regime)且系数显著有别的 regime 结构。"
                  "→ 「锚的配方随 regime 时变」有 MS 证据;此刻最可能的 regime 见上(年度主导时序末年)。")
         L.append("- **下一步 (推测)**: 进阶可上 MS-VECM(协整向量 regime 依赖)或 PR #5 的 TVP/Kalman "
                  "看漂移是**突跳**(支持 regime)还是**平滑**(支持 TVP)。")
     else:
-        L.append("- ⚠️ **杀死条件触发 (spec PR #4)**: 两样本均**找不到**可解释、系数显著有别的 regime 结构 "
-                 "(事实/推理) → **连离散时变锚也不成立**。")
+        L.append("- ⚠️ **杀死条件触发 (spec PR #4)**: 两样本经退化门硬化后均**无可信、显著有别的 regime 结构** "
+                 "(未收敛 / 退化 regime / 无切换;事实+推理) → **连离散时变锚也不成立**,延续 PR#1–#3 的全否。")
         L.append("- **下一步 (推测)**: 转 **TVP / Kalman 平滑漂移 (PR #5)**;若 TVP 也无结构,"
                  "则黄金「无稳定锚,只剩 regime/叙事」。")
 
@@ -318,23 +357,31 @@ def main():
             continue
         sel = res["sel"]
         print(f"  {label}: n={res['frame_n']}, BIC={ {k: round(v, 1) for k, v in sel['bic'].items()} } "
-              f"→ K={sel['selected_k']}; errors={sel['errors']}")
+              f"clean_k={sel['clean_k']} → trusted K={sel['selected_k']} "
+              f"(BIC-min K={sel['bic_selected_k']}); errors={sel['errors']}")
 
     print("[3/4] Saving smoothed regime probabilities + meta...")
     meta = {"generated": datetime.now().isoformat(timespec="seconds"),
             "start": args.start, "end": args.end, "k_values": list(K_VALUES),
             "n_restarts": N_RESTARTS, "seed": SEED, "samples": {}}
     for (label, _e, _s), res in zip(SAMPLES, results):
-        if res["skip"] or res["sel"]["selected_k"] is None:
+        sel = res.get("sel")
+        if res["skip"] or sel is None or sel["bic_selected_k"] is None:
             meta["samples"][label] = {"skip": res.get("skip") or "no K fit"}
             continue
-        fit = res["sel"]["fits"][res["sel"]["selected_k"]]
+        trusted = sel["selected_k"] is not None
+        chosen_k = sel["selected_k"] if trusted else sel["bic_selected_k"]
+        fit = sel["fits"][chosen_k]
         slug = ("debt_only" if "debt-only" in label else "debt_real_post2003")
         sp_path = os.path.join(DATA_DIR, f"gold_anchor_markov_smoothed_{slug}.csv")
         fit["smoothed_probabilities"].to_csv(sp_path)
         meta["samples"][label] = {
-            "selected_k": fit["k_regimes"], "bic": res["sel"]["bic"],
-            "n_obs": fit["n_obs"], "window": res["window"],
+            "displayed_k": fit["k_regimes"], "trusted": trusted,
+            "trusted_k": sel["selected_k"], "bic_selected_k": sel["bic_selected_k"],
+            "clean_k": sel["clean_k"], "no_switching": sel["no_switching"],
+            "converged": fit.get("converged"), "degenerate": fit.get("degenerate"),
+            "n_nondegenerate": fit.get("n_nondegenerate"),
+            "bic": sel["bic"], "n_obs": fit["n_obs"], "window": res["window"],
             "expected_durations": fit["expected_durations"],
             "transition_matrix": fit["transition_matrix"],
             "smoothed_csv": os.path.basename(sp_path),

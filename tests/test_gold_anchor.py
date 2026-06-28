@@ -13,8 +13,10 @@ import pytest
 # project root is added to sys.path by tests/conftest.py
 import lib.gold_anchor as ga
 from lib.gold_anchor import (
+    assess_markov_degeneracy,
     build_anchor_panel,
     build_ms_frame,
+    choose_markov_k,
     classify_integration,
     combined_verdict,
     estimate_vecm,
@@ -28,6 +30,7 @@ from lib.gold_anchor import (
     select_var_order,
     unit_root_tests,
 )
+from lib.gold_anchor import _ms_coeff_significant
 
 def _white_noise(n=400, seed=12345):
     idx = pd.date_range("1980-01-31", periods=n, freq="ME")
@@ -596,6 +599,13 @@ def test_fit_markov_switching_shapes_and_convergence():
     # smoothed probabilities: one row per fitted obs, k columns
     smp = fit["smoothed_probabilities"]
     assert smp.shape == (fit["n_obs"], 2)
+    # degeneracy gate fields present; clean two-regime DGP → trustworthy, no degenerate
+    assert set(["degenerate", "trustworthy", "n_nondegenerate", "var_floor"]) <= set(fit)
+    for r in fit["regimes"]:
+        assert "degenerate" in r and "degenerate_reasons" in r
+    assert fit["degenerate"] is False
+    assert fit["trustworthy"] is True
+    assert fit["n_nondegenerate"] == 2
 
 
 def test_markov_smoothed_probabilities_sum_to_one():
@@ -630,14 +640,87 @@ def test_markov_separates_two_regimes():
     assert np.bincount(blk0, minlength=2).argmax() != np.bincount(blk1, minlength=2).argmax()
 
 
-def test_select_markov_k_picks_lowest_bic():
+def test_select_markov_k_reports_bic_and_trusted():
     df, _ = _two_regime_panel(n=300)
     fr = build_ms_frame(df, ["ln_debt_gdp"])
     sel = select_markov_k(fr, k_values=(2, 3), n_restarts=2, seed=0)
     assert set(sel["bic"]) <= {2, 3}
-    assert sel["selected_k"] == min(sel["bic"], key=sel["bic"].get)
-    # true DGP has two regimes → BIC should not over-fit to 3
-    assert sel["selected_k"] == 2
+    # bic_selected_k is the pure-BIC pick (transparency)
+    assert sel["bic_selected_k"] == min(sel["bic"], key=sel["bic"].get)
+    # trusted selection is the largest K among trustworthy fits (or None)
+    trusted = [k for k, ok in sel["clean_k"].items() if ok]
+    assert sel["selected_k"] == (max(trusted) if trusted else None)
+    # K=2 fit on a clean two-regime DGP must be trustworthy
+    assert sel["clean_k"].get(2) is True
+    assert sel["fits"][2]["trustworthy"] is True
+
+
+def test_choose_markov_k_skips_degenerate():
+    # pure selection logic on hand-built fit dicts: K=3 is BIC-min but degenerate,
+    # K=2 is trustworthy → trusted selection must skip K=3 and pick K=2.
+    fits = {
+        2: {"bic": -100.0, "trustworthy": True},
+        3: {"bic": -200.0, "trustworthy": False},   # better BIC but degenerate
+    }
+    ch = choose_markov_k(fits)
+    assert ch["bic_selected_k"] == 3          # BIC alone would pick 3
+    assert ch["selected_k"] == 2              # trusted skips the degenerate 3
+    assert ch["clean_k"] == {2: True, 3: False}
+    assert ch["no_switching"] is False
+    # no trustworthy fit → selected_k None, no_switching True (≈ K=1)
+    ch2 = choose_markov_k({2: {"bic": -1.0, "trustworthy": False},
+                           3: {"bic": -2.0, "trustworthy": False}})
+    assert ch2["selected_k"] is None and ch2["no_switching"] is True
+
+
+def test_assess_markov_degeneracy_flags_collapsed_regime():
+    # one healthy regime + one collapsed regime (σ²≈0, 1-month duration, |t|~1e13)
+    fit = {
+        "k_regimes": 2, "exog": ["d_x"], "converged": True,
+        "regimes": [
+            {"regime": 0, "sigma2": 0.01, "expected_duration": 40.0,
+             "coeffs": {"const": {"coef": 0.0, "t": 1.2, "p": 0.2, "se": 0.1, "significant": False},
+                        "d_x": {"coef": 2.0, "t": 8.0, "p": 0.0, "se": 0.25, "significant": True}}},
+            {"regime": 1, "sigma2": 1e-9, "expected_duration": 1.0,
+             "coeffs": {"const": {"coef": 0.18, "t": float("nan"), "p": float("nan"), "se": 0.0, "significant": False},
+                        "d_x": {"coef": -28.0, "t": 1e13, "p": 0.0, "se": 1e-13, "significant": True}}},
+        ],
+    }
+    assess_markov_degeneracy(fit, lhs_var=0.02)
+    assert fit["regimes"][0]["degenerate"] is False
+    assert fit["regimes"][1]["degenerate"] is True
+    assert fit["n_nondegenerate"] == 1
+    assert fit["degenerate"] is True
+    # only 1 non-degenerate regime → not a credible *switching* structure
+    assert fit["trustworthy"] is False
+    # spread comparison excludes the degenerate regime → nothing to compare
+    sp = regime_coeff_spread(fit)["d_x"]
+    assert sp["n_compared"] == 1
+    assert sp["distinct"] is False
+
+
+def test_ms_coeff_significant_rejects_unidentified_t():
+    # p<alpha but |t|>1e6 (SE≈0) → NOT significant; nan t → NOT significant
+    assert _ms_coeff_significant(0.0, 2.5, 0.05) is True
+    assert _ms_coeff_significant(0.0, 1e13, 0.05) is False
+    assert _ms_coeff_significant(0.0, float("nan"), 0.05) is False
+    assert _ms_coeff_significant(0.20, 2.5, 0.05) is False   # p too high
+
+
+def test_unconverged_fit_not_trustworthy():
+    # a converged=False fit with otherwise-fine regimes is still not trustworthy
+    fit = {
+        "k_regimes": 2, "exog": ["d_x"], "converged": False,
+        "regimes": [
+            {"regime": 0, "sigma2": 0.01, "expected_duration": 30.0,
+             "coeffs": {"d_x": {"coef": 1.0, "t": 5.0, "p": 0.0, "se": 0.2, "significant": True}}},
+            {"regime": 1, "sigma2": 0.02, "expected_duration": 25.0,
+             "coeffs": {"d_x": {"coef": -1.0, "t": -5.0, "p": 0.0, "se": 0.2, "significant": True}}},
+        ],
+    }
+    assess_markov_degeneracy(fit, lhs_var=0.02)
+    assert fit["degenerate"] is False        # regimes themselves are fine
+    assert fit["trustworthy"] is False       # but MLE did not converge
 
 
 def test_regime_coeff_spread_distinctness():

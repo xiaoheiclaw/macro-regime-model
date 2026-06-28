@@ -810,7 +810,53 @@ def estimate_vecm(
 # dependent coefficients AND residual variance (switching_variance=True). The
 # question "is the long end an anchor" becomes regime-conditional: in which
 # regimes is the real-rate coefficient significant?
+#
+# HARDENING (PR #4 round 2): real-data MS fits routinely return DEGENERATE
+# solutions — a regime collapses onto a single outlier (σ²→0, expected duration
+# ~1 month, coefficient |t|~1e13 from a standard error ≈0). statsmodels reports
+# p=0.000 for those, which naively reads as "significant" when it is the opposite
+# (the parameter is numerically NOT identified). We therefore (a) require a finite
+# t below `_MS_T_IDENT_MAX` for a coefficient to count as significant, and
+# (b) flag whole regimes as degenerate (σ² below a data-scaled floor, too-short
+# expected duration, or any non-identified |t|), excluding them from the verdict.
 _MS_DIFF_PREFIX = "d_"
+# |t| above this means SE≈0 → the parameter is numerically unidentified, NOT
+# significant (real regression t-stats are ~O(1..100); 1e6+ is pure degeneracy).
+_MS_T_IDENT_MAX = 1e6
+# residual-variance floor as a fraction of the LHS (Δln gold) sample variance:
+# a regime with σ² below this has collapsed onto a near-deterministic sliver.
+_MS_VAR_FLOOR_RATIO = 1e-3
+# a real regime should persist; an expected duration shorter than this (months)
+# is an outlier-absorbing artifact, not a macro regime.
+_MS_MIN_DURATION = 3.0
+
+
+def _ms_coeff_significant(p: float, t: float, alpha: float,
+                          t_ident_max: float = _MS_T_IDENT_MAX) -> bool:
+    """A coefficient counts as significant only if its two-sided p is below
+    ``alpha`` AND its t-stat is finite and below the identification ceiling. A
+    |t|~1e13 with p=0.000 is a standard-error-≈0 numerical artifact (the
+    parameter is NOT identified), the opposite of real significance."""
+    return bool(np.isfinite(p) and p < alpha
+                and np.isfinite(t) and abs(t) < t_ident_max)
+
+
+def choose_markov_k(fits: Dict[int, Dict[str, object]]) -> Dict[str, object]:
+    """Choose K from already-fitted MS models. Returns the lowest-BIC K (for
+    transparency) AND the **largest trustworthy K** (converged, no degenerate
+    regime, ≥2 non-degenerate regimes — see :func:`assess_markov_degeneracy`).
+    If no fit is trustworthy, ``selected_k`` is None and ``no_switching`` True —
+    the honest "no credible regime switching survives" (effectively K=1)."""
+    bic = {k: f["bic"] for k, f in fits.items()}
+    clean_k = {k: bool(f.get("trustworthy")) for k, f in fits.items()}
+    trusted = [k for k, ok in clean_k.items() if ok]
+    return {
+        "bic": bic,
+        "clean_k": clean_k,
+        "selected_k": (max(trusted) if trusted else None),
+        "bic_selected_k": (min(bic, key=bic.get) if bic else None),
+        "no_switching": not trusted,
+    }
 
 
 def build_ms_frame(df: pd.DataFrame, exog_level_cols,
@@ -882,9 +928,13 @@ def _summarize_markov(res, mod, exog_names, lhs, k_regimes, alpha, index) -> Dic
             regimes[reg]["sigma2"] = float(c)
             continue
         disp = "const" if base == "const" else exog_map.get(base, base)
+        # a coefficient is significant only if its t is finite AND below the
+        # identification ceiling: a |t|~1e13 (SE≈0) is degeneracy, not evidence.
+        sig = _ms_coeff_significant(p, t, alpha)
         regimes[reg]["coeffs"][disp] = {
             "coef": float(c), "t": float(t), "p": float(p), "se": float(se),
-            "significant": bool(p < alpha),
+            "significant": sig,
+            "identified": bool(np.isfinite(t) and abs(t) < _MS_T_IDENT_MAX),
         }
 
     # transition matrix: statsmodels regime_transition[i, j] = P(s_t=i | s_{t-1}=j)
@@ -920,10 +970,56 @@ def _summarize_markov(res, mod, exog_names, lhs, k_regimes, alpha, index) -> Dic
     }
 
 
+def assess_markov_degeneracy(fit: Dict[str, object], lhs_var: float,
+                             var_floor_ratio: float = _MS_VAR_FLOOR_RATIO,
+                             min_duration: float = _MS_MIN_DURATION,
+                             t_ident_max: float = _MS_T_IDENT_MAX) -> Dict[str, object]:
+    """Tag each regime degenerate / non-degenerate and roll the result up to the
+    whole fit — the gate that stops a collapsed MS solution from being read as a
+    real regime structure.
+
+    A regime is DEGENERATE if ANY of:
+      * its residual variance σ² is below ``var_floor_ratio × Var(Δln gold)``
+        (collapsed onto a near-deterministic sliver), or non-finite;
+      * its expected duration is < ``min_duration`` months (an outlier-absorbing
+        1-month state, not a macro regime);
+      * any of its coefficients is non-identified — non-finite t or |t| above
+        ``t_ident_max`` (SE≈0, the |t|~1e13 pathology).
+
+    The fit is ``trustworthy`` only if it converged AND has no degenerate regime
+    AND ≥2 non-degenerate regimes survive (otherwise there is no credible
+    *switching* structure). Mutates and returns ``fit``.
+    """
+    var_floor = float(var_floor_ratio) * float(lhs_var) if np.isfinite(lhs_var) else 0.0
+    for r in fit["regimes"]:
+        reasons = []
+        s2 = r.get("sigma2")
+        if s2 is None or not np.isfinite(s2) or s2 < var_floor:
+            reasons.append(f"σ²<floor({var_floor:.2e})")
+        if not np.isfinite(r.get("expected_duration", np.nan)) or r["expected_duration"] < min_duration:
+            reasons.append(f"dur<{min_duration:g}m")
+        for nm, c in r["coeffs"].items():
+            t = c.get("t")
+            if t is None or not np.isfinite(t) or abs(t) > t_ident_max:
+                reasons.append(f"{nm}:|t|>{t_ident_max:g}/nan")
+        r["degenerate"] = bool(reasons)
+        r["degenerate_reasons"] = reasons
+    n_nondeg = int(sum(not r["degenerate"] for r in fit["regimes"]))
+    fit["var_floor"] = var_floor
+    fit["min_duration"] = float(min_duration)
+    fit["t_ident_max"] = float(t_ident_max)
+    fit["n_nondegenerate"] = n_nondeg
+    fit["degenerate"] = bool(any(r["degenerate"] for r in fit["regimes"]))
+    # trustworthy = converged + no degenerate regime + a genuine ≥2-regime switch
+    fit["trustworthy"] = bool(fit.get("converged") and not fit["degenerate"] and n_nondeg >= 2)
+    return fit
+
+
 def fit_markov_switching(frame: pd.DataFrame, exog_names=None, lhs: Optional[str] = None,
                          k_regimes: int = 2, switching_variance: bool = True,
-                         n_restarts: int = 20, seed: int = 0,
-                         alpha: float = 0.05) -> Dict[str, object]:
+                         n_restarts: int = 50, seed: int = 0,
+                         alpha: float = 0.05, em_iter: int = 50,
+                         maxiter: int = 500) -> Dict[str, object]:
     """Fit a Markov-switching regression of Δln(gold) on the diffed drivers with
     regime-dependent coefficients (and variance, by default).
 
@@ -932,7 +1028,11 @@ def fit_markov_switching(frame: pd.DataFrame, exog_names=None, lhs: Optional[str
     fit is sensitive to starting values / local optima, so we take the best of
     the default EM start plus ``n_restarts`` random restarts (statsmodels
     ``search_reps`` — driven by the global numpy RNG, which we seed and restore
-    for reproducibility). Returns the :func:`_summarize_markov` dict.
+    for reproducibility), with raised ``em_iter`` / ``maxiter`` for a real shot
+    at convergence. The returned :func:`_summarize_markov` dict is then passed
+    through :func:`assess_markov_degeneracy` so degenerate/unconverged solutions
+    are flagged (``trustworthy`` / per-regime ``degenerate``) rather than read as
+    real regimes.
     """
     from statsmodels.tsa.regime_switching.markov_regression import MarkovRegression
 
@@ -967,10 +1067,10 @@ def fit_markov_switching(frame: pd.DataFrame, exog_names=None, lhs: Optional[str
     state = np.random.get_state()
     try:
         np.random.seed(seed)
-        res = mod.fit()
+        res = mod.fit(em_iter=em_iter, maxiter=maxiter)
         if n_restarts and n_restarts > 0:
             try:
-                cand = mod.fit(search_reps=int(n_restarts))
+                cand = mod.fit(search_reps=int(n_restarts), em_iter=em_iter, maxiter=maxiter)
                 if np.isfinite(cand.llf) and cand.llf > res.llf:
                     res = cand
             except (np.linalg.LinAlgError, RuntimeError, ValueError):
@@ -981,17 +1081,29 @@ def fit_markov_switching(frame: pd.DataFrame, exog_names=None, lhs: Optional[str
     out = _summarize_markov(res, mod, exog_names, lhs, k_regimes, alpha, frame.index)
     out["switching_variance"] = bool(switching_variance)
     out["n_restarts"] = int(n_restarts)
+    # degeneracy / trustworthiness gate (σ² floor scaled by the LHS variance)
+    assess_markov_degeneracy(out, lhs_var=float(np.var(endog, ddof=1)))
     return out
 
 
 def select_markov_k(frame: pd.DataFrame, exog_names=None, lhs: Optional[str] = None,
                     k_values=(2, 3), switching_variance: bool = True,
-                    n_restarts: int = 20, seed: int = 0,
+                    n_restarts: int = 50, seed: int = 0,
                     alpha: float = 0.05) -> Dict[str, object]:
-    """Fit the Markov-switching regression at each K in ``k_values`` and pick the
-    one with the lowest BIC. Returns {fits, bic, selected_k, errors}. A K that
-    fails to fit (singular / non-convergence) is recorded in ``errors`` and
-    excluded from selection rather than crashing the whole comparison."""
+    """Fit the Markov-switching regression at each K in ``k_values`` and choose K.
+
+    Two selections are returned, on purpose:
+      * ``bic_selected_k`` — the lowest-BIC K (for transparency; BIC happily
+        over-fits to a K that only "wins" via a degenerate outlier-absorbing
+        regime, so this is reported but NOT trusted);
+      * ``selected_k`` — the **largest K whose fit is trustworthy** (converged,
+        no degenerate regime, ≥2 non-degenerate regimes). If no fitted K is
+        trustworthy, ``selected_k`` is None and ``no_switching`` is True — the
+        honest "no credible regime switching survives" outcome (effectively K=1).
+
+    ``clean_k`` maps each fitted K → trustworthy?. A K that fails to fit is
+    recorded in ``errors`` and excluded rather than crashing the comparison.
+    """
     fits: Dict[int, object] = {}
     errors: Dict[int, str] = {}
     for k in k_values:
@@ -1002,55 +1114,74 @@ def select_markov_k(frame: pd.DataFrame, exog_names=None, lhs: Optional[str] = N
                 seed=seed, alpha=alpha)
         except (ValueError, np.linalg.LinAlgError, RuntimeError) as e:
             errors[k] = f"{type(e).__name__}: {str(e)[:80]}"
-    bic = {k: f["bic"] for k, f in fits.items()}
-    selected_k = min(bic, key=bic.get) if bic else None
-    return {"fits": fits, "bic": bic, "selected_k": selected_k, "errors": errors}
+    chosen = choose_markov_k(fits)
+    return {"fits": fits, "errors": errors, **chosen}
 
 
-def regime_coeff_spread(fit: Dict[str, object], alpha: float = 0.05) -> Dict[str, Dict[str, object]]:
+def regime_coeff_spread(fit: Dict[str, object], alpha: float = 0.05,
+                        nondegenerate_only: bool = True) -> Dict[str, Dict[str, object]]:
     """Summarize, per driver, whether the regimes are economically DISTINCT —
     the input to PR #4's kill condition. For each coefficient (const + each
     exog) across regimes: the coef list, the spread (max−min), whether the sign
     flips across regimes, and how many regimes it is significant in. A driver
-    that is significant in some regimes but not others (or flips sign) is the
-    'regime-conditional anchor' signature; no such driver → discrete anchor
-    fails too."""
+    that is significant in some regimes but not others (or flips sign, or has a
+    beyond-noise magnitude gap) is the 'regime-conditional anchor' signature.
+
+    By default ``nondegenerate_only`` restricts the comparison to non-degenerate
+    regimes (see :func:`assess_markov_degeneracy`): a 1-month, σ²≈0,
+    |t|~1e13 outlier-absorbing regime must NOT manufacture a "regime-conditional"
+    verdict. ``n_compared`` reports how many regimes survived the filter — with
+    fewer than 2, there is nothing to compare and ``distinct`` is False."""
     out: Dict[str, Dict[str, object]] = {}
     names = ["const"] + list(fit.get("exog", []))
     regimes = fit.get("regimes", [])
+    if nondegenerate_only:
+        # if degeneracy was assessed, drop degenerate regimes; if not assessed
+        # (no "degenerate" key), keep all (back-compat for hand-built fits).
+        regimes = [r for r in regimes if not r.get("degenerate", False)]
+    n_compared = len(regimes)
     for nm in names:
         cells = [r["coeffs"].get(nm) for r in regimes]
         cells = [c for c in cells if c is not None]
         coefs = [c["coef"] for c in cells]
         ses = [c.get("se", float("nan")) for c in cells]
         sigs = [bool(c["significant"]) for c in cells]
-        signs = {1 if c > 0 else -1 if c < 0 else 0 for c in coefs}
         spread = (max(coefs) - min(coefs)) if coefs else None
-        # magnitude-distinct: the across-regime coefficient range exceeds ~2× the
-        # largest standard error → the regimes' coefficients are separated beyond
-        # noise even when the SIGN does not flip (e.g. a debt coef of 3.0 in one
-        # regime vs 0.2 in another — same sign, but a different anchor recipe).
-        max_se = max((s for s in ses if np.isfinite(s)), default=float("nan"))
+        # All distinctness must involve SIGNIFICANT regimes — a sign flip or
+        # magnitude gap between two INSIGNIFICANT coefficients is noise, not a
+        # regime-conditional anchor (gate C: compare only significant regimes).
+        sig_coefs = [c["coef"] for c in cells if c["significant"]]
+        sig_ses = [c.get("se", float("nan")) for c in cells if c["significant"]]
+        sig_signs = {1 if c > 0 else -1 if c < 0 else 0 for c in sig_coefs}
+        # sign flip: ≥2 significant regimes with opposite signs
+        sign_flip = (len(sig_coefs) >= 2) and (1 in sig_signs) and (-1 in sig_signs)
+        # magnitude gap among significant regimes beyond ~2× their largest SE
+        max_sig_se = max((s for s in sig_ses if np.isfinite(s)), default=float("nan"))
+        sig_spread = (max(sig_coefs) - min(sig_coefs)) if sig_coefs else None
         magnitude_distinct = bool(
-            spread is not None and np.isfinite(max_se) and max_se > 0
-            and spread > 2.0 * max_se
+            len(sig_coefs) >= 2 and sig_spread is not None
+            and np.isfinite(max_sig_se) and max_sig_se > 0
+            and sig_spread > 2.0 * max_sig_se
         )
+        # regime-conditional: significant in some but not all non-degenerate regimes
+        regime_conditional = (n_compared >= 2) and any(sigs) and not all(sigs)
+        # need ≥2 (non-degenerate) regimes to talk about a difference at all
+        can_compare = n_compared >= 2
         out[nm] = {
             "coefs": coefs,
             "ses": ses,
             "spread": spread,
-            "sign_flip": (1 in signs) and (-1 in signs),
-            "magnitude_distinct": magnitude_distinct,
+            "n_compared": n_compared,
+            "sign_flip": bool(can_compare and sign_flip),
+            "magnitude_distinct": bool(can_compare and magnitude_distinct),
             "n_sig": int(sum(sigs)),
             "sig_in_any": any(sigs),
             "sig_in_all": all(sigs) if sigs else False,
-            "regime_conditional": any(sigs) and not all(sigs),
-            # the driver genuinely differs across regimes: sign flip, only-some-
-            # regimes significant, OR a beyond-noise magnitude gap.
+            "regime_conditional": bool(regime_conditional),
+            # the driver genuinely differs across SIGNIFICANT regimes: opposite
+            # signs, significant-in-some-not-all, OR a beyond-noise magnitude gap.
             "distinct": bool(
-                ((1 in signs) and (-1 in signs))
-                or (any(sigs) and not all(sigs))
-                or magnitude_distinct
+                can_compare and (sign_flip or regime_conditional or magnitude_distinct)
             ),
         }
     return out
