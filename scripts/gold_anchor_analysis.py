@@ -549,7 +549,7 @@ def main():
               f"coint_rank={point['coint_rank']} valid={point['valid_coint']} β={beta_s}; "
               f"robust ranks across lag×det={ranks}")
 
-    print("[4/4] Trivariate anchor (Johansen + VECM) & real-rate I(d) segments...")
+    print("[4/5] Trivariate anchor (Johansen + VECM) & real-rate I(d) segments...")
     rr_segs = _run_real_rate_segments(df, panel.notes)
     for name, seg in rr_segs.items():
         if name != "_cutoff":

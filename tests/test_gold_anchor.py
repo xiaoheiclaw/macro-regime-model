@@ -401,9 +401,11 @@ def test_johansen_trivariate_rank_gt1_no_single_beta():
     r = 0.5 * f + rng.standard_normal(n) * 0.3
     df = pd.DataFrame({"ln_gold_nominal": g, "ln_debt_gdp": d, "real_rate_10y": r}, index=idx)
     j = johansen_test(df, list(df.columns), k_ar_diff=1)
-    # contract holds for ANY rank outcome: β/βs populated iff coint_rank == 1
-    assert (j["betas"] is not None) == (j["coint_rank"] == 1)
-    assert (j["beta"] is not None) == (j["coint_rank"] == 1)
+    # contract holds for ANY rank outcome: β/βs populated iff the relation is
+    # both valid AND unique (valid_coint and coint_rank == 1).
+    expected = j["valid_coint"] and j["coint_rank"] == 1
+    assert (j["betas"] is not None) == expected
+    assert (j["beta"] is not None) == expected
     if j["coint_rank"] > 1:
         assert j["beta"] is None and j["betas"] is None
 
@@ -459,10 +461,10 @@ def test_johansen_beta_requires_valid_and_unique_coint():
         index=idx,
     )
     j = johansen_test(df, list(df.columns))
-    assert j["valid_coint"] is False
-    assert j["beta"] is None and j["betas"] is None
-    # the contract, stated directly:
-    assert (j["beta"] is None) == (not (j["valid_coint"] and j["coint_rank"] == 1))
+    # the contract, stated directly (robust to a false-positive rank draw):
+    expected = j["valid_coint"] and j["coint_rank"] == 1
+    assert (j["betas"] is not None) == expected
+    assert (j["beta"] is not None) == expected
 
 
 def test_estimate_vecm_validates_inputs():

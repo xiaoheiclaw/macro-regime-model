@@ -583,9 +583,9 @@ def johansen_test(
     # rate] `betas` carries (β_debt, β_real). β/βs are interpretable ONLY when
     # coint_rank == 1: with rank>1 the single eigenvector is not unique, so the
     # first column is an arbitrary basis vector — report None, not a misleading β.
-    # interpretable only when there is a VALID, UNIQUE cointegrating relation:
-    # valid_coint (rules out full-rank-stationary) AND rank exactly 1 (rank>1 →
-    # the first eigenvector is a non-unique basis vector). Both are required.
+    # β interpretable only for a VALID (valid_coint rules out full-rank-stationary)
+    # and UNIQUE (coint_rank == 1; rank>1 → first eigenvector is a non-unique
+    # basis vector) cointegrating relation.
     interpretable = valid_coint and (coint_rank == 1) and (n >= 2)
     beta = float(-norm[1]) if interpretable else None
     betas = [float(-norm[i]) for i in range(1, n)] if interpretable else None
