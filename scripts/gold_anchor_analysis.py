@@ -24,6 +24,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from lib.gold_anchor import (
     build_anchor_panel,
     combined_verdict,
+    estimate_vecm,
+    integration_segments,
     integration_table,
     johansen_robustness,
     johansen_test,
@@ -40,6 +42,12 @@ ANCHORS = [
     ("fed_gdp", "ln_fed_gdp", "Fed assets/GDP (对照)"),
     ("m2_gdp", "ln_m2_gdp", "M2/GDP (对照)"),
 ]
+
+# PR #2: the trivariate anchor — joint long-run equilibrium surface
+# [ln gold, ln(debt/GDP), 10y real rate]. β1 lifts the anchor (debasement),
+# β2 presses it down (opportunity cost). β2 significant ⇒ the long end IS part
+# of the anchor; short-run Δreal_rate significant ⇒ it drives the deviation.
+TRIVARIATE_COLS = ["ln_gold_nominal", "ln_debt_gdp", "real_rate_10y"]
 
 
 def should_run_johansen(gold_verdict: str, anchor_verdict: str) -> bool:
@@ -88,21 +96,170 @@ def _robust_summary(entry: dict) -> str:
     return f"coint_rank ∈ {ranks} **随设定变化(不稳定)**{beta_s}"
 
 
-def _build_report(df, notes, itab, jres, args) -> str:
+def _run_real_rate_segments(df, notes) -> dict:
+    """Step 1 (PR #2): the long-end real rate's I(d) read on TWO regimes — the
+    full spliced series (GS10−CPI proxy + DFII10) vs the clean post-TIPS DFII10
+    subsample. PR #1 judged the (full) real rate I(0) and dropped it from the
+    cointegrating vector; the split makes that auditable per segment."""
+    cutoff = notes.get("real_rate_tips_start", "n/a")
+    segs = {"full (spliced)": (None, None)}
+    if cutoff and cutoff != "n/a":
+        segs[f"clean TIPS (≥{cutoff})"] = (cutoff, None)
+    out = integration_segments(df["real_rate_10y"], segs)
+    out["_cutoff"] = cutoff
+    return out
+
+
+def _run_trivariate(df) -> dict:
+    """Step 1–2 (PR #2): three-variable Johansen on the joint anchor surface,
+    plus VECM if the cointegration rank is robustly ≥1."""
+    cols = TRIVARIATE_COLS
+    sub = df[cols].dropna()
+    entry = {"cols": cols, "pairwise_n": int(len(sub)), "id_check": {},
+             "skip": None, "lag": None, "point": None, "robust": None,
+             "rank_set": None, "vecm": None, "vecm_note": None}
+
+    # I(1) pre-check on the SAME complete-case subsample, c+ct (Johansen wants
+    # I(1) inputs; a clearly-I(0) leg is reported, not silently dropped).
+    for c in cols:
+        entry["id_check"][c] = combined_verdict(sub[c])
+    if len(sub) < 40:
+        entry["skip"] = f"too few complete rows ({len(sub)})"
+        return entry
+
+    lag = select_var_order(df, cols, max_lags=4)
+    entry["lag"] = lag
+    entry["point"] = johansen_test(df, cols, det_order=0, k_ar_diff=lag["k_ar_diff"])
+    robust = johansen_robustness(df, cols, lags=ROBUST_LAGS, det_orders=ROBUST_DET_ORDERS)
+    entry["robust"] = robust
+    ranks = sorted(set(robust["coint_rank"].dropna().astype(int)))
+    entry["rank_set"] = ranks
+
+    # robust cointegration ⇒ estimate the VECM (long-run β1/β2 + short-run ECM).
+    # rank robustly ≥1 = every valid grid cell has rank≥1.
+    valid_ranks = robust["coint_rank"].dropna().astype(int)
+    robust_coint = len(valid_ranks) > 0 and (valid_ranks >= 1).all()
+    if robust_coint:
+        k = max(1, lag["k_ar_diff"])
+        if k != lag["k_ar_diff"]:
+            entry["vecm_note"] = (f"AIC lag→k_ar_diff={lag['k_ar_diff']} (VAR(1)); "
+                                  f"bumped to k_ar_diff={k} so a short-run Δ block exists.")
+        try:
+            entry["vecm"] = estimate_vecm(df, cols, k_ar_diff=k, coint_rank=1, det_order=0)
+        except ValueError as e:
+            entry["vecm_note"] = f"VECM estimation failed: {e}"
+    return entry
+
+
+def _fmt_trivariate(tri) -> list:
     L = []
-    L.append("# 黄金「锚 + 偏离」— 第 0–1 步:单整 + 协整生死门\n")
+    L.append("\n## 2. 三变量锚 — Johansen [ln金价, ln(债务/GDP), 10y实利率]\n")
+    L.append("锚升级为**联合长期均衡面** `ln金价* = α + β₁·ln(债务/GDP) + β₂·实利率`:"
+             "债务上抬(贬值)、实利率下压(机会成本),两者共同定均衡。"
+             "「长端是不是锚」= β₂ 是否在**长期向量**里显著(对 spec §修订)。\n")
+    L.append(f"- 完整 case 子样本 n={tri['pairwise_n']};同子样本 c+ct 单整预检 (推理):")
+    for c, cv in tri["id_check"].items():
+        L.append(f"    - `{c}`: **{cv['combined']}** (c={cv['c']}, ct={cv['ct']})")
+    if tri["skip"]:
+        L.append(f"- **skipped: {tri['skip']}**")
+        return L
+    lag = tri["lag"]
+    L.append(f"- VAR select_order(AIC) p={lag['var_order']} → k_ar_diff={lag['k_ar_diff']} (事实)")
+    L.append("\n点估计 (选定 lag, det_order=0):")
+    L.append(_fmt_johansen(tri["point"]))
+    pt = tri["point"]
+    if pt["betas"] is not None:
+        L.append(f"- 长期向量系数: **β₁(债务)={pt['betas'][0]:.3f}, "
+                 f"β₂(实利率)={pt['betas'][1]:.3f}** (事实)")
+    L.append("\n稳健性网格 (coint_rank / valid_coint / β₁,β₂=betas):")
+    L.append("```")
+    L.append(tri["robust"].to_string(index=False))
+    L.append("```")
+    ranks = tri["rank_set"] or []
+    if ranks == [1]:
+        rank_verdict = f"coint_rank=1 在 lag∈{list(ROBUST_LAGS)}×det∈{list(ROBUST_DET_ORDERS)} 全设定下**稳定**"
+    elif ranks == [0]:
+        rank_verdict = "coint_rank=0 在所有设定下稳定 → **无协整**"
+    else:
+        rank_verdict = f"coint_rank ∈ {ranks} **随设定变化(不稳定)**"
+    L.append(f"- **稳健性 (推理): {rank_verdict}**")
+    return L
+
+
+def _fmt_vecm(tri) -> list:
+    L = []
+    L.append("\n## 3. VECM — 实利率在锚里、在偏离里、还是两者皆有?\n")
+    if tri.get("skip") or tri["rank_set"] is None:
+        L.append("- 三变量 Johansen 未运行,VECM 跳过 (推理)。")
+        return L
+    if tri["vecm"] is None:
+        if (tri["rank_set"] or []) == [1] or (tri["rank_set"] and min(tri["rank_set"]) >= 1):
+            note = tri.get("vecm_note") or "未估计"
+            L.append(f"- 稳健协整但 VECM 未产出: {note} (推理)。")
+        else:
+            L.append(f"- **协整非稳健 (coint_rank∈{tri['rank_set']}) → 不估 VECM** "
+                     "(无稳健长期向量可拆) (推理)。")
+        return L
+    v = tri["vecm"]
+    if tri.get("vecm_note"):
+        L.append(f"> {tri['vecm_note']}\n")
+    L.append(f"- 设定: coint_rank={v['coint_rank']}, k_ar_diff={v['k_ar_diff']}, "
+             f"deterministic={v['deterministic']}, n_obs={v['n_obs']} (事实)\n")
+    L.append("**长期协整向量 (gold 归一化, 系数移到 RHS):**")
+    for var, b in v["betas"].items():
+        sig = "显著" if b["significant"] else "不显著"
+        L.append(f"- {var}: β={b['beta']:.4f} (t={b['t']:.2f}, p={b['p']:.3f}, **{sig}**) (事实)")
+    ec = v["ec_speed"]
+    ec_sig = "显著" if ec["significant"] else "不显著"
+    hl = ""
+    if ec["lambda"] < 0 and ec["significant"]:
+        import math
+        hl = f"; 半衰期≈{math.log(0.5)/math.log(1+ec['lambda']):.1f} 月" if -1 < ec["lambda"] < 0 else ""
+    L.append(f"\n**误差修正速度 λ (金价方程): {ec['lambda']:.4f}** "
+             f"(t={ec['t']:.2f}, p={ec['p']:.3f}, {ec_sig}; λ<0 且显著={ec['corrects']}{hl}) (事实)")
+    L.append("\n**短期 Δ 系数 (金价方程):**")
+    L.append("```")
+    L.append(f"{'var':<16}{'lag':>4}{'coef':>10}{'t':>8}{'p':>8}  sig")
+    for t in v["short_run"]:
+        L.append(f"{t['var']:<16}{t['lag']:>4}{t['coef']:>10.4f}{t['t']:>8.2f}"
+                 f"{t['p']:>8.3f}  {'*' if t['significant'] else ''}")
+    L.append("```")
+
+    # the verdict the spec asks for
+    b2 = v["betas"].get("real_rate_10y", {})
+    long_sig = bool(b2.get("significant"))
+    rr_short = [t for t in v["short_run"] if t["var"] == "real_rate_10y"]
+    short_sig = any(t["significant"] for t in rr_short)
+    if long_sig and short_sig:
+        verdict = "**两者皆有**: 实利率既在长期锚 (β₂ 显著) 又驱动短期偏离"
+    elif long_sig:
+        verdict = "**在锚里**: 实利率长期 β₂ 显著、短期 Δ 不显著 → 长端是锚的一部分"
+    elif short_sig:
+        verdict = "**在偏离里**: 长期 β₂ 不显著、短期 Δ实利率显著 → 实利率驱动金价对锚的偏离(印证 Baur 漏了 ECT)"
+    else:
+        verdict = "**两者皆不显著**: 实利率长期与短期都不显著 → '长端是锚' 在此线性设定下未获支持"
+    L.append(f"\n- **裁决 (推理): {verdict}。** "
+             f"(λ {'修正成立' if ec['corrects'] else '不显著/非负→无回归力,存疑'})")
+    return L
+
+
+def _build_report(df, notes, itab, jres, args, rr_segs=None, tri=None) -> str:
+    L = []
+    L.append("# 黄金「锚 + 偏离」— 单整 + 协整 + 三变量 VECM\n")
     L.append(f"> 生成时间区间: {df.index.min().date()} .. {df.index.max().date()} "
-             f"({len(df)} 个月)。对应 `docs/gold-anchor-vecm-spec.md` 第 0–1 步。\n")
-    L.append("> 本报告只做单整检验与协整秩判决,**不含 VECM / 2022 分解**(留作下一 PR)。\n")
+             f"({len(df)} 个月)。对应 `docs/gold-anchor-vecm-spec.md` 第 0–2 步。\n")
+    L.append("> PR #1: 单整检验 + 双变量协整生死门。PR #2: 长端实利率两段 I(d) 复核 + "
+             "**三变量 Johansen [金价,债务/GDP,实利率]** + (若稳健协整) **VECM** 拆长期锚/短期偏离。"
+             "**2022 分解 / Gregory-Hansen 断点**留作 PR #3。\n")
 
     L.append("\n## 0. 数据与口径\n")
     for k, v in notes.items():
         L.append(f"- **{k}**: {v}")
 
-    L.append("\n## ⚠️ Limitations(本 PR 已知假设,留待 VECM PR 处理)\n")
+    L.append("\n## ⚠️ Limitations(本 PR 已知假设,留待 PR #3 处理)\n")
     L.append("- **季度 GDP/debt → 月末 ffill 含前视偏差** (事实):季度值被前填到季度内各月末,"
              "**这不是实时(发布日)历史协整**——某月用到的 GDP/debt 在当时可能尚未发布。本 PR 为全样本"
-             "结构检验,可接受;**发布日对齐 + 对该假设的敏感性**留待 VECM PR (推测)。")
+             "结构检验,可接受;**发布日对齐 + 对该假设的敏感性**留待 PR #3 (推测)。")
     L.append("- 实利率 1997 前(实为 DFII10 起点 2003 前)为 GS10−CPI 拼接代理,见 §0 注记 (事实)。")
 
     L.append("\n## 1a. 单整阶数 (ADF + PP + KPSS, regression ∈ {c, ct})\n")
@@ -116,10 +273,26 @@ def _build_report(df, notes, itab, jres, args) -> str:
     for s, row in itab.iterrows():
         L.append(f"- `{s}`: **{row['verdict']}** (c={row['verdict_c']}, ct={row['verdict_ct']}) (推理)")
     rr = itab.loc["real_rate_10y", "verdict"] if "real_rate_10y" in itab.index else "n/a"
-    L.append(f"\n- 实利率 `real_rate_10y` 合并判定 **{rr}** (推理)。若 I(0)→只能进短期 ECM(下一 PR),"
+    L.append(f"\n- 实利率 `real_rate_10y` 合并判定 **{rr}** (推理)。若 I(0)→只能进短期 ECM,"
              "符合「实利率是偏离驱动、不是锚」的直觉 (推测);若 I(1)→可进长期向量,需另行解释 (spec §1)。")
 
-    L.append("\n## 1b. 协整 (Johansen) — pairwise 子样本 + lag/det_order 稳健性\n")
+    if rr_segs:
+        cutoff = rr_segs.get("_cutoff", "n/a")
+        L.append("\n### 1a-bis. 长端实利率的两段 I(d) 复核 (PR #2 重点)\n")
+        L.append("PR #1 把(全样本拼接)实利率判 I(0) 是它被踢出长期协整向量的**直接原因**;"
+                 "因拼接断点(代理↔TIPS)可能污染单一判定,这里分两段各报 c+ct (推理):\n")
+        L.append(f"- 注:干净 TIPS 子样本实为 **DFII10 起点 {cutoff}**(10y 不变期限 TIPS 自 2003 起),"
+                 "而非 spec 假设的 1997——如实标注 (事实)。\n")
+        for name, seg in rr_segs.items():
+            if name == "_cutoff":
+                continue
+            L.append(f"- **{name}** (n={seg['n']}, {seg['start']}..{seg['end']}): "
+                     f"合并 **{seg['combined']}** (c={seg['c']}, ct={seg['ct']}) (推理)")
+        L.append("\n- 判读 (推理): 若全样本与干净 TIPS 段都非 I(1) → 实利率作为**长期锚的一条腿**"
+                 "证据弱,三变量协整大概率仍由 [金价,债务] 主导;若任一段 I(1) → 它有资格进长期向量,"
+                 "由下面三变量 Johansen 与 VECM β₂ 给出最终裁决。")
+
+    L.append("\n## 1b. 双变量协整 (Johansen) — PR #1 基线: [金价, 单锚] pairwise + 稳健性\n")
     L.append("系统 = [ln(名义金价), ln(锚/GDP)]。**前置 I(1) 检验在 Johansen 实际使用的同一 "
              "pairwise complete-case 子样本上、用 c+ct 双设定重跑**(不用整列判定)。lag 由 VAR "
              "select_order(AIC) 在该子样本上选,k_ar_diff = p−1;并报告 rank 对 lag∈{1..4}×"
@@ -142,6 +315,11 @@ def _build_report(df, notes, itab, jres, args) -> str:
         L.append(e["robust"].to_string(index=False))
         L.append("```")
         L.append(f"- **稳健性 (推理): {_robust_summary(e)}**")
+
+    # PR #2: trivariate anchor + VECM
+    if tri is not None:
+        L.extend(_fmt_trivariate(tri))
+        L.extend(_fmt_vecm(tri))
 
     L.append("\n## 核心结论(稳健性视角)\n")
     main = jres.get("debt_gdp")
@@ -173,8 +351,39 @@ def _build_report(df, notes, itab, jres, args) -> str:
                 ranks = e.get("rank_set") or []
                 stab = "稳定" if len(ranks) == 1 else "不稳定"
                 L.append(f"- 对照 {e['label']}: coint_rank∈{ranks}({stab}) (事实)。")
-    L.append("\n- 下一步 (下一 PR) (推测): 对协整成立的锚估 VECM,看误差修正项 λ 是否显著、"
-             "实利率 δ 是否在偏离项里现形,并做发布日对齐 + 2022 分解 (spec §2–§3)。")
+
+    # ── trivariate anchor verdict (PR #2 centerpiece) ──
+    if tri is not None and not tri.get("skip") and tri.get("rank_set") is not None:
+        ranks = tri["rank_set"]
+        v = tri.get("vecm")
+        L.append("\n### 三变量锚 [金价, 债务/GDP, 实利率] 裁决\n")
+        if ranks == [1] and v is not None:
+            b2 = v["betas"].get("real_rate_10y", {})
+            ec = v["ec_speed"]
+            long_sig = bool(b2.get("significant"))
+            rr_short = [t for t in v["short_run"] if t["var"] == "real_rate_10y"]
+            short_sig = any(t["significant"] for t in rr_short)
+            where = ("锚里+偏离里" if (long_sig and short_sig) else
+                     "锚里" if long_sig else "偏离里" if short_sig else "都不显著")
+            L.append(f"- **三变量锚稳健成立 (coint_rank=1 全网格) (事实/推理)。** "
+                     f"长期 β₁(债务)={v['betas']['ln_debt_gdp']['beta']:.3f}, "
+                     f"β₂(实利率)={b2.get('beta', float('nan')):.3f} "
+                     f"(p={b2.get('p', float('nan')):.3f}); 误差修正 λ={ec['lambda']:.3f} "
+                     f"(p={ec['p']:.3f}, 修正={ec['corrects']}) (事实)。")
+            L.append(f"- **实利率落点: {where}** (推理) — "
+                     "回答了 spec §修订的核心问句。")
+        elif ranks == [0]:
+            L.append("- **三变量仍 coint_rank=0 全网格稳定 (事实) → 加入实利率后仍无协整。**")
+            L.append("- ⚠️ **杀死条件触发 (spec 修订版条件 1+扩展)**: 线性常参数锚(含实利率)"
+                     "也被证伪 (推理) → 留待 regime-switching / 断点协整 (Gregory-Hansen, PR #3)。")
+        else:
+            L.append(f"- **三变量 coint_rank∈{ranks} 随设定变化(不稳定)(事实) → 协整证据脆弱,"
+                     "不能稳健宣称含实利率的三变量锚成立 (推理)。**")
+            L.append("- ⚠️ **杀死条件触发 (扩展)**: 线性常参数三变量锚不稳健 → "
+                     "留待 regime-switching / 断点协整 (PR #3)。")
+
+    L.append("\n- 下一步 (下一 PR) (推测): 若三变量锚成立但 λ/β₂ 边际,或不稳健 → "
+             "Gregory-Hansen 断点协整 + regime-switching VECM;并做发布日对齐 + 2022 分解 (spec §3–§4)。")
     L.append("\n> Claim types: 检验统计量与样本 β 估计值为 (事实);I(d) 判定、协整成立与否、"
              "「β≈1 支持纯贬值假说」等模型判读为 (推理);未来路径与机制故事为 (推测)。")
     return "\n".join(L) + "\n"
@@ -254,9 +463,21 @@ def main():
               f"coint_rank={point['coint_rank']} valid={point['valid_coint']} β={beta_s}; "
               f"robust ranks across lag×det={ranks}")
 
-    print("[4/4] Writing analysis report...")
+    print("[4/4] Trivariate anchor (Johansen + VECM) & real-rate I(d) segments...")
+    rr_segs = _run_real_rate_segments(df, panel.notes)
+    for name, seg in rr_segs.items():
+        if name != "_cutoff":
+            print(f"  real_rate {name}: {seg['combined']} (c={seg['c']}, ct={seg['ct']}, n={seg['n']})")
+    tri = _run_trivariate(df)
+    if tri.get("skip"):
+        print(f"  trivariate: skipped — {tri['skip']}")
+    else:
+        print(f"  trivariate Johansen: robust ranks={tri['rank_set']}; "
+              f"VECM={'estimated' if tri.get('vecm') else 'not estimated'}")
+
+    print("[5/5] Writing analysis report...")
     today = (args.end or datetime.now().strftime("%Y-%m-%d"))
-    report = _build_report(df, panel.notes, itab, jres, args)
+    report = _build_report(df, panel.notes, itab, jres, args, rr_segs=rr_segs, tri=tri)
     out = os.path.join(ANALYSIS_DIR, f"gold_anchor_cointegration_{today}.md")
     with open(out, "w", encoding="utf-8") as f:
         f.write(report)

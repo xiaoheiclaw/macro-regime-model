@@ -262,6 +262,11 @@ def build_anchor_panel(
         "pre-TIPS proxy = GS10 − trailing-12m CPI YoY (realized, not ex-ante). "
         "Splice break is a known weakness (spec §0)."
     )
+    # clean machine-readable splice cutoff so callers can split the real-rate
+    # series into spliced-full vs clean-TIPS subsamples for the I(d) double read.
+    notes["real_rate_tips_start"] = (
+        tips_start.date().isoformat() if tips_start is not None else "n/a"
+    )
 
     df = pd.DataFrame(
         {
@@ -467,6 +472,38 @@ def integration_table(df: pd.DataFrame, columns, min_obs: int = 20) -> pd.DataFr
     return pd.DataFrame(rows).set_index("series")
 
 
+def integration_segments(series, segments: Dict[str, tuple], alpha: float = 0.05,
+                         min_obs: int = 20) -> Dict[str, Dict[str, object]]:
+    """Run the dual-regression (c + ct) I(d) verdict on named sub-windows of a
+    single series. ``segments`` maps a label → (start, end) bounds (either may
+    be None for open-ended). Returns label → {combined, c, ct, n, start, end}.
+
+    Used to read the long-end real rate on two regimes separately: the full
+    spliced series (GS10−CPI proxy pre-TIPS + DFII10) vs the clean post-TIPS
+    DFII10 subsample. PR #1 judged the (full) real rate I(0) and dropped it from
+    the cointegrating vector; the split makes that verdict auditable per segment
+    rather than letting the splice break drive a single ambiguous label.
+    """
+    s = pd.Series(series).dropna().astype(float)
+    out: Dict[str, Dict[str, object]] = {}
+    for name, bounds in segments.items():
+        start, end = bounds
+        seg = s
+        if start is not None:
+            seg = seg[seg.index >= pd.Timestamp(start)]
+        if end is not None:
+            seg = seg[seg.index <= pd.Timestamp(end)]
+        cv = combined_verdict(seg, alpha=alpha, min_obs=min_obs)
+        out[name] = {
+            "combined": cv["combined"], "c": cv["c"], "ct": cv["ct"],
+            "c_res": cv["c_res"], "ct_res": cv["ct_res"],
+            "n": int(len(seg)),
+            "start": (seg.index.min().date().isoformat() if len(seg) else None),
+            "end": (seg.index.max().date().isoformat() if len(seg) else None),
+        }
+    return out
+
+
 # ── Cointegration (step 1) ─────────────────────────────────────────────
 # Johansen critical-value columns: [90%, 95%, 99%]
 _CV_COL = {0.10: 0, 0.05: 1, 0.01: 2}
@@ -540,10 +577,13 @@ def johansen_test(
             f"near-zero loading {vec[0]:.2e} for {cols} (n_obs={len(sub)})"
         )
     norm = vec / vec[0]
-    # G = α + β·A  ⇒  G - β·A ~ I(0); evec row encodes G + c1*A, so β = -c1
-    # (coefficient on the anchor moved to the RHS). β is only a long-run
-    # elasticity when a valid cointegrating relation exists — None otherwise.
+    # G = α + β·A  ⇒  G - β·A ~ I(0); evec row encodes G + c_i·A_i, so the
+    # long-run coefficient on anchor i is β_i = -c_i (moved to the RHS). For a
+    # bivariate system β = β_1; for the trivariate anchor [gold, debt, real
+    # rate] `betas` carries (β_debt, β_real). β is only a long-run elasticity
+    # when a valid cointegrating relation exists — None otherwise.
     beta = float(-norm[1]) if (valid_coint and n >= 2) else None
+    betas = [float(-norm[i]) for i in range(1, n)] if (valid_coint and n >= 2) else None
 
     return {
         "columns": cols,
@@ -561,6 +601,7 @@ def johansen_test(
         "full_rank_stationary": bool(full_rank_stationary),
         "coint_vector_normalized": [float(x) for x in norm],
         "beta": beta,
+        "betas": betas,
         "alpha_level": alpha,
         "k_ar_diff": int(k_ar_diff),
         "det_order": int(det_order),
@@ -597,9 +638,130 @@ def johansen_robustness(df: pd.DataFrame, columns, lags=(1, 2, 3, 4),
                 j = johansen_test(df, columns, det_order=det, k_ar_diff=lag, alpha=alpha)
                 rec.update(coint_rank=j["coint_rank"], valid_coint=j["valid_coint"],
                            beta=(None if j["beta"] is None else round(j["beta"], 3)),
+                           betas=(None if j["betas"] is None else [round(b, 3) for b in j["betas"]]),
                            n_obs=j["n_obs"])
             except ValueError as e:
                 rec.update(coint_rank=None, valid_coint=None, beta=None,
-                           n_obs=None, error=str(e)[:50])
+                           betas=None, n_obs=None, error=str(e)[:50])
             rows.append(rec)
     return pd.DataFrame(rows)
+
+
+# ── VECM (step 2: long-run vector + short-run error correction) ─────────
+# det_order (Johansen) → statsmodels VECM `deterministic` string. det_order=0
+# (constant restricted to the cointegrating relation) ↔ "ci"; -1 ↔ "nc";
+# 1 (linear trend) ↔ "cili" (constant + linear trend inside CE).
+_DET_ORDER_TO_VECM = {-1: "nc", 0: "ci", 1: "cili"}
+
+
+def estimate_vecm(
+    df: pd.DataFrame,
+    columns,
+    k_ar_diff: int = 1,
+    coint_rank: int = 1,
+    det_order: int = 0,
+) -> Dict[str, object]:
+    """Estimate a VECM and split the anchor into its long-run and short-run
+    pieces — the step-2 question "is the real rate IN the anchor or in the
+    deviation?".
+
+    Returns, for the gold equation (row 0):
+      * ``betas`` — long-run cointegrating coefficients β_i = -beta_i (gold
+        normalized to 1), with t/p values → β2 (real rate) significant ⇒ the
+        real rate is part of the long-run anchor.
+      * ``ec_speed`` (λ = α on gold) + t/p → λ<0 & significant ⇒ genuine error
+        correction back to the anchor.
+      * ``short_run`` — Δ coefficients in the gold equation (per var × lag) with
+        t/p → a significant short-run Δreal_rate ⇒ the real rate drives the
+        deviation around the anchor.
+
+    Requires ``k_ar_diff>=1`` so at least one short-run difference block exists
+    (a VAR(1)→k_ar_diff=0 Johansen lag carries no Δ dynamics; the caller bumps
+    it to 1 for the VECM and notes the bump).
+    """
+    from statsmodels.tsa.vector_ar.vecm import VECM
+
+    cols = list(columns)
+    n = len(cols)
+    if n < 2:
+        raise ValueError(f"estimate_vecm needs >=2 columns, got {cols}")
+    if k_ar_diff < 1:
+        raise ValueError(
+            f"estimate_vecm needs k_ar_diff>=1 for short-run terms, got {k_ar_diff}"
+        )
+    if coint_rank < 1:
+        raise ValueError(f"estimate_vecm needs coint_rank>=1, got {coint_rank}")
+    if det_order not in _DET_ORDER_TO_VECM:
+        raise ValueError(f"det_order must be one of {sorted(_DET_ORDER_TO_VECM)}")
+
+    sub = df[cols].dropna()
+    min_obs = max(40, n * (k_ar_diff + 3))
+    if len(sub) < min_obs:
+        raise ValueError(
+            f"estimate_vecm needs >={min_obs} complete rows for {cols}, "
+            f"got {len(sub)} after dropna"
+        )
+    if not np.isfinite(sub.values).all():
+        raise ValueError(f"estimate_vecm got non-finite values in {cols}")
+
+    deterministic = _DET_ORDER_TO_VECM[det_order]
+    res = VECM(sub.values, k_ar_diff=k_ar_diff, coint_rank=coint_rank,
+               deterministic=deterministic).fit()
+
+    # cointegrating vector: first `n` rows are the variable loadings (any
+    # deterministic terms come after). Normalize on gold (col 0).
+    beta_vec = np.asarray(res.beta)[:n, 0].astype(float)
+    if abs(beta_vec[0]) < 1e-12:
+        raise ValueError(
+            f"estimate_vecm: cannot normalize VECM β on gold — near-zero "
+            f"loading {beta_vec[0]:.2e} for {cols}"
+        )
+    beta_norm = beta_vec / beta_vec[0]
+    tb = np.asarray(res.tvalues_beta)[:n, 0].astype(float)
+    pb = np.asarray(res.pvalues_beta)[:n, 0].astype(float)
+    betas = {}
+    for i in range(1, n):
+        betas[cols[i]] = {
+            "beta": float(-beta_norm[i]),   # long-run coef moved to RHS
+            "t": float(tb[i]),
+            "p": float(pb[i]),
+            "significant": bool(pb[i] < 0.05),
+        }
+
+    ec_speed = {
+        "lambda": float(np.asarray(res.alpha)[0, 0]),
+        "t": float(np.asarray(res.tvalues_alpha)[0, 0]),
+        "p": float(np.asarray(res.pvalues_alpha)[0, 0]),
+    }
+    ec_speed["significant"] = bool(ec_speed["p"] < 0.05)
+    ec_speed["corrects"] = bool(ec_speed["lambda"] < 0 and ec_speed["significant"])
+
+    # short-run Γ for the gold equation (row 0). Γ is (n, n*k_ar_diff) ordered
+    # [lag1: var0..var_{n-1}, lag2: ...].
+    gamma = np.asarray(res.gamma)
+    tg = np.asarray(res.tvalues_gamma)
+    pg = np.asarray(res.pvalues_gamma)
+    short_run = []
+    for lag in range(1, k_ar_diff + 1):
+        for i, c in enumerate(cols):
+            j = (lag - 1) * n + i
+            short_run.append({
+                "var": c, "lag": lag,
+                "coef": float(gamma[0, j]),
+                "t": float(tg[0, j]),
+                "p": float(pg[0, j]),
+                "significant": bool(pg[0, j] < 0.05),
+            })
+
+    return {
+        "columns": cols,
+        "coint_rank": int(coint_rank),
+        "k_ar_diff": int(k_ar_diff),
+        "det_order": int(det_order),
+        "deterministic": deterministic,
+        "n_obs": int(len(sub)),
+        "beta_normalized": [float(x) for x in beta_norm],
+        "betas": betas,
+        "ec_speed": ec_speed,
+        "short_run": short_run,
+    }
