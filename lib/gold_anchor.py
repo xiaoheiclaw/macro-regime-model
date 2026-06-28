@@ -116,9 +116,26 @@ def fetch_gold_monthly(start: str = "1968-01-01") -> pd.Series:
     price dataset (Measuring Worth / LBMA), 1833→present. Used in place of the
     discontinued FRED LBMA series. Returns a float Series at month-end."""
     df = pd.read_csv(GOLD_CSV_URL)
+    missing = {"Date", "Price"} - set(df.columns)
+    if missing:
+        raise ValueError(
+            f"gold CSV missing columns: {sorted(missing)} (got {list(df.columns)}); "
+            f"source schema may have changed: {GOLD_CSV_URL}"
+        )
     s = pd.Series(df["Price"].values, index=pd.PeriodIndex(df["Date"], freq="M").to_timestamp("M"))
     s = pd.to_numeric(s, errors="coerce").dropna()
     return s[s.index >= pd.Timestamp(start)]
+
+
+def _parse_month_boundary(x: str, side: str) -> pd.Timestamp:
+    """Parse a date string. If only year-month (or year) is given, snap to the
+    month's start (side="start") or month-end (side="end") so that
+    ``end="2025-12"`` *includes* 2025-12-31 rather than excluding the month."""
+    ts = pd.Timestamp(x)
+    if len(str(x).split("-")) < 3:  # no explicit day → snap to month edge
+        per = pd.Period(ts, freq="M")
+        return per.to_timestamp("M") if side == "end" else per.to_timestamp()
+    return ts
 
 
 def _to_monthly(s: pd.Series, how: str = "mean") -> pd.Series:
@@ -207,9 +224,10 @@ def build_anchor_panel(
 
     # enforce the [start, end] contract on the final panel — injected fetchers
     # may not honor `start`, and lower-freq ffill grids can predate it.
-    df = df[df.index >= pd.Timestamp(start)]
+    # year-month inputs snap to month edges (end="2025-12" includes 2025-12-31).
+    df = df[df.index >= _parse_month_boundary(start, "start")]
     if end is not None:
-        df = df[df.index <= pd.Timestamp(end)]
+        df = df[df.index <= _parse_month_boundary(end, "end")]
 
     # provenance / coverage notes
     def _cov(s: pd.Series) -> str:
@@ -397,20 +415,21 @@ def johansen_test(
 
     # A valid cointegration rank is in [0, n-1]; raw rank == n means the system
     # is full-rank (the series themselves look stationary / model assumptions
-    # don't hold), which is NOT "the anchor holds". Cap and flag it.
+    # don't hold), which is NOT "the anchor holds". Flag it and force the
+    # cointegration rank to 0 so callers that key off coint_rank/valid_coint
+    # never read full-rank as a valid relation.
     full_rank_stationary = (raw_trace_rank == n) or (raw_maxeig_rank == n)
     trace_rank = min(raw_trace_rank, n - 1)
     maxeig_rank = min(raw_maxeig_rank, n - 1)
+    coint_rank = 0 if full_rank_stationary else min(trace_rank, maxeig_rank)
+    valid_coint = coint_rank >= 1
 
     # cointegrating vector = first eigenvector, normalized on gold (col 0)
     vec = res.evec[:, 0]
     norm = vec / vec[0]
-    # G = α + β·A  ⇒  G - β·A ~ I(0); evec row encodes G + c1*A,
-    # so β = -c1 (coefficient on the anchor moved to the RHS). β is only a
-    # long-run elasticity when a valid cointegrating relation exists — None
-    # otherwise (rank 0 = no anchor; full rank = stationary/assumptions fail).
-    rank = min(trace_rank, maxeig_rank)
-    valid_coint = (rank >= 1) and (not full_rank_stationary)
+    # G = α + β·A  ⇒  G - β·A ~ I(0); evec row encodes G + c1*A, so β = -c1
+    # (coefficient on the anchor moved to the RHS). β is only a long-run
+    # elasticity when a valid cointegrating relation exists — None otherwise.
     beta = float(-norm[1]) if (valid_coint and n >= 2) else None
 
     return {
@@ -423,7 +442,9 @@ def johansen_test(
         "raw_maxeig_rank": int(raw_maxeig_rank),
         "trace_rank": int(trace_rank),
         "maxeig_rank": int(maxeig_rank),
-        "rank": int(rank),
+        "coint_rank": int(coint_rank),
+        "rank": int(coint_rank),  # back-compat alias for coint_rank
+        "valid_coint": bool(valid_coint),
         "full_rank_stationary": bool(full_rank_stationary),
         "coint_vector_normalized": [float(x) for x in norm],
         "beta": beta,

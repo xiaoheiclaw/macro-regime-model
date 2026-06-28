@@ -20,8 +20,6 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-import pandas as pd
-
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from lib.gold_anchor import build_anchor_panel, integration_table, johansen_test
 from lib.paths import ANALYSIS_DIR, DATA_DIR
@@ -32,6 +30,13 @@ ANCHORS = [
     ("fed_gdp", "ln_fed_gdp", "Fed assets/GDP (对照)"),
     ("m2_gdp", "ln_m2_gdp", "M2/GDP (对照)"),
 ]
+
+
+def should_run_johansen(gold_verdict: str, anchor_verdict: str) -> bool:
+    """Johansen cointegration assumes all series are I(1). Only run when BOTH
+    gold and the anchor are classified I(1); I(0)/ambiguous/mixed-order inputs
+    would yield a meaningless 'anchor holds' verdict."""
+    return gold_verdict == "I(1)" and anchor_verdict == "I(1)"
 
 
 def _fmt_johansen(j: dict) -> str:
@@ -46,7 +51,8 @@ def _fmt_johansen(j: dict) -> str:
     for r in range(n):
         mark = "✓ reject" if j["maxeig_stat"][r] > j["maxeig_cv"][r] else "✗ fail"
         lines.append(f"    r={r}: stat={j['maxeig_stat'][r]:.2f} vs cv={j['maxeig_cv'][r]:.2f}  {mark}")
-    lines.append(f"- **coint rank = {j['rank']}** (trace={j['trace_rank']}, max-eigen={j['maxeig_rank']}; "
+    lines.append(f"- **coint_rank = {j['coint_rank']}** (valid_coint={j['valid_coint']}; "
+                 f"trace={j['trace_rank']}, max-eigen={j['maxeig_rank']}; "
                  f"raw trace/max-eigen={j['raw_trace_rank']}/{j['raw_maxeig_rank']})")
     if j["full_rank_stationary"]:
         lines.append("- ⚠️ **full-rank** (raw rank = n): series look stationary / model assumptions "
@@ -86,16 +92,27 @@ def main():
     print(itab.to_string())
 
     print("[3/4] Johansen cointegration (debt/GDP main; Fed, M2 controls)...")
-    jres = {}
+    # Johansen assumes all series are I(1); only run when both gold and the
+    # anchor are classified I(1), else the cointegration verdict is meaningless.
+    gold_v = itab.loc["ln_gold_nominal", "verdict"] if "ln_gold_nominal" in itab.index else "missing"
+    jres = {}  # key -> (label, j_or_None, skip_reason_or_None)
     for key, lncol, label in ANCHORS:
+        anc_v = itab.loc[lncol, "verdict"] if lncol in itab.index else "missing"
         sub = df[["ln_gold_nominal", lncol]].dropna()
+        if not should_run_johansen(gold_v, anc_v):
+            reason = f"non-I(1) (gold={gold_v}, anchor={anc_v})"
+            jres[key] = (label, None, reason)
+            print(f"  {label}: skipped — {reason}")
+            continue
         if len(sub) < 30:
-            print(f"  {label}: too few obs ({len(sub)}), skipped")
+            reason = f"too few obs ({len(sub)})"
+            jres[key] = (label, None, reason)
+            print(f"  {label}: skipped — {reason}")
             continue
         j = johansen_test(df, ["ln_gold_nominal", lncol])
-        jres[key] = (label, j)
+        jres[key] = (label, j, None)
         beta_s = "n/a" if j["beta"] is None else f"{j['beta']:.3f}"
-        print(f"  {label}: rank={j['rank']}, β={beta_s}, n={j['n_obs']}")
+        print(f"  {label}: coint_rank={j['coint_rank']}, valid={j['valid_coint']}, β={beta_s}, n={j['n_obs']}")
 
     print("[4/4] Writing analysis report...")
     today = (args.end or datetime.now().strftime("%Y-%m-%d"))
@@ -131,32 +148,41 @@ def _build_report(df, notes, itab, jres, args) -> str:
              "符合「实利率是偏离驱动、不是锚」的直觉;若 I(1)→可进长期向量,需另行解释 (spec §1)。")
 
     L.append("\n## 1b. 协整 (Johansen, trace + max-eigen)\n")
-    L.append("系统 = [ln(名义金价), ln(锚/GDP)]。rank=0 → 锚是伪共同趋势,假说被证伪;"
-             "rank≥1 → 锚成立,报告长期弹性 β。\n")
-    for key, (label, j) in jres.items():
+    L.append("系统 = [ln(名义金价), ln(锚/GDP)],仅当两者都判 I(1) 才跑。"
+             "valid_coint=False → 锚是伪共同趋势/满秩,假说被证伪;"
+             "valid_coint=True → 锚成立,报告长期弹性 β。\n")
+    for key, (label, j, skip) in jres.items():
         L.append(f"\n### {label}\n")
-        L.append(_fmt_johansen(j))
+        if j is None:
+            L.append(f"- **skipped: {skip}** — 未跑 Johansen。")
+        else:
+            L.append(_fmt_johansen(j))
 
     L.append("\n## 核心结论\n")
     main = jres.get("debt_gdp")
     if main:
-        label, j = main
-        if j["full_rank_stationary"]:
+        label, j, skip = main
+        if j is None:
+            L.append(f"- **主锚 Debt/GDP: 未跑 Johansen({skip})** — 前置单整条件不满足,不作锚判定。")
+        elif j["full_rank_stationary"]:
             L.append(f"- **主锚 Debt/GDP: 满秩(raw rank=n)→ 序列疑似平稳/模型假设不成立,"
                      f"协整解读无效,不作锚成立判定(需复查单整阶数)。**")
-        elif j["rank"] >= 1:
+        elif j["valid_coint"]:
             beta_note = ("接近 1(纯贬值假说获支持)" if abs(j["beta"] - 1.0) < 0.25
                          else "显著偏离 1(贬值故事需进一步解释,见 spec §2)")
-            L.append(f"- **主锚 Debt/GDP: coint rank = {j['rank']} ≥ 1 → 锚成立(非伪趋势)。** "
+            L.append(f"- **主锚 Debt/GDP: coint_rank = {j['coint_rank']} ≥ 1 → 锚成立(非伪趋势)。** "
                      f"长期弹性 β = {j['beta']:.3f},{beta_note}。")
         else:
-            L.append(f"- **主锚 Debt/GDP: rank = 0 → 没有协整,基准线是伪共同趋势,"
+            L.append(f"- **主锚 Debt/GDP: coint_rank = 0 → 没有协整,基准线是伪共同趋势,"
                      f"用户「锚」假说在此被证伪(spec 杀死条件 1)。**")
     for key in ("fed_gdp", "m2_gdp"):
         if key in jres:
-            label, j = jres[key]
-            beta_s = "n/a" if j["beta"] is None else f"{j['beta']:.3f}"
-            L.append(f"- 对照 {label}: rank={j['rank']}, β={beta_s}。")
+            label, j, skip = jres[key]
+            if j is None:
+                L.append(f"- 对照 {label}: skipped({skip})。")
+            else:
+                beta_s = "n/a" if j["beta"] is None else f"{j['beta']:.3f}"
+                L.append(f"- 对照 {label}: coint_rank={j['coint_rank']}, valid={j['valid_coint']}, β={beta_s}。")
     L.append("\n- 下一步 (下一 PR): 对协整成立的锚估 VECM,看误差修正项 λ 是否显著、"
              "实利率 δ 是否在偏离项里现形,并做 2022 分解 (spec §2–§3)。")
     L.append("\n> Claim types: 检验统计量与样本 β 估计值为 (事实);I(d) 判定、协整成立与否、"

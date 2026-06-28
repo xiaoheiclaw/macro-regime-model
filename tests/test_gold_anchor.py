@@ -201,3 +201,37 @@ def test_johansen_validates_inputs():
     bad.iloc[5, 0] = np.inf
     with pytest.raises(ValueError):
         johansen_test(bad, ["ln_gold_nominal", "ln_anchor"])  # non-finite
+
+
+def test_should_run_johansen_gate():
+    from scripts.gold_anchor_analysis import should_run_johansen
+
+    assert should_run_johansen("I(1)", "I(1)") is True
+    # stationary or ambiguous anchor (or gold) must NOT enter Johansen
+    assert should_run_johansen("I(1)", "I(0)") is False
+    assert should_run_johansen("I(1)", "ambiguous") is False
+    assert should_run_johansen("I(0)", "I(1)") is False
+    assert should_run_johansen("I(1)", "insufficient data") is False
+
+
+def test_full_rank_marks_invalid_coint():
+    n = 500
+    idx = pd.date_range("1980-01-31", periods=n, freq="ME")
+    g = np.random.default_rng(5).standard_normal(n)
+    a = np.random.default_rng(6).standard_normal(n)
+    df = pd.DataFrame({"ln_gold_nominal": g, "ln_anchor": a}, index=idx)
+    j = johansen_test(df, ["ln_gold_nominal", "ln_anchor"])
+    assert j["full_rank_stationary"] is True
+    assert j["valid_coint"] is False
+    assert j["coint_rank"] == 0
+    assert j["beta"] is None
+
+
+def test_end_month_boundary_includes_month_end():
+    # end="2025-12" must include 2025-12-31, not exclude the whole month
+    panel = build_anchor_panel(
+        start="1968-01-01", end="2025-12",
+        fetch_fn=_synthetic_fred, gold_fetch_fn=_synthetic_gold,
+    )
+    assert pd.Timestamp("2025-12-31") in panel.data.index
+    assert panel.data.index.max() <= pd.Timestamp("2025-12-31")
