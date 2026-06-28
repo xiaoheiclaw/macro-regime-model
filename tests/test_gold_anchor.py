@@ -354,11 +354,12 @@ def test_johansen_trivariate_reports_two_betas():
     df = _trivariate_cointegrated()
     cols = ["ln_gold_nominal", "ln_debt_gdp", "real_rate_10y"]
     j = johansen_test(df, cols, k_ar_diff=1)
-    assert j["rank"] >= 1
+    assert j["coint_rank"] == 1              # unique vector → β interpretable
     # betas carries (β_debt, β_real) for the 3-var system
     assert j["betas"] is not None and len(j["betas"]) == 2
-    assert abs(j["betas"][0] - 1.2) < 0.4   # β_debt ≈ 1.2
-    assert j["betas"][0] == j["beta"]       # β alias = first anchor coef
+    assert abs(j["betas"][0] - 1.2) < 0.4    # β_debt ≈ 1.2 (true)
+    assert abs(j["betas"][1] - (-0.5)) < 0.4  # β_real ≈ -0.5 (true) — the PR's core add
+    assert j["betas"][0] == j["beta"]        # β alias = first anchor coef
     # robustness grid carries the betas list per cell
     rob = johansen_robustness(df, cols)
     assert "betas" in rob.columns
@@ -445,6 +446,25 @@ def test_estimate_vecm_recovers_long_and_short_run():
     assert v["beta_normalized"][0] == 1.0
 
 
+def test_johansen_beta_requires_valid_and_unique_coint():
+    # β/βs must be None unless there is a VALID (not full-rank-stationary) AND
+    # UNIQUE (rank==1) cointegrating relation. Two stationary white-noise series
+    # → full_rank_stationary → valid_coint False → β None even if a raw rank
+    # would otherwise be ≥1.
+    n = 500
+    idx = pd.date_range("1980-01-31", periods=n, freq="ME")
+    df = pd.DataFrame(
+        {"ln_gold_nominal": np.random.default_rng(5).standard_normal(n),
+         "ln_debt_gdp": np.random.default_rng(6).standard_normal(n)},
+        index=idx,
+    )
+    j = johansen_test(df, list(df.columns))
+    assert j["valid_coint"] is False
+    assert j["beta"] is None and j["betas"] is None
+    # the contract, stated directly:
+    assert (j["beta"] is None) == (not (j["valid_coint"] and j["coint_rank"] == 1))
+
+
 def test_estimate_vecm_validates_inputs():
     df = _trivariate_cointegrated()
     cols = ["ln_gold_nominal", "ln_debt_gdp", "real_rate_10y"]
@@ -454,6 +474,19 @@ def test_estimate_vecm_validates_inputs():
         estimate_vecm(df, ["ln_gold_nominal"], k_ar_diff=1)  # <2 cols
     with pytest.raises(ValueError):
         estimate_vecm(df.iloc[:20], cols, k_ar_diff=1)       # too few rows
+    with pytest.raises(ValueError):
+        estimate_vecm(df, cols, k_ar_diff=1, coint_rank=2)   # rank>1 → no unique β
+
+
+def test_estimate_vecm_alpha_threshold_propagates():
+    # significance uses the caller's alpha, and alpha_level is echoed back.
+    df = _trivariate_cointegrated()
+    cols = ["ln_gold_nominal", "ln_debt_gdp", "real_rate_10y"]
+    v = estimate_vecm(df, cols, k_ar_diff=2, coint_rank=1, alpha=0.01)
+    assert v["alpha_level"] == 0.01
+    for b in v["betas"].values():
+        assert b["significant"] == (b["p"] < 0.01)
+    assert v["ec_speed"]["significant"] == (v["ec_speed"]["p"] < 0.01)
 
 
 def test_estimate_vecm_det_orders_do_not_crash():

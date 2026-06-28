@@ -583,7 +583,10 @@ def johansen_test(
     # rate] `betas` carries (β_debt, β_real). β/βs are interpretable ONLY when
     # coint_rank == 1: with rank>1 the single eigenvector is not unique, so the
     # first column is an arbitrary basis vector — report None, not a misleading β.
-    interpretable = (coint_rank == 1) and (n >= 2)
+    # interpretable only when there is a VALID, UNIQUE cointegrating relation:
+    # valid_coint (rules out full-rank-stationary) AND rank exactly 1 (rank>1 →
+    # the first eigenvector is a non-unique basis vector). Both are required.
+    interpretable = valid_coint and (coint_rank == 1) and (n >= 2)
     beta = float(-norm[1]) if interpretable else None
     betas = [float(-norm[i]) for i in range(1, n)] if interpretable else None
 
@@ -665,6 +668,7 @@ def estimate_vecm(
     k_ar_diff: int = 1,
     coint_rank: int = 1,
     det_order: int = 0,
+    alpha: float = 0.05,
 ) -> Dict[str, object]:
     """Estimate a VECM and split the anchor into its long-run and short-run
     pieces — the step-2 question "is the real rate IN the anchor or in the
@@ -694,8 +698,15 @@ def estimate_vecm(
         raise ValueError(
             f"estimate_vecm needs k_ar_diff>=1 for short-run terms, got {k_ar_diff}"
         )
-    if coint_rank < 1:
-        raise ValueError(f"estimate_vecm needs coint_rank>=1, got {coint_rank}")
+    # single-anchor decomposition: we report ONE long-run vector (β1/β2) + one
+    # error-correction loading λ, which is only meaningful when the cointegrating
+    # space is 1-D. rank>1 → multiple vectors, no unique "anchor" → caller must
+    # handle separately (mirrors the johansen_test rank>1 → β=None contract).
+    if coint_rank != 1:
+        raise ValueError(
+            f"estimate_vecm currently supports only coint_rank==1 (single anchor "
+            f"vector); got {coint_rank}. rank>1 has no unique β1/β2 to report."
+        )
     if det_order not in _DET_ORDER_TO_VECM:
         raise ValueError(f"det_order must be one of {sorted(_DET_ORDER_TO_VECM)}")
 
@@ -714,14 +725,18 @@ def estimate_vecm(
                deterministic=deterministic).fit()
 
     # cointegrating vector: first `n` rows are the variable loadings (any
-    # deterministic terms come after). Normalize on gold (col 0).
+    # deterministic terms come after). statsmodels already normalizes the first
+    # `coint_rank` rows of β to the identity, so for rank==1 res.beta[0]==1 and
+    # the reported t/p line up with the coefficients as-is. Assert that before
+    # reusing t/p — if a future statsmodels stops auto-normalizing, β would
+    # become a ratio and the raw t/p would no longer correspond (P2).
     beta_vec = np.asarray(res.beta)[:n, 0].astype(float)
-    if abs(beta_vec[0]) < 1e-12:
+    if abs(beta_vec[0] - 1.0) > 1e-6:
         raise ValueError(
-            f"estimate_vecm: cannot normalize VECM β on gold — near-zero "
-            f"loading {beta_vec[0]:.2e} for {cols}"
+            f"estimate_vecm: VECM β not normalized to gold=1 (got {beta_vec[0]:.4g}); "
+            "reusing statsmodels t/p would be inconsistent — refit/normalize needed."
         )
-    beta_norm = beta_vec / beta_vec[0]
+    beta_norm = beta_vec  # already gold-normalized (beta_vec[0]==1)
     tb = np.asarray(res.tvalues_beta)[:n, 0].astype(float)
     pb = np.asarray(res.pvalues_beta)[:n, 0].astype(float)
     betas = {}
@@ -733,7 +748,7 @@ def estimate_vecm(
             "beta": float(-beta_norm[i]),
             "t": float(-tb[i]),
             "p": float(pb[i]),
-            "significant": bool(pb[i] < 0.05),
+            "significant": bool(pb[i] < alpha),
         }
 
     ec_speed = {
@@ -741,7 +756,7 @@ def estimate_vecm(
         "t": float(np.asarray(res.tvalues_alpha)[0, 0]),
         "p": float(np.asarray(res.pvalues_alpha)[0, 0]),
     }
-    ec_speed["significant"] = bool(ec_speed["p"] < 0.05)
+    ec_speed["significant"] = bool(ec_speed["p"] < alpha)
     ec_speed["corrects"] = bool(ec_speed["lambda"] < 0 and ec_speed["significant"])
 
     # short-run Γ for the gold equation (row 0). Γ is (n, n*k_ar_diff) ordered
@@ -758,7 +773,7 @@ def estimate_vecm(
                 "coef": float(gamma[0, j]),
                 "t": float(tg[0, j]),
                 "p": float(pg[0, j]),
-                "significant": bool(pg[0, j] < 0.05),
+                "significant": bool(pg[0, j] < alpha),
             })
 
     return {
@@ -767,6 +782,7 @@ def estimate_vecm(
         "k_ar_diff": int(k_ar_diff),
         "det_order": int(det_order),
         "deterministic": deterministic,
+        "alpha_level": float(alpha),
         "n_obs": int(len(sub)),
         "beta_normalized": [float(x) for x in beta_norm],
         "betas": betas,

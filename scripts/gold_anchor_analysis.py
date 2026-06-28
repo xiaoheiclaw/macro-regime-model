@@ -192,9 +192,13 @@ def _run_trivariate(df, notes) -> dict:
     # rank>1 ⇒ the single eigenvector is not unique → β1/β2 arbitrary; any failed
     # cell ⇒ the grid isn't robust. (P2)
     n_cells = len(robust)
-    all_cells_ok = bool(robust["coint_rank"].notna().all()) and n_cells > 0
+    n_failed = int(robust["coint_rank"].isna().sum())
+    all_cells_ok = (n_failed == 0) and n_cells > 0
     all_valid = bool(robust["valid_coint"].fillna(False).all()) if n_cells else False
     robust_unique_rank1 = all_cells_ok and all_valid and ranks == [1]
+    entry["n_cells"] = n_cells
+    entry["n_failed"] = n_failed
+    entry["all_cells_ok"] = all_cells_ok
     entry["robust_unique_rank1"] = robust_unique_rank1
     if robust_unique_rank1:
         k = max(1, lag["k_ar_diff"])
@@ -246,10 +250,14 @@ def _fmt_trivariate(tri) -> list:
     L.append(tri["robust"].to_string(index=False))
     L.append("```")
     ranks = tri["rank_set"] or []
-    if ranks == [1]:
+    nf, nc = tri.get("n_failed", 0), tri.get("n_cells", 0)
+    if not tri.get("all_cells_ok", False):
+        rank_verdict = (f"网格 {nf}/{nc} 单元数值失败 → **稳健性不足**,不能宣称全设定稳定;"
+                        f"成功单元 coint_rank∈{ranks}")
+    elif ranks == [1]:
         rank_verdict = f"coint_rank=1 在 lag∈{list(ROBUST_LAGS)}×det∈{list(ROBUST_DET_ORDERS)} 全设定下**稳定**"
     elif ranks == [0]:
-        rank_verdict = "coint_rank=0 在所有设定下稳定 → **无协整**"
+        rank_verdict = "coint_rank=0 在所有设定下**稳定** → **无协整**"
     else:
         rank_verdict = f"coint_rank ∈ {ranks} **随设定变化(不稳定)**"
     L.append(f"- **稳健性 (推理): {rank_verdict}**")
@@ -447,13 +455,16 @@ def _build_report(df, notes, itab, jres, args, rr_segs=None, tri=None) -> str:
                      f"(p={b2.get('p', float('nan')):.3f}); 误差修正 λ={ec['lambda']:.3f} "
                      f"(p={ec['p']:.3f}, 修正={ec['corrects']}) (事实)。")
             L.append(f"- **实利率落点: {where}** (推理) — 回答了 spec §修订的核心问句。")
-        elif ranks == [0]:
+        elif ranks == [0] and tri.get("all_cells_ok"):
             L.append("- **三变量仍 coint_rank=0 全网格稳定 (事实) → 加入实利率后仍无协整。**")
             L.append("- ⚠️ **杀死条件触发 (spec 修订版条件 1+扩展)**: 线性常参数锚(含实利率)"
                      "也被证伪 (推理) → 留待 regime-switching / 断点协整 (Gregory-Hansen, PR #3)。")
         else:
-            L.append(f"- **三变量 coint_rank∈{ranks} 非「稳健且唯一=1」(事实) → 协整证据脆弱"
-                     "(rank>1 时向量不唯一/含失败单元),不能稳健宣称含实利率的三变量锚成立 (推理)。**")
+            nf, nc = tri.get("n_failed", 0), tri.get("n_cells", 0)
+            extra = (f"(网格 {nf}/{nc} 单元数值失败,稳健性不足)" if not tri.get("all_cells_ok")
+                     else "(rank>1 时向量不唯一)")
+            L.append(f"- **三变量 coint_rank∈{ranks} 非「稳健且唯一=1」{extra} (事实) → 协整证据脆弱,"
+                     "不能稳健宣称含实利率的三变量锚成立 (推理)。**")
             L.append("- ⚠️ **杀死条件触发 (扩展)**: 线性常参数三变量锚不稳健 → "
                      "留待 regime-switching / 断点协整 (PR #3)。")
 
