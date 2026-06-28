@@ -126,90 +126,128 @@ def _gate_check(sub) -> tuple:
     return passed, verdicts
 
 
-def _run_trivariate(df, notes) -> dict:
-    """Step 1–2 (PR #2): three-variable Johansen on the joint anchor surface,
-    plus VECM iff the cointegration rank is robustly and *uniquely* 1.
-
-    Johansen/VECM are run only on a window where ALL THREE legs are I(1) (the
-    full 1968+ spliced sample if it passes; else the clean post-TIPS window
-    where the real rate is I(1)). If neither window is all-I(1), the trivariate
-    test is skipped and the real rate is confined to the short-run ECM (P1)."""
-    cols = TRIVARIATE_COLS
-    entry = {"cols": cols, "window": None, "id_window": None, "pairwise_n": None,
-             "id_check": {}, "gate_full": None, "gate_full_n": None,
-             "gate_clean": None, "gate_clean_n": None, "skip": None, "lag": None,
-             "point": None, "robust": None, "rank_set": None,
-             "robust_unique_rank1": False, "vecm": None, "vecm_note": None}
-
-    full = df[cols].dropna()
-    passed_full, v_full = _gate_check(full)
-    entry["gate_full"], entry["gate_full_n"] = v_full, int(len(full))
-
-    use, window, used_gate = None, None, None
-    if passed_full and len(full) >= 40:
-        use, window, used_gate = full, "full (1968+ spliced)", v_full
-    else:
-        cutoff = notes.get("real_rate_tips_start", "n/a")
-        if cutoff and cutoff != "n/a":
-            clean = df.loc[df.index >= pd.Timestamp(cutoff), cols].dropna()
-            passed_clean, v_clean = _gate_check(clean)
-            entry["gate_clean"], entry["gate_clean_n"] = v_clean, int(len(clean))
-            if passed_clean and len(clean) >= 40:
-                use, window, used_gate = clean, f"clean TIPS (≥{cutoff})", v_clean
-
-    if use is None:
-        # report id_check + n from the LAST evaluated gate window (clean if it was
-        # tried, else full) so id verdicts and the sample size never mismatch (P2).
-        if entry["gate_clean"] is not None:
-            entry["id_check"], entry["pairwise_n"], entry["id_window"] = (
-                entry["gate_clean"], entry["gate_clean_n"], "clean TIPS")
-        else:
-            entry["id_check"], entry["pairwise_n"], entry["id_window"] = (
-                entry["gate_full"], entry["gate_full_n"], "full (1968+ spliced)")
-        entry["skip"] = ("not all three legs I(1) on any gated window — Johansen "
-                         "requires all-I(1); real rate remains eligible only for a "
-                         "future short-run ECM specification (PR #3)")
-        return entry
-
-    # id_check / n / window all come from the SAME (used) subsample
-    entry["window"] = entry["id_window"] = window
-    entry["id_check"] = used_gate
-    entry["pairwise_n"] = int(len(use))
+def _run_one_window(use, label, cols) -> dict:
+    """Johansen point + lag/det robustness (+ VECM if robust-unique-rank-1) on a
+    single all-I(1) window. The point estimate, the VECM and the robustness
+    verdict all share ONE lag k = max(1, AIC k_ar_diff) so they never mix lags
+    (P2): if AIC picks VAR(1)→k_ar_diff=0, we bump to 1 (VECM needs a Δ block)
+    and rebuild the point Johansen at the same bumped lag."""
+    w = {"window": label, "n": int(len(use)), "lag": None, "k_point": None,
+         "point": None, "robust": None, "rank_set": None, "n_cells": 0,
+         "n_failed": 0, "all_cells_ok": False, "robust_unique_rank1": False,
+         "vecm": None, "vecm_note": None, "error": None}
     lag = select_var_order(use, cols, max_lags=4)
-    entry["lag"] = lag
+    w["lag"] = lag
+    k = max(1, lag["k_ar_diff"])
+    w["k_point"] = k
+    if k != lag["k_ar_diff"]:
+        w["vecm_note"] = (f"AIC lag→k_ar_diff={lag['k_ar_diff']} (VAR(1)); point + VECM "
+                          f"use bumped k_ar_diff={k} so a short-run Δ block exists.")
     try:
-        entry["point"] = johansen_test(use, cols, det_order=0, k_ar_diff=lag["k_ar_diff"])
+        w["point"] = johansen_test(use, cols, det_order=0, k_ar_diff=k)
     except (ValueError, np.linalg.LinAlgError) as e:
-        entry["skip"] = f"point Johansen failed: {type(e).__name__}: {str(e)[:60]}"
-        return entry
+        w["error"] = f"point Johansen failed: {type(e).__name__}: {str(e)[:60]}"
+        return w
     robust = johansen_robustness(use, cols, lags=ROBUST_LAGS, det_orders=ROBUST_DET_ORDERS)
-    entry["robust"] = robust
+    w["robust"] = robust
     ranks = sorted(set(robust["coint_rank"].dropna().astype(int)))
-    entry["rank_set"] = ranks
-
-    # VECM only when the cointegrating vector is well-identified: EVERY grid cell
-    # succeeded (no failures), every cell is valid_coint, AND rank is uniquely 1.
-    # rank>1 ⇒ the single eigenvector is not unique → β1/β2 arbitrary; any failed
-    # cell ⇒ the grid isn't robust. (P2)
+    w["rank_set"] = ranks
     n_cells = len(robust)
     n_failed = int(robust["coint_rank"].isna().sum())
     all_cells_ok = (n_failed == 0) and n_cells > 0
     all_valid = bool(robust["valid_coint"].fillna(False).all()) if n_cells else False
-    robust_unique_rank1 = all_cells_ok and all_valid and ranks == [1]
-    entry["n_cells"] = n_cells
-    entry["n_failed"] = n_failed
-    entry["all_cells_ok"] = all_cells_ok
-    entry["robust_unique_rank1"] = robust_unique_rank1
-    if robust_unique_rank1:
-        k = max(1, lag["k_ar_diff"])
-        if k != lag["k_ar_diff"]:
-            entry["vecm_note"] = (f"AIC lag→k_ar_diff={lag['k_ar_diff']} (VAR(1)); "
-                                  f"bumped to k_ar_diff={k} so a short-run Δ block exists.")
+    # robust-unique-rank-1 requires: full grid succeeded, all valid, grid rank
+    # uniquely 1, AND the chosen-lag point estimate is also rank 1 (P2 — no
+    # mixing a non-rank-1 point estimate with a "stable" grid).
+    point_rank1 = w["point"]["coint_rank"] == 1
+    w["n_cells"], w["n_failed"], w["all_cells_ok"] = n_cells, n_failed, all_cells_ok
+    w["robust_unique_rank1"] = all_cells_ok and all_valid and ranks == [1] and point_rank1
+    if w["robust_unique_rank1"]:
         try:
-            entry["vecm"] = estimate_vecm(use, cols, k_ar_diff=k, coint_rank=1, det_order=0)
+            w["vecm"] = estimate_vecm(use, cols, k_ar_diff=k, coint_rank=1, det_order=0)
         except (ValueError, np.linalg.LinAlgError) as e:
-            entry["vecm_note"] = f"VECM estimation failed: {type(e).__name__}: {e}"
+            w["vecm_note"] = f"VECM estimation failed: {type(e).__name__}: {e}"
+    return w
+
+
+def _run_trivariate(df, notes) -> dict:
+    """Step 1–2 (PR #2): three-variable Johansen + VECM on the joint anchor.
+
+    Both candidate windows — the full 1968+ spliced sample AND the clean
+    post-TIPS sample — are gated and (if all-I(1)) run independently, then their
+    verdicts are cross-checked (P2): the trivariate anchor is "robust" only if
+    every eligible window is robust-unique-rank-1 AND they agree. If they
+    disagree it is flagged window-sensitive (NOT robust). If no window is
+    all-I(1) the test is skipped and the real rate stays out of the long run."""
+    cols = TRIVARIATE_COLS
+    entry = {"cols": cols, "gates": {}, "windows": {}, "skip": None, "verdict": None}
+
+    candidates = {"full (1968+ spliced)": df[cols].dropna()}
+    cutoff = notes.get("real_rate_tips_start", "n/a")
+    if cutoff and cutoff != "n/a":
+        candidates[f"clean TIPS (≥{cutoff})"] = df.loc[df.index >= pd.Timestamp(cutoff), cols].dropna()
+
+    eligible = []
+    for label, sub in candidates.items():
+        passed, verdicts = _gate_check(sub)
+        ok = bool(passed and len(sub) >= 40)
+        entry["gates"][label] = {"verdicts": verdicts, "n": int(len(sub)), "passed": ok}
+        if ok:
+            eligible.append((label, sub))
+
+    if not eligible:
+        entry["skip"] = ("no candidate window is all-I(1) — Johansen requires "
+                         "all-I(1); real rate remains eligible only for a future "
+                         "short-run ECM specification (PR #3)")
+        return entry
+
+    for label, sub in eligible:
+        entry["windows"][label] = _run_one_window(sub, label, cols)
+
+    flags = [w["robust_unique_rank1"] for w in entry["windows"].values()]
+    if len(flags) >= 2:
+        entry["verdict"] = ("robust_both" if all(flags)
+                            else "window_sensitive" if any(flags)
+                            else "not_robust")
+    else:
+        entry["verdict"] = "robust_single" if flags[0] else "not_robust"
     return entry
+
+
+def _fmt_window_block(w) -> list:
+    """Johansen point + robustness for one window."""
+    L = [f"\n#### 窗口: {w['window']} (n={w['n']})\n"]
+    if w.get("error"):
+        L.append(f"- **error: {w['error']}** — 该窗口未产出 Johansen (推理)。")
+        return L
+    lag = w["lag"]
+    L.append(f"- VAR select_order(AIC) p={lag['var_order']} → AIC k_ar_diff={lag['k_ar_diff']}; "
+             f"点估计/VECM 用 k_ar_diff={w['k_point']} (事实)")
+    if w.get("vecm_note") and "bumped" in (w["vecm_note"] or ""):
+        L.append(f"  - {w['vecm_note']}")
+    L.append("\n点估计 (k=k_point, det_order=0):")
+    L.append(_fmt_johansen(w["point"]))
+    pt = w["point"]
+    if pt["betas"] is not None:
+        L.append(f"- 长期向量系数: **β₁(债务)={pt['betas'][0]:.3f}, "
+                 f"β₂(实利率)={pt['betas'][1]:.3f}** (事实)")
+    L.append("\n稳健性网格 (coint_rank / valid_coint / β₁,β₂=betas):")
+    L.append("```")
+    L.append(w["robust"].to_string(index=False))
+    L.append("```")
+    ranks = w["rank_set"] or []
+    nf, nc = w["n_failed"], w["n_cells"]
+    if not w["all_cells_ok"]:
+        rv = (f"网格 {nf}/{nc} 单元数值失败 → **稳健性不足**,不能宣称全设定稳定;"
+              f"成功单元 coint_rank∈{ranks}")
+    elif ranks == [1] and w["point"]["coint_rank"] == 1:
+        rv = f"coint_rank=1 在 lag∈{list(ROBUST_LAGS)}×det∈{list(ROBUST_DET_ORDERS)} 全设定下**稳定**(点估计同为 1)"
+    elif ranks == [0]:
+        rv = "coint_rank=0 在所有设定下**稳定** → **无协整**"
+    else:
+        rv = f"coint_rank ∈ {ranks} (点估计={w['point']['coint_rank']}) **随设定变化(不稳定)**"
+    L.append(f"- **稳健性 (推理): {rv}**")
+    return L
 
 
 def _fmt_trivariate(tri) -> list:
@@ -218,80 +256,53 @@ def _fmt_trivariate(tri) -> list:
     L.append("锚升级为**联合长期均衡面** `ln金价* = α + β₁·ln(债务/GDP) + β₂·实利率`:"
              "债务上抬(贬值)、实利率下压(机会成本),两者共同定均衡。"
              "「长端是不是锚」= β₂ 是否在**长期向量**里显著(对 spec §修订)。\n")
-    L.append("**全-I(1) gate (推理)**: Johansen 要求三列同子样本都 I(1);混入 I(0)/ambiguous "
-             "腿会让 rank 与 β₂ 失效,故先 gate 再跑。")
-
-    def _gate_lines(label, n, verdicts):
-        out = [f"- gate 窗口 **{label}** (n={n}),同子样本 c+ct 单整预检:"]
-        for c, cv in verdicts.items():
-            out.append(f"    - `{c}`: **{cv['combined']}** (c={cv['c']}, ct={cv['ct']})")
-        return out
+    L.append("**全-I(1) gate (推理)**: Johansen 要求三列同子样本都 I(1)。**full(拼接)与 clean "
+             "post-TIPS 两个候选窗口都各自 gate + 跑**,再交叉核对(对 spec 的「full vs clean」口径)。\n")
+    for label, g in tri["gates"].items():
+        mark = "通过" if g["passed"] else "未通过"
+        L.append(f"- gate 窗口 **{label}** (n={g['n']}) — **{mark}**;同子样本 c+ct 单整预检:")
+        for c, cv in g["verdicts"].items():
+            L.append(f"    - `{c}`: **{cv['combined']}** (c={cv['c']}, ct={cv['ct']})")
 
     if tri["skip"]:
-        # print BOTH gate windows that were evaluated, each with its OWN n (P2)
-        L.extend(_gate_lines("full (1968+ spliced)", tri["gate_full_n"], tri["gate_full"]))
-        if tri.get("gate_clean"):
-            L.extend(_gate_lines(f"clean TIPS", tri["gate_clean_n"], tri["gate_clean"]))
-        L.append(f"- **skipped (gate 未通过): {tri['skip']}** (推理)")
+        L.append(f"\n- **skipped (无窗口全-I(1)): {tri['skip']}** (推理)")
         return L
 
-    L.extend(_gate_lines(tri["id_window"], tri["pairwise_n"], tri["id_check"]))
-    L.append(f"- **gate 通过窗口: {tri['window']}** — Johansen/VECM 在此窗口估计 (事实)")
-    lag = tri["lag"]
-    L.append(f"- VAR select_order(AIC) p={lag['var_order']} → k_ar_diff={lag['k_ar_diff']} (事实)")
-    L.append("\n点估计 (选定 lag, det_order=0):")
-    L.append(_fmt_johansen(tri["point"]))
-    pt = tri["point"]
-    if pt["betas"] is not None:
-        L.append(f"- 长期向量系数: **β₁(债务)={pt['betas'][0]:.3f}, "
-                 f"β₂(实利率)={pt['betas'][1]:.3f}** (事实)")
-    L.append("\n稳健性网格 (coint_rank / valid_coint / β₁,β₂=betas):")
-    L.append("```")
-    L.append(tri["robust"].to_string(index=False))
-    L.append("```")
-    ranks = tri["rank_set"] or []
-    nf, nc = tri.get("n_failed", 0), tri.get("n_cells", 0)
-    if not tri.get("all_cells_ok", False):
-        rank_verdict = (f"网格 {nf}/{nc} 单元数值失败 → **稳健性不足**,不能宣称全设定稳定;"
-                        f"成功单元 coint_rank∈{ranks}")
-    elif ranks == [1]:
-        rank_verdict = f"coint_rank=1 在 lag∈{list(ROBUST_LAGS)}×det∈{list(ROBUST_DET_ORDERS)} 全设定下**稳定**"
-    elif ranks == [0]:
-        rank_verdict = "coint_rank=0 在所有设定下**稳定** → **无协整**"
-    else:
-        rank_verdict = f"coint_rank ∈ {ranks} **随设定变化(不稳定)**"
-    L.append(f"- **稳健性 (推理): {rank_verdict}**")
+    for w in tri["windows"].values():
+        L.extend(_fmt_window_block(w))
+
+    vmap = {"robust_both": "两个窗口均 robust-unique-rank-1 且一致 → **稳健成立**",
+            "robust_single": "唯一合格窗口 robust-unique-rank-1 → 该窗口内**成立**(另一窗口非全-I(1),无法交叉验证)",
+            "window_sensitive": "**窗口间结论冲突(一个稳健、一个不稳健)→ 样本窗口敏感,不判稳健成立**",
+            "not_robust": "无窗口 robust-unique-rank-1 → **不稳健**"}
+    L.append(f"\n- **跨窗口裁决 (推理): {vmap.get(tri['verdict'], tri['verdict'])}**")
     return L
 
 
-def _fmt_vecm(tri) -> list:
-    L = []
-    L.append("\n## 3. VECM — 实利率在锚里、在偏离里、还是两者皆有?\n")
-    if tri.get("skip") or tri["rank_set"] is None:
-        L.append("- 三变量 Johansen 未运行(gate 未通过),VECM 跳过 (推理)。")
-        return L
-    if tri["vecm"] is None:
-        if tri.get("robust_unique_rank1") and tri.get("vecm_note"):
-            L.append(f"- coint_rank 稳健且唯一=1,但 VECM 未产出: {tri['vecm_note']} (推理)。")
+def _fmt_one_vecm(w) -> list:
+    """Render a single window's VECM long/short-run decomposition + verdict."""
+    import math
+    L = [f"\n### VECM — 窗口 {w['window']}\n"]
+    v = w["vecm"]
+    if v is None:
+        if w["robust_unique_rank1"] and w.get("vecm_note"):
+            L.append(f"- robust-unique-rank-1,但 VECM 未产出: {w['vecm_note']} (推理)。")
         else:
-            L.append(f"- **coint_rank∈{tri['rank_set']} 非「稳健且唯一=1」→ 不估 VECM** "
-                     "(rank>1 时单一协整向量不唯一,β₁/β₂ 不可识别;含失败单元则网格不稳健) (推理)。")
+            L.append(f"- **coint_rank∈{w['rank_set']} 非「稳健且唯一=1」→ 不估 VECM** "
+                     "(rank>1 时向量不唯一;含失败单元/点估计非 1 则不稳健) (推理)。")
         return L
-    v = tri["vecm"]
-    if tri.get("vecm_note"):
-        L.append(f"> {tri['vecm_note']}\n")
+    if w.get("vecm_note"):
+        L.append(f"> {w['vecm_note']}\n")
+    det_s = "" if v.get("coint_det") is None else f", ECT 截距/趋势项 coint_det={[round(x,4) for x in v['coint_det']]}"
     L.append(f"- 设定: coint_rank={v['coint_rank']}, k_ar_diff={v['k_ar_diff']}, "
-             f"deterministic={v['deterministic']}, n_obs={v['n_obs']} (事实)\n")
+             f"deterministic={v['deterministic']}, α={v['alpha_level']}, n_obs={v['n_obs']}{det_s} (事实)\n")
     L.append("**长期协整向量 (gold 归一化, 系数移到 RHS):**")
     for var, b in v["betas"].items():
         sig = "显著" if b["significant"] else "不显著"
         L.append(f"- {var}: β={b['beta']:.4f} (t={b['t']:.2f}, p={b['p']:.3f}, **{sig}**) (事实)")
     ec = v["ec_speed"]
     ec_sig = "显著" if ec["significant"] else "不显著"
-    hl = ""
-    if ec["lambda"] < 0 and ec["significant"]:
-        import math
-        hl = f"; 半衰期≈{math.log(0.5)/math.log(1+ec['lambda']):.1f} 月" if -1 < ec["lambda"] < 0 else ""
+    hl = f"; 半衰期≈{math.log(0.5)/math.log(1+ec['lambda']):.1f} 月" if (-1 < ec["lambda"] < 0 and ec["significant"]) else ""
     L.append(f"\n**误差修正速度 λ (金价方程): {ec['lambda']:.4f}** "
              f"(t={ec['t']:.2f}, p={ec['p']:.3f}, {ec_sig}; λ<0 且显著={ec['corrects']}{hl}) (事实)")
     L.append("\n**短期 Δ 系数 (金价方程):**")
@@ -301,12 +312,9 @@ def _fmt_vecm(tri) -> list:
         L.append(f"{t['var']:<16}{t['lag']:>4}{t['coef']:>10.4f}{t['t']:>8.2f}"
                  f"{t['p']:>8.3f}  {'*' if t['significant'] else ''}")
     L.append("```")
-
-    # the verdict the spec asks for
     b2 = v["betas"].get("real_rate_10y", {})
     long_sig = bool(b2.get("significant"))
-    rr_short = [t for t in v["short_run"] if t["var"] == "real_rate_10y"]
-    short_sig = any(t["significant"] for t in rr_short)
+    short_sig = any(t["significant"] for t in v["short_run"] if t["var"] == "real_rate_10y")
     if long_sig and short_sig:
         verdict = "**两者皆有**: 实利率既在长期锚 (β₂ 显著) 又驱动短期偏离"
     elif long_sig:
@@ -317,6 +325,17 @@ def _fmt_vecm(tri) -> list:
         verdict = "**两者皆不显著**: 实利率长期与短期都不显著 → '长端是锚' 在此线性设定下未获支持"
     L.append(f"\n- **裁决 (推理): {verdict}。** "
              f"(λ {'修正成立' if ec['corrects'] else '不显著/非负→无回归力,存疑'})")
+    return L
+
+
+def _fmt_vecm(tri) -> list:
+    L = []
+    L.append("\n## 3. VECM — 实利率在锚里、在偏离里、还是两者皆有?\n")
+    if tri.get("skip") or not tri["windows"]:
+        L.append("- 三变量 Johansen 未运行(无窗口全-I(1)),VECM 跳过 (推理)。")
+        return L
+    for w in tri["windows"].values():
+        L.extend(_fmt_one_vecm(w))
     return L
 
 
@@ -432,41 +451,51 @@ def _build_report(df, notes, itab, jres, args, rr_segs=None, tri=None) -> str:
     # ── trivariate anchor verdict (PR #2 centerpiece) ──
     if tri is not None:
         L.append("\n### 三变量锚 [金价, 债务/GDP, 实利率] 裁决\n")
-        ranks = tri.get("rank_set")
-        v = tri.get("vecm")
+        verdict = tri.get("verdict")
+        windows = tri.get("windows", {})
         if tri.get("skip"):
-            rr = (tri.get("id_check") or {}).get("real_rate_10y", {})
-            L.append(f"- **全-I(1) gate 未通过(实利率合并判定 {rr.get('combined', '?')})→ "
-                     "三列未同为 I(1),无法构成有效三变量协整 (事实/推理)。** "
-                     "实利率只能进短期 ECM,不报告长期 β₂。")
-            L.append("- ⚠️ **杀死条件触发 (spec 修订版扩展)**: 全样本线性常参数三变量锚因实利率"
-                     "非稳健 I(1) 无法估计 → 留待 regime-switching / 断点协整 (PR #3) (推理)。")
-        elif tri.get("robust_unique_rank1") and v is not None:
-            b2 = v["betas"].get("real_rate_10y", {})
-            ec = v["ec_speed"]
-            long_sig = bool(b2.get("significant"))
-            rr_short = [t for t in v["short_run"] if t["var"] == "real_rate_10y"]
-            short_sig = any(t["significant"] for t in rr_short)
-            where = ("锚里+偏离里" if (long_sig and short_sig) else
-                     "锚里" if long_sig else "偏离里" if short_sig else "都不显著")
-            L.append(f"- **三变量锚稳健成立 (coint_rank 全网格唯一=1, 窗口={tri['window']}) (事实/推理)。** "
-                     f"长期 β₁(债务)={v['betas']['ln_debt_gdp']['beta']:.3f}, "
-                     f"β₂(实利率)={b2.get('beta', float('nan')):.3f} "
-                     f"(p={b2.get('p', float('nan')):.3f}); 误差修正 λ={ec['lambda']:.3f} "
-                     f"(p={ec['p']:.3f}, 修正={ec['corrects']}) (事实)。")
-            L.append(f"- **实利率落点: {where}** (推理) — 回答了 spec §修订的核心问句。")
-        elif ranks == [0] and tri.get("all_cells_ok"):
-            L.append("- **三变量仍 coint_rank=0 全网格稳定 (事实) → 加入实利率后仍无协整。**")
-            L.append("- ⚠️ **杀死条件触发 (spec 修订版条件 1+扩展)**: 线性常参数锚(含实利率)"
-                     "也被证伪 (推理) → 留待 regime-switching / 断点协整 (Gregory-Hansen, PR #3)。")
-        else:
-            nf, nc = tri.get("n_failed", 0), tri.get("n_cells", 0)
-            extra = (f"(网格 {nf}/{nc} 单元数值失败,稳健性不足)" if not tri.get("all_cells_ok")
-                     else "(rank>1 时向量不唯一)")
-            L.append(f"- **三变量 coint_rank∈{ranks} 非「稳健且唯一=1」{extra} (事实) → 协整证据脆弱,"
-                     "不能稳健宣称含实利率的三变量锚成立 (推理)。**")
-            L.append("- ⚠️ **杀死条件触发 (扩展)**: 线性常参数三变量锚不稳健 → "
+            rrs = {lbl: g["verdicts"].get("real_rate_10y", {}).get("combined", "?")
+                   for lbl, g in tri.get("gates", {}).items()}
+            L.append(f"- **无候选窗口三列同为 I(1)(各窗口实利率判定 {rrs})→ 无法构成有效三变量协整 "
+                     "(事实/推理)。** 实利率只能留待未来短期 ECM 设定,不报告长期 β₂。")
+            L.append("- ⚠️ **杀死条件触发 (spec 修订版扩展)**: 线性常参数三变量锚因实利率非稳健 I(1) "
+                     "无法估计 → 留待 regime-switching / 断点协整 (PR #3) (推理)。")
+        elif verdict in ("robust_both", "robust_single"):
+            # report the robust window(s); pick one with a VECM for the placement call
+            wv = next((w for w in windows.values() if w.get("vecm")), None)
+            if wv is None:
+                L.append("- robust-unique-rank-1 但 VECM 未产出(数值问题),见 §3 (推理)。")
+            else:
+                v = wv["vecm"]
+                b2 = v["betas"].get("real_rate_10y", {})
+                ec = v["ec_speed"]
+                long_sig = bool(b2.get("significant"))
+                short_sig = any(t["significant"] for t in v["short_run"] if t["var"] == "real_rate_10y")
+                where = ("锚里+偏离里" if (long_sig and short_sig) else
+                         "锚里" if long_sig else "偏离里" if short_sig else "都不显著")
+                cross = ("两窗口一致" if verdict == "robust_both" else "仅此窗口合格")
+                L.append(f"- **三变量锚成立 ({cross}, 窗口={wv['window']}, coint_rank 全网格唯一=1) (事实/推理)。** "
+                         f"长期 β₁(债务)={v['betas']['ln_debt_gdp']['beta']:.3f}, "
+                         f"β₂(实利率)={b2.get('beta', float('nan')):.3f} "
+                         f"(p={b2.get('p', float('nan')):.3f}); 误差修正 λ={ec['lambda']:.3f} "
+                         f"(p={ec['p']:.3f}, 修正={ec['corrects']}) (事实)。")
+                L.append(f"- **实利率落点: {where}** (推理) — 回答了 spec §修订的核心问句。")
+        elif verdict == "window_sensitive":
+            L.append("- **窗口间结论冲突: 一个窗口稳健 rank=1、另一个不稳健 → 样本窗口敏感,"
+                     "不判三变量锚稳健成立 (事实/推理)。**")
+            L.append("- ⚠️ **杀死条件触发 (扩展)**: 锚结论依赖样本窗口选择 → "
                      "留待 regime-switching / 断点协整 (PR #3)。")
+        else:  # not_robust
+            allzero = all((w["rank_set"] == [0] and w["all_cells_ok"]) for w in windows.values())
+            if allzero:
+                L.append("- **所有合格窗口 coint_rank=0 全网格稳定 (事实) → 加入实利率后仍无协整。**")
+            else:
+                detail = "; ".join(f"{w['window']}:rank∈{w['rank_set']}"
+                                   + ("" if w["all_cells_ok"] else f"({w['n_failed']}/{w['n_cells']}失败)")
+                                   for w in windows.values())
+                L.append(f"- **三变量协整非稳健 ({detail}) → 不能稳健宣称含实利率的三变量锚成立 (推理)。**")
+            L.append("- ⚠️ **杀死条件触发 (spec 修订版条件 1+扩展)**: 线性常参数三变量锚不稳健/无协整 → "
+                     "留待 regime-switching / 断点协整 (Gregory-Hansen, PR #3)。")
 
     L.append("\n- 下一步 (下一 PR) (推测): 若三变量锚成立但 λ/β₂ 边际,或不稳健 → "
              "Gregory-Hansen 断点协整 + regime-switching VECM;并做发布日对齐 + 2022 分解 (spec §3–§4)。")
@@ -485,7 +514,7 @@ def main():
     Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
     Path(ANALYSIS_DIR).mkdir(parents=True, exist_ok=True)
 
-    print("[1/4] Building monthly gold-anchor panel...")
+    print("[1/5] Building monthly gold-anchor panel...")
     panel = build_anchor_panel(start=args.start, end=args.end)
     df = panel.data
     if df.empty:
@@ -502,11 +531,11 @@ def main():
         json.dump(panel.notes, f, indent=2, ensure_ascii=False)
     print(f"  saved → {panel_path}")
 
-    print("[2/4] Unit-root tests (ADF + PP + KPSS)...")
+    print("[2/5] Unit-root tests (ADF + PP + KPSS)...")
     itab = integration_table(df, [c for c in LEVEL_COLS if c in df.columns])
     print(itab.to_string())
 
-    print("[3/4] Johansen cointegration (debt/GDP main; Fed, M2 controls)...")
+    print("[3/5] Johansen cointegration (debt/GDP main; Fed, M2 controls)...")
     # Johansen assumes all series are I(1); the I(1) check is done on the SAME
     # pairwise complete-case subsample Johansen actually uses (not the full
     # column), under both 'c' and 'ct' regressions. Lag is selected per pair.
@@ -558,8 +587,11 @@ def main():
     if tri.get("skip"):
         print(f"  trivariate: skipped — {tri['skip']}")
     else:
-        print(f"  trivariate Johansen: robust ranks={tri['rank_set']}; "
-              f"VECM={'estimated' if tri.get('vecm') else 'not estimated'}")
+        for lbl, w in tri["windows"].items():
+            vm = "VECM✓" if w.get("vecm") else "VECM✗"
+            print(f"  trivariate [{lbl}]: robust ranks={w['rank_set']} "
+                  f"(failed {w['n_failed']}/{w['n_cells']}); {vm}")
+        print(f"  trivariate verdict: {tri['verdict']}")
 
     print("[5/5] Writing analysis report...")
     today = (args.end or datetime.now().strftime("%Y-%m-%d"))

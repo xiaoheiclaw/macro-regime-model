@@ -751,6 +751,13 @@ def estimate_vecm(
             "significant": bool(pb[i] < alpha),
         }
 
+    # deterministic term(s) restricted to the cointegration relation (the ECT
+    # intercept/trend), so the user can reconstruct ECT = G - Σβ_i·X_i + c.
+    # "ci" → one constant; "cili" → constant + linear trend; "n" → none.
+    dcc = getattr(res, "det_coef_coint", None)
+    dcc = np.asarray(dcc) if dcc is not None else None
+    coint_det = [float(x) for x in dcc[:, 0]] if (dcc is not None and dcc.size) else None
+
     ec_speed = {
         "lambda": float(np.asarray(res.alpha)[0, 0]),
         "t": float(np.asarray(res.tvalues_alpha)[0, 0]),
@@ -786,6 +793,7 @@ def estimate_vecm(
         "n_obs": int(len(sub)),
         "beta_normalized": [float(x) for x in beta_norm],
         "betas": betas,
+        "coint_det": coint_det,
         "ec_speed": ec_speed,
         "short_run": short_run,
     }
