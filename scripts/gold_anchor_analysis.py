@@ -78,6 +78,11 @@ def main():
     print("[1/4] Building monthly gold-anchor panel...")
     panel = build_anchor_panel(start=args.start, end=args.end)
     df = panel.data
+    if df.empty:
+        raise ValueError(
+            f"empty panel for start={args.start}, end={args.end} — "
+            "check the date window and upstream data availability"
+        )
     print(f"  panel: {df.shape[0]} months × {df.shape[1]} cols, "
           f"{df.index.min().date()}..{df.index.max().date()}")
 

@@ -53,8 +53,8 @@ def test_random_walk_is_I1():
 
 def test_integration_table_shape():
     df = pd.DataFrame(
-        {"a": _white_noise(300).values, "b": _random_walk(300, seed=3).values},
-        index=pd.date_range("1980-01-31", periods=300, freq="ME"),
+        {"a": _white_noise(600).values, "b": _random_walk(600, seed=3).values},
+        index=pd.date_range("1980-01-31", periods=600, freq="ME"),
     )
     tab = integration_table(df, ["a", "b"])
     assert list(tab.index) == ["a", "b"]
@@ -225,6 +225,25 @@ def test_full_rank_marks_invalid_coint():
     assert j["valid_coint"] is False
     assert j["coint_rank"] == 0
     assert j["beta"] is None
+
+
+def test_to_monthly_ffill_extends_to_quarter_end():
+    from lib.gold_anchor import _to_monthly
+    # quarterly obs dated at quarter START (FRED convention); the Q4 value at
+    # 2025-10-01 must fill Oct/Nov/Dec, not just Oct.
+    idx = pd.to_datetime(["2025-01-01", "2025-04-01", "2025-07-01", "2025-10-01"])
+    m = _to_monthly(pd.Series([1.0, 2.0, 3.0, 4.0], index=idx), "ffill")
+    assert pd.Timestamp("2025-12-31") in m.index
+    assert m.loc["2025-11-30"] == 4.0 and m.loc["2025-12-31"] == 4.0
+
+
+def test_empty_window_returns_empty_panel_without_crashing():
+    # window entirely after the data → empty panel (script guards on .empty)
+    panel = build_anchor_panel(
+        start="2030-01-01", end="2031-01-01",
+        fetch_fn=_synthetic_fred, gold_fetch_fn=_synthetic_gold,
+    )
+    assert panel.data.empty
 
 
 def test_end_month_boundary_includes_month_end():

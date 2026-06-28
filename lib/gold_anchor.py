@@ -12,9 +12,12 @@ Implements steps 0–1 of docs/gold-anchor-vecm-spec.md:
 
 Design notes
 ------------
-* All anchors are divided by GDP (the debasement mechanism is "fiat claims
-  relative to real output"); raw stock levels would re-create the
-  "two rising lines colliding" spurious correlation the spec warns about.
+* All anchors are divided by **nominal** GDP (FRED `GDP`), i.e. the conventional
+  debt-to-GDP / M2-to-GDP ratio — a nominal stock over a nominal flow. The
+  debasement motivation is "fiat claims relative to output"; we keep both
+  numerator and denominator nominal (a real-GDP `GDPC1` denominator would mix a
+  real flow with a nominal stock). Dividing by output is what stops raw stock
+  levels from re-creating the "two rising lines colliding" spurious correlation.
 * Gold is kept *nominal*; price level is absorbed by CPI/anchor (spec §0).
 * The 10y TIPS real rate (FRED DFII10, constant maturity) only starts 2003.
   For a longer sample we splice a pre-TIPS proxy = 10y nominal (GS10) −
@@ -138,16 +141,21 @@ def _parse_month_boundary(x: str, side: str) -> pd.Timestamp:
     return ts
 
 
-def _to_monthly(s: pd.Series, how: str = "mean") -> pd.Series:
+def _to_monthly(s: pd.Series, how: str = "mean", fill_period: str = "Q") -> pd.Series:
     """Resample a series to month-end. ``mean`` for noisy daily levels/rates,
-    ``last`` for end-of-period stocks, ``ffill`` for lower-frequency series."""
+    ``last`` for end-of-period stocks, ``ffill`` for lower-frequency series.
+
+    For ``ffill`` the value of the last observation is carried to the END of
+    its native period (``fill_period``, default "Q"), so e.g. a Q4 GDP/debt
+    reading dated 2025-10-01 fills Oct/Nov/Dec rather than only Oct."""
     s = s.sort_index()
+    if s.dropna().empty:
+        return pd.Series(dtype="float64")
     if how == "ffill":
-        # reindex onto a month-end grid, carrying the last known value forward.
-        # extend the grid to the month-end of the last obs so a quarter whose
-        # observation is dated at the quarter *start* isn't dropped.
         start = s.index.min().to_period("M").to_timestamp("M")
-        end = s.index.max().to_period("M").to_timestamp("M")
+        # extend the grid to the month-end of the last obs's full period (quarter)
+        end = s.index.max().to_period(fill_period).to_timestamp(how="end").normalize()
+        end = end.to_period("M").to_timestamp("M")
         idx = pd.date_range(start, end, freq="ME")
         return s.reindex(s.index.union(idx)).ffill().reindex(idx)
     rule = s.resample("ME")
@@ -225,9 +233,10 @@ def build_anchor_panel(
     # enforce the [start, end] contract on the final panel — injected fetchers
     # may not honor `start`, and lower-freq ffill grids can predate it.
     # year-month inputs snap to month edges (end="2025-12" includes 2025-12-31).
-    df = df[df.index >= _parse_month_boundary(start, "start")]
-    if end is not None:
-        df = df[df.index <= _parse_month_boundary(end, "end")]
+    if not df.empty:
+        df = df[df.index >= _parse_month_boundary(start, "start")]
+        if end is not None:
+            df = df[df.index <= _parse_month_boundary(end, "end")]
 
     # provenance / coverage notes
     def _cov(s: pd.Series) -> str:
@@ -237,6 +246,10 @@ def build_anchor_panel(
         return f"{sv.index.min().date()}..{sv.index.max().date()} (n={len(sv)})"
 
     notes["units"] = "debt & fed_assets rescaled $M→$B; gdp,m2 already $B."
+    notes["anchor_definition"] = (
+        "anchors = stock / NOMINAL GDP (FRED GDP, $B SAAR) — conventional "
+        "debt-to-GDP / M2-to-GDP / Fed-to-GDP ratios (nominal over nominal)."
+    )
     notes["frequency"] = (
         "monthly (ME). gold/monthly→last; daily rates→mean; weekly stocks→last; "
         "quarterly (debt, gdp)→ffill within quarter."
@@ -426,6 +439,11 @@ def johansen_test(
 
     # cointegrating vector = first eigenvector, normalized on gold (col 0)
     vec = res.evec[:, 0]
+    if abs(vec[0]) < 1e-12:
+        raise ValueError(
+            f"johansen_test: cannot normalize cointegrating vector on gold — "
+            f"near-zero loading {vec[0]:.2e} for {cols} (n_obs={len(sub)})"
+        )
     norm = vec / vec[0]
     # G = α + β·A  ⇒  G - β·A ~ I(0); evec row encodes G + c1*A, so β = -c1
     # (coefficient on the anchor moved to the RHS). β is only a long-run
