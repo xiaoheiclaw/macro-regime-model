@@ -52,7 +52,10 @@ def _fmt_johansen(j: dict) -> str:
         lines.append("- ⚠️ **full-rank** (raw rank = n): series look stationary / model assumptions "
                      "may not hold — this is NOT evidence the anchor holds.")
     lines.append(f"- cointegrating vector (normalized on gold): {[round(x,4) for x in j['coint_vector_normalized']]}")
-    lines.append(f"- **long-run elasticity β = {j['beta']:.4f}** (gold vs anchor)")
+    if j["beta"] is None:
+        lines.append("- **long-run elasticity β = n/a** (no valid cointegrating relation)")
+    else:
+        lines.append(f"- **long-run elasticity β = {j['beta']:.4f}** (gold vs anchor)")
     return "\n".join(lines)
 
 
@@ -91,7 +94,8 @@ def main():
             continue
         j = johansen_test(df, ["ln_gold_nominal", lncol])
         jres[key] = (label, j)
-        print(f"  {label}: rank={j['rank']}, β={j['beta']:.3f}, n={j['n_obs']}")
+        beta_s = "n/a" if j["beta"] is None else f"{j['beta']:.3f}"
+        print(f"  {label}: rank={j['rank']}, β={beta_s}, n={j['n_obs']}")
 
     print("[4/4] Writing analysis report...")
     today = (args.end or datetime.now().strftime("%Y-%m-%d"))
@@ -151,10 +155,12 @@ def _build_report(df, notes, itab, jres, args) -> str:
     for key in ("fed_gdp", "m2_gdp"):
         if key in jres:
             label, j = jres[key]
-            L.append(f"- 对照 {label}: rank={j['rank']}, β={j['beta']:.3f}。")
+            beta_s = "n/a" if j["beta"] is None else f"{j['beta']:.3f}"
+            L.append(f"- 对照 {label}: rank={j['rank']}, β={beta_s}。")
     L.append("\n- 下一步 (下一 PR): 对协整成立的锚估 VECM,看误差修正项 λ 是否显著、"
              "实利率 δ 是否在偏离项里现形,并做 2022 分解 (spec §2–§3)。")
-    L.append("\n> 所有 β≈1 / I(d) 判定为本次样本的 (事实);其经济含义与未来路径为 (推理)/(推测)。")
+    L.append("\n> Claim types: 检验统计量与样本 β 估计值为 (事实);I(d) 判定、协整成立与否、"
+             "「β≈1 支持纯贬值假说」等模型判读为 (推理);未来路径与机制故事为 (推测)。")
     return "\n".join(L) + "\n"
 
 

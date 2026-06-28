@@ -21,12 +21,9 @@ from lib.gold_anchor import (
     unit_root_tests,
 )
 
-RNG = np.random.default_rng(12345)
-
-
-def _white_noise(n=400):
+def _white_noise(n=400, seed=12345):
     idx = pd.date_range("1980-01-31", periods=n, freq="ME")
-    return pd.Series(RNG.standard_normal(n), index=idx)
+    return pd.Series(np.random.default_rng(seed).standard_normal(n), index=idx)
 
 
 def _random_walk(n=400, drift=0.0, seed=1):

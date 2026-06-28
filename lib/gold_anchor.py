@@ -76,7 +76,8 @@ def _fred_api_key() -> Optional[str]:
     for p in ["~/.fred_api_key", "~/.config/fred/api_key"]:
         fp = os.path.expanduser(p)
         if os.path.exists(fp):
-            return open(fp).read().strip()
+            with open(fp, encoding="utf-8") as f:
+                return f.read().strip()
     return None
 
 
@@ -123,8 +124,12 @@ def _to_monthly(s: pd.Series, how: str = "mean") -> pd.Series:
     ``last`` for end-of-period stocks, ``ffill`` for lower-frequency series."""
     s = s.sort_index()
     if how == "ffill":
-        # reindex onto a month-end grid, carrying the last known value forward
-        idx = pd.date_range(s.index.min(), s.index.max(), freq="ME")
+        # reindex onto a month-end grid, carrying the last known value forward.
+        # extend the grid to the month-end of the last obs so a quarter whose
+        # observation is dated at the quarter *start* isn't dropped.
+        start = s.index.min().to_period("M").to_timestamp("M")
+        end = s.index.max().to_period("M").to_timestamp("M")
+        idx = pd.date_range(start, end, freq="ME")
         return s.reindex(s.index.union(idx)).ffill().reindex(idx)
     rule = s.resample("ME")
     return rule.mean() if how == "mean" else rule.last()
@@ -210,7 +215,7 @@ def build_anchor_panel(
 
     notes["units"] = "debt & fed_assets rescaled $M→$B; gdp,m2 already $B."
     notes["frequency"] = (
-        "monthly (ME). daily→mean (gold, rates), weekly/monthly stocks→last, "
+        "monthly (ME). gold/monthly→last; daily rates→mean; weekly stocks→last; "
         "quarterly (debt, gdp)→ffill within quarter."
     )
     fed_raw = raw["fed_assets"].dropna()
@@ -230,7 +235,8 @@ def unit_root_tests(series: pd.Series, regression: str = "c") -> Dict[str, float
 
     ADF/PP null = unit root (I(1)); KPSS null = stationarity (I(0)).
     """
-    from statsmodels.tsa.stattools import InterpolationWarning, adfuller, kpss
+    from statsmodels.tsa.stattools import adfuller, kpss
+    from statsmodels.tools.sm_exceptions import InterpolationWarning
     from arch.unitroot import PhillipsPerron
 
     x = pd.Series(series).dropna().astype(float)
@@ -267,16 +273,14 @@ def classify_integration(series: pd.Series, alpha: float = 0.05) -> Dict[str, ob
     pp_rej = lvl["pp_pvalue"] < alpha
     kpss_rej = lvl["kpss_pvalue"] < alpha
 
-    stationary_votes = int(adf_rej) + int(pp_rej) + int(not kpss_rej)
-    if stationary_votes >= 2 and (adf_rej or pp_rej):
-        # ADF/PP reject unit root AND KPSS fails to reject stationarity → I(0)
+    if adf_rej and pp_rej and not kpss_rej:
+        # both ADF & PP reject unit root AND KPSS fails to reject stationarity
         verdict = "I(0)"
     elif (not adf_rej) and (not pp_rej) and kpss_rej:
-        # ADF/PP fail to reject unit root AND KPSS rejects stationarity → I(1)
+        # ADF & PP fail to reject unit root AND KPSS rejects stationarity
         verdict = "I(1)"
     else:
-        # everything else (incl. ADF/PP/KPSS all fail to reject = low power /
-        # inconclusive, and ADF↔PP↔KPSS disagreement) is genuinely ambiguous
+        # any disagreement, or all-fail (low power / inconclusive) → ambiguous
         verdict = "ambiguous"
 
     res: Dict[str, object] = {"verdict": verdict, "levels": lvl}
@@ -368,8 +372,12 @@ def johansen_test(
     vec = res.evec[:, 0]
     norm = vec / vec[0]
     # G = α + β·A  ⇒  G - β·A ~ I(0); evec row encodes G + c1*A,
-    # so β = -c1 (coefficient on the anchor moved to the RHS).
-    beta = float(-norm[1]) if n >= 2 else float("nan")
+    # so β = -c1 (coefficient on the anchor moved to the RHS). β is only a
+    # long-run elasticity when a valid cointegrating relation exists — None
+    # otherwise (rank 0 = no anchor; full rank = stationary/assumptions fail).
+    rank = min(trace_rank, maxeig_rank)
+    valid_coint = (rank >= 1) and (not full_rank_stationary)
+    beta = float(-norm[1]) if (valid_coint and n >= 2) else None
 
     return {
         "columns": list(columns),
@@ -381,7 +389,7 @@ def johansen_test(
         "raw_maxeig_rank": int(raw_maxeig_rank),
         "trace_rank": int(trace_rank),
         "maxeig_rank": int(maxeig_rank),
-        "rank": int(min(trace_rank, maxeig_rank)),
+        "rank": int(rank),
         "full_rank_stationary": bool(full_rank_stationary),
         "coint_vector_normalized": [float(x) for x in norm],
         "beta": beta,
