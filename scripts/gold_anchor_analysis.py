@@ -231,11 +231,15 @@ def _run_trivariate(df, notes) -> dict:
     flags = [w["anchor_robust"] for w in entry["windows"].values()]
     if len(flags) >= 2:
         if all(flags):
-            # both windows anchor-robust → require their VECM "placement" to AGREE
-            # (β₂ sign+significance, λ corrects, where) before claiming robust_both;
-            # rank-1 in both windows with different long-run vectors is NOT robust.
-            sigs = {_vecm_signature(w["vecm"]) for w in entry["windows"].values() if w.get("vecm")}
-            entry["verdict"] = "robust_both" if len(sigs) <= 1 else "window_sensitive"
+            # both windows anchor-robust → require EVERY window to have a VECM and
+            # all their "placement" signatures to AGREE before claiming robust_both.
+            # If an anchor-robust window's VECM failed (None signature), we cannot
+            # confirm agreement → window_sensitive, NOT a silent robust_both.
+            sigs = [_vecm_signature(w["vecm"]) for w in entry["windows"].values()]
+            if any(s is None for s in sigs):
+                entry["verdict"] = "window_sensitive"
+            else:
+                entry["verdict"] = "robust_both" if len(set(sigs)) == 1 else "window_sensitive"
         elif any(flags):
             entry["verdict"] = "window_sensitive"
         else:
@@ -247,16 +251,26 @@ def _run_trivariate(df, notes) -> dict:
 
 def _vecm_signature(v):
     """Cross-window comparable 'placement' of the real rate: (β₂ sign, β₂
-    significant, λ corrects, where). Two windows are consistent iff equal."""
+    significant, λ corrects, where, short-run Δreal_rate sign pattern). Two
+    windows are consistent iff equal. The short-run sign pattern is included so
+    that two windows whose Δreal_rate is significant with OPPOSITE sign are
+    flagged as conflicting (a direction reversal is a real disagreement)."""
     if v is None:
         return None
     b2 = v["betas"].get("real_rate_10y", {})
     b2b = b2.get("beta", 0.0)
     b2_sign = 1 if b2b > 0 else -1 if b2b < 0 else 0
-    short_sig = any(t["significant"] for t in v["short_run"] if t["var"] == "real_rate_10y")
+    rr_short = [t for t in v["short_run"] if t["var"] == "real_rate_10y"]
+    short_sig = any(t["significant"] for t in rr_short)
+    # per-lag sign of the SIGNIFICANT short-run Δreal_rate terms (direction matters)
+    short_sign_pattern = tuple(
+        (t["lag"], 1 if t.get("coef", 0.0) > 0 else -1 if t.get("coef", 0.0) < 0 else 0)
+        for t in rr_short if t["significant"]
+    )
     where = ("both" if (b2.get("significant") and short_sig) else
              "anchor" if b2.get("significant") else "deviation" if short_sig else "neither")
-    return (b2_sign, bool(b2.get("significant")), bool(v["ec_speed"]["corrects"]), where)
+    return (b2_sign, bool(b2.get("significant")), bool(v["ec_speed"]["corrects"]),
+            where, short_sign_pattern)
 
 
 def _fmt_window_block(w) -> list:

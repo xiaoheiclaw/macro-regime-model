@@ -487,11 +487,12 @@ def test_vecm_signature_distinguishes_placement():
     # λ-correction) → different signatures → would be flagged window_sensitive.
     from scripts.gold_anchor_analysis import _vecm_signature
 
-    def fake(beta2, b2_sig, lam_corrects, rr_short_sig):
+    def fake(beta2, b2_sig, lam_corrects, rr_short_sig, rr_coef=-0.1):
         return {
             "betas": {"real_rate_10y": {"beta": beta2, "significant": b2_sig}},
             "ec_speed": {"corrects": lam_corrects},
-            "short_run": [{"var": "real_rate_10y", "lag": 1, "significant": rr_short_sig}],
+            "short_run": [{"var": "real_rate_10y", "lag": 1,
+                           "coef": rr_coef, "significant": rr_short_sig}],
         }
 
     base = _vecm_signature(fake(-0.5, True, True, False))
@@ -500,6 +501,10 @@ def test_vecm_signature_distinguishes_placement():
     assert base == same          # consistent → robust_both allowed
     assert base != flip          # inconsistent → window_sensitive
     assert _vecm_signature(None) is None
+    # significant Δreal_rate with OPPOSITE sign → conflicting signatures
+    pos = _vecm_signature(fake(-0.5, False, True, True, rr_coef=+0.2))
+    neg = _vecm_signature(fake(-0.5, False, True, True, rr_coef=-0.2))
+    assert pos != neg
 
 
 def test_estimate_vecm_alpha_threshold_propagates():
