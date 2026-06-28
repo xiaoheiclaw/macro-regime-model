@@ -28,6 +28,7 @@ from lib.gold_anchor import (
     build_anchor_panel,
     combined_verdict,
     estimate_vecm,
+    gregory_hansen_min_obs,
     gregory_hansen_test,
     integration_segments,
     integration_table,
@@ -435,8 +436,10 @@ def _run_gregory_hansen(df, notes) -> dict:
     for key, label, ycol, xcols, sub in systems:
         entry = {"label": label, "y": ycol, "x": xcols, "models": {}, "skip": None}
         usable = sub[[ycol] + xcols].dropna()
-        if len(usable) < 60:
-            entry["skip"] = f"too few complete rows (n={len(usable)})"
+        # gate on the SAME bound the lib enforces (no divergent magic threshold).
+        need = gregory_hansen_min_obs(len(xcols))
+        if len(usable) < need:
+            entry["skip"] = f"too few complete rows (n={len(usable)} < {need})"
             out["systems"][key] = entry
             continue
         for model in GH_MODELS:
@@ -510,27 +513,62 @@ def _fmt_gregory_hansen(gh_res: dict) -> list:
     return L
 
 
-def _gh_verdict_lines(gh_res: dict) -> list:
-    """Honest GH verdict + kill condition (spec §杀死条件 extension)."""
-    L = []
-    L.append("\n### Gregory-Hansen 裁决(诚实)\n")
-    any_reject_overall = False
-    near_0822 = []  # breaks landing near 2008 / 2022
-    for key, e in gh_res["systems"].items():
+def _gh_summary(gh_res: dict) -> dict:
+    """Tally GH cells: how many system×model COMPLETED, how many were skipped/
+    errored, and whether any completed cell rejected 'no cointegration'. Shared
+    by the verdict block and the next-step text so they never disagree."""
+    any_reject = False
+    n_completed = 0
+    n_incomplete = 0
+    for e in gh_res["systems"].values():
         if e.get("skip"):
-            L.append(f"- **{e['label']}: skipped ({e['skip']})** (推理)。")
+            n_incomplete += len(GH_MODELS)
             continue
-        sys_rejects = []
         for model in GH_MODELS:
             gh = e["models"].get(model)
             if gh is None or "error" in gh:
-                L.append(f"- {e['label']} · {GH_MODEL_LABEL[model]}: "
-                         f"未产出/出错 (推理)。")
+                n_incomplete += 1
                 continue
+            n_completed += 1
+            if any(gh[s]["reject_no_coint"] for s in ("adf", "zt", "zalpha")):
+                any_reject = True
+    return {"any_reject": any_reject, "n_completed": n_completed,
+            "n_incomplete": n_incomplete}
+
+
+def _gh_verdict_lines(gh_res: dict) -> list:
+    """Honest GH verdict + kill condition (spec §杀死条件 extension).
+
+    The kill condition ("even a single-break linear anchor is rejected") may ONLY
+    fire when EVERY required system × model actually COMPLETED and none rejected.
+    A skipped or errored cell is NOT evidence of "no rejection" — treating it as
+    such would falsely trigger the kill condition. So we track completed / failed
+    / skipped explicitly and, if any required cell is missing, report the verdict
+    as **inconclusive** instead of killing the linear anchor."""
+    L = []
+    L.append("\n### Gregory-Hansen 裁决(诚实)\n")
+    any_reject_overall = False
+    n_completed = 0
+    n_incomplete = 0  # skipped systems + errored/missing models
+    near_0822 = []  # breaks landing near 2008 / 2022
+    for key, e in gh_res["systems"].items():
+        if e.get("skip"):
+            # a skipped system carries len(GH_MODELS) un-run cells
+            n_incomplete += len(GH_MODELS)
+            L.append(f"- **{e['label']}: skipped ({e['skip']})** → 该系统未参与裁决 (推理)。")
+            continue
+        for model in GH_MODELS:
+            gh = e["models"].get(model)
+            if gh is None or "error" in gh:
+                n_incomplete += 1
+                err = (gh or {}).get("error", "未产出")
+                L.append(f"- {e['label']} · {GH_MODEL_LABEL[model]}: "
+                         f"**{err} → 不计入裁决(测试未产出≠不拒绝)** (推理)。")
+                continue
+            n_completed += 1
             rejecters = [s for s in ("adf", "zt", "zalpha") if gh[s]["reject_no_coint"]]
             if rejecters:
                 any_reject_overall = True
-                sys_rejects.append(model)
                 bdate = gh["adf"]["break_date"]
                 bstats = ", ".join(s.upper() for s in rejecters)
                 L.append(f"- **{e['label']} · {GH_MODEL_LABEL[model]}: 拒绝「无协整」"
@@ -554,7 +592,18 @@ def _gh_verdict_lines(gh_res: dict) -> list:
         L.append("- **对照普通 Johansen (PR #2)**: 普通常参数 Johansen 测不出稳健协整,"
                  "但允许单一断点的 GH 能在上述设定下拒绝「无协整」→ **锚是「分段存在」的**:"
                  "协整关系在断点前后各自成立、但向量本身发生了位移,这正是常参数检验失败的原因 (推理)。")
+        if n_incomplete:
+            L.append(f"- ⚠️ 注:有 {n_incomplete} 个 system×model 单元被跳过/出错,未纳入裁决 "
+                     "(推理)。")
+    elif n_completed == 0:
+        L.append("- **GH 结果不完整:无任何 system×model 成功产出 → 结论 inconclusive,"
+                 "不触发杀死条件** (推理)。检查样本长度 / 数据可得性。")
+    elif n_incomplete > 0:
+        L.append(f"- **GH 结果不完整({n_completed} 成功 / {n_incomplete} 跳过或出错):"
+                 "已完成的单元均不拒绝「无协整」,但并非所有必需设定都产出 → 结论 "
+                 "inconclusive,不触发杀死条件** (推理)。补齐缺失单元后再下定论。")
     else:
+        # every required system×model completed AND none rejected
         L.append("- **对照普通 Johansen (PR #2)**: 普通 Johansen 测不出协整,GH 允许单一断点后"
                  "**仍测不出** → 连「单断点线性锚」也被否定 (推理)。")
         L.append("- ⚠️ **杀死条件触发 (spec §杀死条件扩展)**: 双变量与三变量、level 与 regime "
@@ -732,8 +781,21 @@ def _build_report(df, notes, itab, jres, args, rr_segs=None, tri=None, gh_res=No
             L.append("- ⚠️ **杀死条件触发 (spec 修订版条件 1+扩展)**: 线性常参数三变量锚不稳健/无协整 → "
                      "留待 regime-switching / 断点协整 (Gregory-Hansen, PR #3)。")
 
-    L.append("\n- 下一步 (下一 PR) (推测): GH 断点协整若成立则进入 regime-switching/TVP VECM 估时变锚;"
-             "若 GH 也证伪线性单断点锚 → 直接上 Markov-switching / TVP (PR #4);并做发布日对齐 + 2022 分解 (spec §3–§4)。")
+    if gh_res is not None:
+        s = _gh_summary(gh_res)
+        if s["any_reject"]:
+            nxt = ("GH 已在部分设定下拒绝「无协整」(断点调整后协整成立) → 下一步进入 "
+                   "regime-switching/TVP VECM 估时变锚 + 在 GH 断点处分段估 VECM (PR #4)")
+        elif s["n_completed"] == 0 or s["n_incomplete"] > 0:
+            nxt = ("GH 结果不完整(部分 system×model 跳过/出错)→ 下一步先补齐缺失单元(放宽样本/"
+                   "数据),再据完整结果决定是否转 Markov-switching / TVP (PR #4)")
+        else:
+            nxt = ("GH 在全部设定下均不拒绝「无协整」(线性单断点锚已证伪)→ 下一步直接上 "
+                   "Markov-switching / TVP 时变参数协整 (PR #4)")
+        L.append(f"\n- 下一步 (下一 PR) (推测): {nxt};并做发布日对齐 + 2022 分解 (spec §3–§4)。")
+    else:
+        L.append("\n- 下一步 (下一 PR) (推测): 运行 GH 断点协整后据结果决定 regime-switching/TVP "
+                 "路径;并做发布日对齐 + 2022 分解 (spec §3–§4)。")
     L.append("\n> Claim types: 检验统计量与样本 β 估计值为 (事实);I(d) 判定、协整成立与否、"
              "「β≈1 支持纯贬值假说」等模型判读为 (推理);未来路径与机制故事为 (推测)。")
     return "\n".join(L) + "\n"

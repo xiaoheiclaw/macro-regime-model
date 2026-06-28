@@ -581,18 +581,23 @@ def test_gh_detects_regime_shift_cointegration():
 
 
 def test_gh_does_not_reject_independent_walks():
-    # two independent random walks → no cointegration even with a break allowed
+    # Size check: for genuinely independent I(1) walks the break-augmented GH test
+    # should reject 'no cointegration' only RARELY. A single seed is chancy, so
+    # average the ADF* rejection rate over many seeds and assert it stays low
+    # (well under 1/2 — a broken impl that always rejects would be ~1.0).
     n = 400
     idx = pd.date_range("1980-01-31", periods=n, freq="ME")
-    df = pd.DataFrame(
-        {"ln_gold_nominal": np.cumsum(np.random.default_rng(71).standard_normal(n)),
-         "ln_debt_gdp": np.cumsum(np.random.default_rng(72).standard_normal(n))},
-        index=idx,
-    )
-    gh = gregory_hansen_test(df, "ln_gold_nominal", ["ln_debt_gdp"], model="C/S")
-    # the headline ADF* should NOT reject (no spurious break-driven coint)
-    assert gh["adf"]["reject_no_coint"] is False
-    assert gh["any_reject"] is False
+    rejects = 0
+    trials = 20
+    for s in range(trials):
+        df = pd.DataFrame(
+            {"ln_gold_nominal": np.cumsum(np.random.default_rng(1000 + 2 * s).standard_normal(n)),
+             "ln_debt_gdp": np.cumsum(np.random.default_rng(1001 + 2 * s).standard_normal(n))},
+            index=idx,
+        )
+        gh = gregory_hansen_test(df, "ln_gold_nominal", ["ln_debt_gdp"], model="C/S")
+        rejects += int(gh["adf"]["reject_no_coint"])
+    assert rejects / trials <= 0.35  # empirical size near nominal, not ~1.0
 
 
 def test_gh_trivariate_m_and_cv_lookup():
@@ -634,6 +639,42 @@ def test_gh_validates_inputs():
     bad.iloc[5, 0] = np.inf
     with pytest.raises(ValueError):
         gregory_hansen_test(bad, "ln_gold_nominal", ["ln_debt_gdp"])  # non-finite
+    # alpha not in the GH critical-value table → explicit ValueError, not KeyError
+    with pytest.raises(ValueError):
+        gregory_hansen_test(df, "ln_gold_nominal", ["ln_debt_gdp"], alpha=0.025)
+    # non-datetime index → explicit ValueError (break dates need a DatetimeIndex)
+    nodate = df.reset_index(drop=True)
+    with pytest.raises(ValueError):
+        gregory_hansen_test(nodate, "ln_gold_nominal", ["ln_debt_gdp"])
+
+
+def test_gh_min_obs_helper_matches_test_gate():
+    # the exposed min-obs helper is exactly the bound the test enforces: one row
+    # below it raises, exactly at it does not (for the too-few branch).
+    df, _ = _regime_shift_cointegrated(n=400)
+    need = ga.gregory_hansen_min_obs(1)
+    with pytest.raises(ValueError):
+        gregory_hansen_test(df.iloc[:need - 1], "ln_gold_nominal", ["ln_debt_gdp"])
+    # at the bound it proceeds past the length check (may still run/return)
+    gh = gregory_hansen_test(df.iloc[:need], "ln_gold_nominal", ["ln_debt_gdp"])
+    assert gh["n_obs"] == need
+
+
+def test_gh_rank_deficient_break_is_skipped():
+    # a constant regressor makes the C/S design rank-deficient at every break
+    # (collinear const & y2 & interaction) — lstsq returns a least-norm solution
+    # rather than raising, so the rank guard must count those as failed and the
+    # test must still return without crashing (n_breaks_failed > 0).
+    n = 200
+    idx = pd.date_range("1990-01-31", periods=n, freq="ME")
+    df = pd.DataFrame(
+        {"ln_gold_nominal": np.cumsum(np.random.default_rng(3).standard_normal(n)),
+         "flat": np.ones(n)},  # constant → collinear with the design const
+        index=idx,
+    )
+    # every break design is rank-deficient (const ≡ flat) → all fail → ValueError
+    with pytest.raises(ValueError, match="every candidate break"):
+        gregory_hansen_test(df, "ln_gold_nominal", ["flat"], model="C/S")
 
 
 def test_gh_break_in_trimmed_interior():

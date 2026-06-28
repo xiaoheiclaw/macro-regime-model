@@ -870,6 +870,14 @@ _GH_CV = {
 }
 
 
+def gregory_hansen_min_obs(m: int, max_lag: int = 6) -> int:
+    """Minimum complete rows ``gregory_hansen_test`` requires for ``m`` regressors
+    and ``max_lag`` ADF augmentation. Exposed so callers gate on the SAME bound
+    the test enforces internally (no divergent magic thresholds)."""
+    n_params_cs = 2 + 2 * m  # the largest design (C/S)
+    return max(40, 4 * (n_params_cs + max_lag))
+
+
 def _gh_critical_values(model: str, m: int, stat: str) -> Optional[Dict[float, float]]:
     """GH (1996) Table 1 critical values for ``model`` (C / C/T / C/S), ``m``
     I(1) regressors, and ``stat`` ('adf'/'zt' share a table; 'zalpha' its own).
@@ -992,15 +1000,25 @@ def gregory_hansen_test(
         raise ValueError(f"model must be one of {sorted(_GH_CV)}, got {model!r}")
     if not (0.0 < trim < 0.5):
         raise ValueError(f"trim must be in (0, 0.5), got {trim}")
+    # CVs are tabulated only at 1/5/10% — index without an implicit KeyError.
+    if alpha not in (0.01, 0.05, 0.10):
+        raise ValueError(
+            f"alpha must be one of {{0.01, 0.05, 0.10}} (GH Table 1 levels), got {alpha}")
 
     cols = [y_col] + x_cols
     sub = df[cols].dropna()
+    # break_date reporting needs a datetime index; validate up front, not via a
+    # late AttributeError deep in _pack().
+    if not isinstance(sub.index, pd.DatetimeIndex):
+        raise ValueError(
+            "gregory_hansen_test requires a DatetimeIndex (break dates are "
+            f"reported from it); got {type(sub.index).__name__}")
     if not np.isfinite(sub.values).all():
         raise ValueError(f"gregory_hansen_test got non-finite values in {cols}")
     T = len(sub)
     # need enough rows so each regime can fit the design and the ADF* lags.
     n_params_cs = 2 + 2 * m  # the largest design (C/S)
-    min_obs = max(40, 4 * (n_params_cs + max_lag))
+    min_obs = gregory_hansen_min_obs(m, max_lag)
     if T < min_obs:
         raise ValueError(
             f"gregory_hansen_test needs >={min_obs} complete rows for {cols}, "
@@ -1031,10 +1049,16 @@ def gregory_hansen_test(
     n_failed = 0
     for k in range(lo, hi + 1):
         X = _gh_design(y2, k, model)
-        # OLS via lstsq (design can be near-collinear at extreme breaks → skip)
+        # OLS via lstsq. A rank-deficient design (collinear break regressors at
+        # extreme breaks) does NOT raise — lstsq returns a least-norm solution on
+        # an unidentified model. Detect it via the returned rank and skip, so an
+        # unidentified break never enters the min-statistic search.
         try:
-            coef, *_ = np.linalg.lstsq(X, y, rcond=None)
+            coef, _res, rank, _sv = np.linalg.lstsq(X, y, rcond=None)
         except np.linalg.LinAlgError:
+            n_failed += 1
+            continue
+        if rank < X.shape[1]:
             n_failed += 1
             continue
         resid = y - X @ coef
@@ -1084,7 +1108,10 @@ def gregory_hansen_test(
     k_star = best["adf"]["k"]
     if k_star is not None:
         Xs = _gh_design(y2, k_star, model)
-        coef, *_ = np.linalg.lstsq(Xs, y, rcond=None)
+        coef, _res, rank_s, _sv = np.linalg.lstsq(Xs, y, rcond=None)
+    else:
+        rank_s = 0
+    if k_star is not None and rank_s >= Xs.shape[1]:
         mu1 = float(coef[0])
         mu2 = float(coef[1])
         if model == "C/S":
