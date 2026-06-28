@@ -16,9 +16,11 @@ Design notes
   relative to real output"); raw stock levels would re-create the
   "two rising lines colliding" spurious correlation the spec warns about.
 * Gold is kept *nominal*; price level is absorbed by CPI/anchor (spec §0).
-* The 10y TIPS real rate (DFII10) only starts 1997. For a longer sample we
-  splice a pre-1997 proxy = 10y nominal (GS10) − trailing 12m CPI inflation
-  and record the splice break explicitly (a known weakness, spec §0).
+* The 10y TIPS real rate (FRED DFII10, constant maturity) only starts 2003.
+  For a longer sample we splice a pre-TIPS proxy = 10y nominal (GS10) −
+  trailing 12m CPI inflation and record the splice break explicitly (a known
+  weakness, spec §0). The spec's "1997" refers to TIPS issuance generally, not
+  this DFII10 series.
 * Data fetching is injectable (``fetch_fn``) so tests run offline on synthetic
   series with no network/key dependency.
 """
@@ -203,6 +205,9 @@ def build_anchor_panel(
     for col in ["gold_nominal", "debt_gdp", "m2_gdp", "fed_gdp"]:
         df[f"ln_{col}"] = np.log(df[col])
 
+    # enforce the [start, end] contract on the final panel — injected fetchers
+    # may not honor `start`, and lower-freq ffill grids can predate it.
+    df = df[df.index >= pd.Timestamp(start)]
     if end is not None:
         df = df[df.index <= pd.Timestamp(end)]
 
@@ -258,6 +263,16 @@ def unit_root_tests(series: pd.Series, regression: str = "c") -> Dict[str, float
     return out
 
 
+def _is_stationary(tests: Dict[str, float], alpha: float = 0.05) -> bool:
+    """Strict I(0) test: ADF & PP both reject a unit root AND KPSS fails to
+    reject stationarity."""
+    return (
+        tests["adf_pvalue"] < alpha
+        and tests["pp_pvalue"] < alpha
+        and tests["kpss_pvalue"] >= alpha
+    )
+
+
 def classify_integration(series: pd.Series, alpha: float = 0.05) -> Dict[str, object]:
     """Classify a series as I(0) / I(1) / ambiguous by combining ADF, PP, KPSS
     on the levels and (for I(1) confirmation) the first difference.
@@ -265,31 +280,35 @@ def classify_integration(series: pd.Series, alpha: float = 0.05) -> Dict[str, ob
     Verdict logic on levels:
       * ADF & PP reject unit root (p<alpha) AND KPSS fails to reject
         stationarity (p>alpha) → I(0).
-      * ADF & PP fail to reject AND KPSS rejects → I(1) (confirm via diff).
-      * disagreement → "ambiguous" (boundary case — spec flags real rate here).
+      * ADF & PP fail to reject AND KPSS rejects → tentatively I(1), but only
+        kept if the first difference is itself stationary (ADF & PP reject +
+        KPSS not reject). Otherwise (e.g. I(2) / structural break) → ambiguous,
+        so it is not fed into Johansen.
+      * disagreement / all-fail (low power) → "ambiguous".
     """
     lvl = unit_root_tests(series)
     adf_rej = lvl["adf_pvalue"] < alpha
     pp_rej = lvl["pp_pvalue"] < alpha
     kpss_rej = lvl["kpss_pvalue"] < alpha
 
-    if adf_rej and pp_rej and not kpss_rej:
-        # both ADF & PP reject unit root AND KPSS fails to reject stationarity
+    if _is_stationary(lvl, alpha):
         verdict = "I(0)"
     elif (not adf_rej) and (not pp_rej) and kpss_rej:
-        # ADF & PP fail to reject unit root AND KPSS rejects stationarity
-        verdict = "I(1)"
+        verdict = "I(1)"  # tentative — confirmed via the difference below
     else:
-        # any disagreement, or all-fail (low power / inconclusive) → ambiguous
         verdict = "ambiguous"
 
     res: Dict[str, object] = {"verdict": verdict, "levels": lvl}
-    # confirm I(1): the first difference should look I(0)
+    # confirm I(1): the first difference must itself look stationary (same
+    # strict ADF+PP+KPSS rule). If not, the I(1) label is downgraded.
     diff = pd.Series(series).dropna().diff().dropna()
     if len(diff) > 12:
         d = unit_root_tests(diff)
+        diff_stationary = _is_stationary(d, alpha)
         res["diff"] = d
-        res["diff_stationary"] = bool(d["adf_pvalue"] < alpha or d["pp_pvalue"] < alpha)
+        res["diff_stationary"] = bool(diff_stationary)
+        if verdict == "I(1)" and not diff_stationary:
+            res["verdict"] = "ambiguous"  # not a clean I(1): I(2)/break suspect
     return res
 
 
@@ -343,10 +362,25 @@ def johansen_test(
     """
     from statsmodels.tsa.vector_ar.vecm import coint_johansen
 
-    sub = df[list(columns)].dropna()
+    cols = list(columns)
+    n = len(cols)
+    if n < 2:
+        raise ValueError(f"johansen_test needs >=2 columns, got {cols}")
+    if alpha not in _CV_COL:
+        raise ValueError(f"alpha must be one of {sorted(_CV_COL)}, got {alpha}")
+
+    sub = df[cols].dropna()
+    min_obs = max(30, k_ar_diff + 5)
+    if len(sub) < min_obs:
+        raise ValueError(
+            f"johansen_test needs >={min_obs} complete rows for {cols}, "
+            f"got {len(sub)} after dropna"
+        )
+    if not np.isfinite(sub.values).all():
+        raise ValueError(f"johansen_test got non-finite values in {cols}")
+
     res = coint_johansen(sub.values, det_order, k_ar_diff)
     cvc = _CV_COL[alpha]
-    n = len(columns)
 
     raw_trace_rank = 0
     for r in range(n):
@@ -380,7 +414,7 @@ def johansen_test(
     beta = float(-norm[1]) if (valid_coint and n >= 2) else None
 
     return {
-        "columns": list(columns),
+        "columns": cols,
         "trace_stat": [float(x) for x in res.lr1],
         "trace_cv": [float(x) for x in res.cvt[:, cvc]],
         "maxeig_stat": [float(x) for x in res.lr2],

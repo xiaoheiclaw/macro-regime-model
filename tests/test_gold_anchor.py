@@ -141,8 +141,8 @@ def test_build_panel_structure():
     for col in ["gold_nominal", "debt_gdp", "m2_gdp", "fed_gdp", "real_rate_10y",
                 "ln_gold_nominal", "ln_debt_gdp", "ln_m2_gdp", "ln_fed_gdp"]:
         assert col in df.columns, f"missing {col}"
-    # monthly index
-    assert (df.index.freqstr or "ME").startswith("M")
+    # monthly index — assert real month-end frequency, never silently None
+    assert pd.infer_freq(df.index) in {"ME", "M"}
     # ratios use GDP as denominator → debt_gdp = debt($B) / gdp($B), order ~1
     assert df["debt_gdp"].dropna().median() > 0
     # ln transform consistency
@@ -177,3 +177,27 @@ def test_units_rescaled_to_billions():
     # debt rescaled $M→$B: with synthetic debt up to 3.5e7 $M = 3.5e4 $B and
     # gdp up to 2.8e4 $B, debt/GDP should be order ~1, not ~1000.
     assert panel.data["debt_gdp"].dropna().max() < 10
+
+
+def test_start_contract_enforced_for_misbehaving_fetcher():
+    # fetchers that ignore `start` must not leak pre-start rows into the panel
+    panel = build_anchor_panel(
+        start="1990-01-01", fetch_fn=_synthetic_fred, gold_fetch_fn=_synthetic_gold,
+    )
+    assert panel.data.index.min() >= pd.Timestamp("1990-01-01")
+
+
+def test_johansen_validates_inputs():
+    idx = pd.date_range("1980-01-31", periods=40, freq="ME")
+    df = pd.DataFrame({"ln_gold_nominal": np.arange(40.0), "ln_anchor": np.arange(40.0)}, index=idx)
+    with pytest.raises(ValueError):
+        johansen_test(df, ["ln_gold_nominal"])  # <2 columns
+    with pytest.raises(ValueError):
+        johansen_test(df, ["ln_gold_nominal", "ln_anchor"], alpha=0.123)  # bad alpha
+    short = df.iloc[:10]
+    with pytest.raises(ValueError):
+        johansen_test(short, ["ln_gold_nominal", "ln_anchor"])  # too few rows
+    bad = df.copy()
+    bad.iloc[5, 0] = np.inf
+    with pytest.raises(ValueError):
+        johansen_test(bad, ["ln_gold_nominal", "ln_anchor"])  # non-finite
