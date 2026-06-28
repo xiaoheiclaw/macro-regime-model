@@ -580,10 +580,12 @@ def johansen_test(
     # G = α + β·A  ⇒  G - β·A ~ I(0); evec row encodes G + c_i·A_i, so the
     # long-run coefficient on anchor i is β_i = -c_i (moved to the RHS). For a
     # bivariate system β = β_1; for the trivariate anchor [gold, debt, real
-    # rate] `betas` carries (β_debt, β_real). β is only a long-run elasticity
-    # when a valid cointegrating relation exists — None otherwise.
-    beta = float(-norm[1]) if (valid_coint and n >= 2) else None
-    betas = [float(-norm[i]) for i in range(1, n)] if (valid_coint and n >= 2) else None
+    # rate] `betas` carries (β_debt, β_real). β/βs are interpretable ONLY when
+    # coint_rank == 1: with rank>1 the single eigenvector is not unique, so the
+    # first column is an arbitrary basis vector — report None, not a misleading β.
+    interpretable = (coint_rank == 1) and (n >= 2)
+    beta = float(-norm[1]) if interpretable else None
+    betas = [float(-norm[i]) for i in range(1, n)] if interpretable else None
 
     return {
         "columns": cols,
@@ -640,9 +642,11 @@ def johansen_robustness(df: pd.DataFrame, columns, lags=(1, 2, 3, 4),
                            beta=(None if j["beta"] is None else round(j["beta"], 3)),
                            betas=(None if j["betas"] is None else [round(b, 3) for b in j["betas"]]),
                            n_obs=j["n_obs"])
-            except ValueError as e:
+            # trivariate systems hit singular/non-PD matrices more often → a bad
+            # cell must degrade to an `error` row, never crash the whole grid.
+            except (ValueError, np.linalg.LinAlgError) as e:
                 rec.update(coint_rank=None, valid_coint=None, beta=None,
-                           betas=None, n_obs=None, error=str(e)[:50])
+                           betas=None, n_obs=None, error=f"{type(e).__name__}: {str(e)[:40]}")
             rows.append(rec)
     return pd.DataFrame(rows)
 

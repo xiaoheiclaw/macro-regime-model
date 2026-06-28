@@ -387,6 +387,26 @@ def test_johansen_trivariate_betas_contract():
         assert len(j["betas"]) == 2
 
 
+def test_johansen_trivariate_rank_gt1_no_single_beta():
+    # one common stochastic trend shared by all three I(1) series → TWO
+    # independent cointegrating vectors → coint_rank=2. The single eigenvector is
+    # then a non-unique basis vector, so β/βs must be None (not a misleading number).
+    n = 500
+    idx = pd.date_range("1980-01-31", periods=n, freq="ME")
+    f = np.cumsum(np.random.default_rng(40).standard_normal(n))  # common trend
+    rng = np.random.default_rng(41)
+    g = f + rng.standard_normal(n) * 0.3
+    d = 2.0 * f + rng.standard_normal(n) * 0.3
+    r = 0.5 * f + rng.standard_normal(n) * 0.3
+    df = pd.DataFrame({"ln_gold_nominal": g, "ln_debt_gdp": d, "real_rate_10y": r}, index=idx)
+    j = johansen_test(df, list(df.columns), k_ar_diff=1)
+    # contract holds for ANY rank outcome: β/βs populated iff coint_rank == 1
+    assert (j["betas"] is not None) == (j["coint_rank"] == 1)
+    assert (j["beta"] is not None) == (j["coint_rank"] == 1)
+    if j["coint_rank"] > 1:
+        assert j["beta"] is None and j["betas"] is None
+
+
 def test_integration_segments_splits_real_rate():
     # build a series: I(0) white noise pre-2003, I(1) random walk post-2003.
     idx = pd.date_range("1990-01-31", periods=480, freq="ME")

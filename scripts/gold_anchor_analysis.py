@@ -20,6 +20,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -80,7 +81,11 @@ def _fmt_johansen(j: dict) -> str:
                      "may not hold — this is NOT evidence the anchor holds.")
     lines.append(f"- cointegrating vector (normalized on gold): {[round(x,4) for x in j['coint_vector_normalized']]}")
     if j["beta"] is None:
-        lines.append("- **long-run elasticity β = n/a** (no valid cointegrating relation)")
+        if j["coint_rank"] > 1:
+            lines.append(f"- **long-run β = n/a** (coint_rank={j['coint_rank']}>1 → 单一协整向量"
+                         "不唯一,不报告 β)")
+        else:
+            lines.append("- **long-run elasticity β = n/a** (no valid cointegrating relation)")
     else:
         lines.append(f"- **long-run elasticity β = {j['beta']:.4f}** (gold vs anchor)")
     return "\n".join(lines)
@@ -130,39 +135,53 @@ def _run_trivariate(df, notes) -> dict:
     where the real rate is I(1)). If neither window is all-I(1), the trivariate
     test is skipped and the real rate is confined to the short-run ECM (P1)."""
     cols = TRIVARIATE_COLS
-    entry = {"cols": cols, "window": None, "pairwise_n": None, "id_check": {},
-             "gate_full": None, "gate_clean": None, "skip": None, "lag": None,
+    entry = {"cols": cols, "window": None, "id_window": None, "pairwise_n": None,
+             "id_check": {}, "gate_full": None, "gate_full_n": None,
+             "gate_clean": None, "gate_clean_n": None, "skip": None, "lag": None,
              "point": None, "robust": None, "rank_set": None,
              "robust_unique_rank1": False, "vecm": None, "vecm_note": None}
 
     full = df[cols].dropna()
     passed_full, v_full = _gate_check(full)
-    entry["gate_full"] = v_full
+    entry["gate_full"], entry["gate_full_n"] = v_full, int(len(full))
 
-    use, window = (None, None)
+    use, window, used_gate = None, None, None
     if passed_full and len(full) >= 40:
-        use, window = full, "full (1968+ spliced)"
+        use, window, used_gate = full, "full (1968+ spliced)", v_full
     else:
         cutoff = notes.get("real_rate_tips_start", "n/a")
         if cutoff and cutoff != "n/a":
             clean = df.loc[df.index >= pd.Timestamp(cutoff), cols].dropna()
             passed_clean, v_clean = _gate_check(clean)
-            entry["gate_clean"] = v_clean
+            entry["gate_clean"], entry["gate_clean_n"] = v_clean, int(len(clean))
             if passed_clean and len(clean) >= 40:
-                use, window = clean, f"clean TIPS (≥{cutoff})"
+                use, window, used_gate = clean, f"clean TIPS (≥{cutoff})", v_clean
 
-    entry["id_check"] = entry["gate_clean"] or entry["gate_full"]
     if use is None:
+        # report id_check + n from the LAST evaluated gate window (clean if it was
+        # tried, else full) so id verdicts and the sample size never mismatch (P2).
+        if entry["gate_clean"] is not None:
+            entry["id_check"], entry["pairwise_n"], entry["id_window"] = (
+                entry["gate_clean"], entry["gate_clean_n"], "clean TIPS")
+        else:
+            entry["id_check"], entry["pairwise_n"], entry["id_window"] = (
+                entry["gate_full"], entry["gate_full_n"], "full (1968+ spliced)")
         entry["skip"] = ("not all three legs I(1) on any gated window — Johansen "
-                         "requires all-I(1); real rate confined to short-run ECM (PR #3)")
-        entry["pairwise_n"] = int(len(full))
+                         "requires all-I(1); real rate remains eligible only for a "
+                         "future short-run ECM specification (PR #3)")
         return entry
 
-    entry["window"] = window
+    # id_check / n / window all come from the SAME (used) subsample
+    entry["window"] = entry["id_window"] = window
+    entry["id_check"] = used_gate
     entry["pairwise_n"] = int(len(use))
     lag = select_var_order(use, cols, max_lags=4)
     entry["lag"] = lag
-    entry["point"] = johansen_test(use, cols, det_order=0, k_ar_diff=lag["k_ar_diff"])
+    try:
+        entry["point"] = johansen_test(use, cols, det_order=0, k_ar_diff=lag["k_ar_diff"])
+    except (ValueError, np.linalg.LinAlgError) as e:
+        entry["skip"] = f"point Johansen failed: {type(e).__name__}: {str(e)[:60]}"
+        return entry
     robust = johansen_robustness(use, cols, lags=ROBUST_LAGS, det_orders=ROBUST_DET_ORDERS)
     entry["robust"] = robust
     ranks = sorted(set(robust["coint_rank"].dropna().astype(int)))
@@ -184,8 +203,8 @@ def _run_trivariate(df, notes) -> dict:
                                   f"bumped to k_ar_diff={k} so a short-run Δ block exists.")
         try:
             entry["vecm"] = estimate_vecm(use, cols, k_ar_diff=k, coint_rank=1, det_order=0)
-        except ValueError as e:
-            entry["vecm_note"] = f"VECM estimation failed: {e}"
+        except (ValueError, np.linalg.LinAlgError) as e:
+            entry["vecm_note"] = f"VECM estimation failed: {type(e).__name__}: {e}"
     return entry
 
 
@@ -197,14 +216,22 @@ def _fmt_trivariate(tri) -> list:
              "「长端是不是锚」= β₂ 是否在**长期向量**里显著(对 spec §修订)。\n")
     L.append("**全-I(1) gate (推理)**: Johansen 要求三列同子样本都 I(1);混入 I(0)/ambiguous "
              "腿会让 rank 与 β₂ 失效,故先 gate 再跑。")
-    L.append(f"- 完整 case 子样本 n={tri['pairwise_n']};同子样本 c+ct 单整预检:")
-    for c, cv in tri["id_check"].items():
-        L.append(f"    - `{c}`: **{cv['combined']}** (c={cv['c']}, ct={cv['ct']})")
+
+    def _gate_lines(label, n, verdicts):
+        out = [f"- gate 窗口 **{label}** (n={n}),同子样本 c+ct 单整预检:"]
+        for c, cv in verdicts.items():
+            out.append(f"    - `{c}`: **{cv['combined']}** (c={cv['c']}, ct={cv['ct']})")
+        return out
+
     if tri["skip"]:
-        L.append(f"- **skipped (gate 未通过): {tri['skip']}** (推理)")
+        # print BOTH gate windows that were evaluated, each with its OWN n (P2)
+        L.extend(_gate_lines("full (1968+ spliced)", tri["gate_full_n"], tri["gate_full"]))
         if tri.get("gate_clean"):
-            L.append("  - 注:已尝试干净 post-TIPS 窗口,该窗口仍非全-I(1)。")
+            L.extend(_gate_lines(f"clean TIPS", tri["gate_clean_n"], tri["gate_clean"]))
+        L.append(f"- **skipped (gate 未通过): {tri['skip']}** (推理)")
         return L
+
+    L.extend(_gate_lines(tri["id_window"], tri["pairwise_n"], tri["id_check"]))
     L.append(f"- **gate 通过窗口: {tri['window']}** — Johansen/VECM 在此窗口估计 (事实)")
     lag = tri["lag"]
     L.append(f"- VAR select_order(AIC) p={lag['var_order']} → k_ar_diff={lag['k_ar_diff']} (事实)")
