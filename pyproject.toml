@@ -13,6 +13,7 @@ dependencies = [
     "numba>=0.59",
     "scikit-learn>=1.4",
     "httpx>=0.28.1",
+    "arch>=6.0",
 ]
 
 [project.optional-dependencies]
