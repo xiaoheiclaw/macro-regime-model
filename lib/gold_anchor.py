@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import os
 import warnings
 from dataclasses import dataclass, field
@@ -59,9 +60,16 @@ FRED_SERIES = {
     "cpi": "CPIAUCSL",                   # CPI-U, index, monthly
 }
 
+# Pinned to a specific commit SHA (NOT `main`) for reproducibility: the content
+# is frozen, so the analysis is replayable and an upstream change cannot
+# silently move the result. EXPECTED_GOLD_SHA256 is verified on every fetch and
+# a mismatch hard-fails. To refresh the data, bump both the SHA and the hash.
+GOLD_CSV_COMMIT = "95f96689baad2bc097ace55805cc9492b560d2ba"  # datasets/gold-prices
 GOLD_CSV_URL = (
-    "https://raw.githubusercontent.com/datasets/gold-prices/main/data/monthly.csv"
+    f"https://raw.githubusercontent.com/datasets/gold-prices/{GOLD_CSV_COMMIT}"
+    "/data/monthly.csv"
 )
+EXPECTED_GOLD_SHA256 = "4ad63a96612effbb57f900c008e011d6c446f795f4722ee8056a2a702725f397"
 
 # series reported in $Millions that we rescale to $Billions
 _MILLIONS_TO_BILLIONS = {"debt", "fed_assets"}
@@ -103,22 +111,27 @@ def _http_get_text(url: str, timeout: float = 30.0) -> str:
 
 
 def fetch_fred_series(series_id: str, start: str = "1968-01-01") -> pd.Series:
-    """Fetch a single FRED series via fredapi, falling back to the public CSV
-    endpoint when no API key is available. Returns a float Series indexed by
-    date (NaNs dropped)."""
+    """Fetch a single FRED series. With an API key, uses the FRED observations
+    JSON endpoint; otherwise the public CSV endpoint. Both go through
+    _http_get_text (explicit timeout + status check). Returns a float Series
+    indexed by date (NaNs dropped)."""
     key = _fred_api_key()
     if key:
         try:
-            from fredapi import Fred
-
-            s = Fred(api_key=key).get_series(series_id, observation_start=start)
-            s = pd.Series(s, dtype="float64").dropna()
+            url = (
+                "https://api.stlouisfed.org/fred/series/observations"
+                f"?series_id={series_id}&api_key={key}&file_type=json"
+                f"&observation_start={start}"
+            )
+            obs = json.loads(_http_get_text(url)).get("observations", [])
+            s = pd.Series({o["date"]: o["value"] for o in obs})
+            s = pd.to_numeric(s.replace(".", np.nan), errors="coerce").dropna()
             s.index = pd.to_datetime(s.index)
             return s
         except Exception as e:
             # don't swallow silently — surface the cause, then try CSV fallback
             warnings.warn(
-                f"fredapi failed for {series_id} ({type(e).__name__}: {e}); "
+                f"FRED API failed for {series_id} ({type(e).__name__}: {e}); "
                 "falling back to public CSV endpoint",
                 stacklevel=2,
             )
@@ -139,6 +152,16 @@ def fetch_gold_monthly(start: str = "1968-01-01") -> pd.Series:
     (the upstream is a moving `main` branch, so the content hash is the audit
     handle — a changed snapshot is visible rather than silent)."""
     text = _http_get_text(GOLD_CSV_URL)
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    if digest != EXPECTED_GOLD_SHA256:
+        raise ValueError(
+            "gold CSV sha256 mismatch — pinned source content changed.\n"
+            f"  url      : {GOLD_CSV_URL}\n"
+            f"  expected : {EXPECTED_GOLD_SHA256}\n"
+            f"  got      : {digest}\n"
+            "If this is an intentional data refresh, bump GOLD_CSV_COMMIT and "
+            "EXPECTED_GOLD_SHA256 together."
+        )
     df = pd.read_csv(io.StringIO(text))
     missing = {"Date", "Price"} - set(df.columns)
     if missing:
@@ -149,11 +172,7 @@ def fetch_gold_monthly(start: str = "1968-01-01") -> pd.Series:
     s = pd.Series(df["Price"].values, index=pd.PeriodIndex(df["Date"], freq="M").to_timestamp("M"))
     s = pd.to_numeric(s, errors="coerce").dropna()
     s = s[s.index >= pd.Timestamp(start)]
-    s.attrs = {
-        "source_url": GOLD_CSV_URL,
-        "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
-        "n_rows": int(len(df)),
-    }
+    s.attrs = {"source_url": GOLD_CSV_URL, "sha256": digest, "n_rows": int(len(df))}
     return s
 
 
@@ -356,9 +375,14 @@ def _is_stationary(tests: Dict[str, float], alpha: float = 0.05) -> bool:
     )
 
 
-def classify_integration(series: pd.Series, alpha: float = 0.05) -> Dict[str, object]:
+def classify_integration(series: pd.Series, alpha: float = 0.05,
+                         regression: str = "c") -> Dict[str, object]:
     """Classify a series as I(0) / I(1) / ambiguous by combining ADF, PP, KPSS
     on the levels and (for I(1) confirmation) the first difference.
+
+    ``regression`` ("c" = constant, "ct" = constant+trend) is applied to the
+    LEVELS test. The first difference is always tested with a constant ("c"),
+    since a genuinely I(1) series differenced is mean-stationary, not trending.
 
     Verdict logic on levels:
       * ADF & PP reject unit root (p<alpha) AND KPSS fails to reject
@@ -369,7 +393,7 @@ def classify_integration(series: pd.Series, alpha: float = 0.05) -> Dict[str, ob
         so it is not fed into Johansen.
       * disagreement / all-fail (low power) → "ambiguous".
     """
-    lvl = unit_root_tests(series)
+    lvl = unit_root_tests(series, regression=regression)
     adf_rej = lvl["adf_pvalue"] < alpha
     pp_rej = lvl["pp_pvalue"] < alpha
     kpss_rej = lvl["kpss_pvalue"] < alpha
@@ -381,12 +405,12 @@ def classify_integration(series: pd.Series, alpha: float = 0.05) -> Dict[str, ob
     else:
         verdict = "ambiguous"
 
-    res: Dict[str, object] = {"verdict": verdict, "levels": lvl}
+    res: Dict[str, object] = {"verdict": verdict, "levels": lvl, "regression": regression}
     # confirm I(1): the first difference must itself look stationary (same
-    # strict ADF+PP+KPSS rule). If not, the I(1) label is downgraded.
+    # strict ADF+PP+KPSS rule, constant only). If not, the I(1) label is downgraded.
     diff = pd.Series(series).dropna().diff().dropna()
     if len(diff) > 12:
-        d = unit_root_tests(diff)
+        d = unit_root_tests(diff, regression="c")
         diff_stationary = _is_stationary(d, alpha)
         res["diff"] = d
         res["diff_stationary"] = bool(diff_stationary)
@@ -395,40 +419,51 @@ def classify_integration(series: pd.Series, alpha: float = 0.05) -> Dict[str, ob
     return res
 
 
+def combined_verdict(series: pd.Series, alpha: float = 0.05, min_obs: int = 20) -> Dict[str, object]:
+    """I(d) verdict using BOTH regressions: 'c' (constant) and 'ct'
+    (constant+trend). Agreement → that verdict; disagreement → 'ambiguous';
+    invalid input (constant/non-finite/too short) → 'invalid data'. Returns
+    {combined, c, ct, c_res, ct_res}."""
+    if int(pd.Series(series).notna().sum()) < min_obs:
+        return {"combined": "insufficient data", "c": None, "ct": None,
+                "c_res": None, "ct_res": None}
+    out = {}
+    for reg in ("c", "ct"):
+        try:
+            out[reg] = classify_integration(series, alpha, regression=reg)
+        except ValueError:
+            out[reg] = None
+    vc = out["c"]["verdict"] if out["c"] else "invalid data"
+    vct = out["ct"]["verdict"] if out["ct"] else "invalid data"
+    if vc == "invalid data" or vct == "invalid data":
+        combined = "invalid data"
+    elif vc == vct:
+        combined = vc
+    else:
+        combined = "ambiguous"
+    return {"combined": combined, "c": vc, "ct": vct, "c_res": out["c"], "ct_res": out["ct"]}
+
+
 def integration_table(df: pd.DataFrame, columns, min_obs: int = 20) -> pd.DataFrame:
-    """Build the I(0)/I(1) verdict table for the given columns. Columns with
-    fewer than ``min_obs`` non-NaN observations are reported as "insufficient
-    data" instead of being fed to the (crash-prone) test routines."""
+    """I(0)/I(1) verdict table for the given columns, run under BOTH 'c' and
+    'ct' level regressions. ``verdict`` = the combined (agree-or-ambiguous)
+    verdict; ``adf_p``/``pp_p``/``kpss_p`` are the 'c' p-values (with ``*_ct``
+    counterparts). Columns with <min_obs non-NaN obs → "insufficient data";
+    constant/non-finite columns → "invalid data" (no crash)."""
     rows = []
     for col in columns:
         n_obs = int(df[col].notna().sum())
-        if n_obs < min_obs:
-            rows.append(
-                {"series": col, "verdict": "insufficient data", "adf_p": np.nan,
-                 "pp_p": np.nan, "kpss_p": np.nan, "diff_stationary": None, "n": n_obs}
-            )
-            continue
-        try:
-            c = classify_integration(df[col])
-        except ValueError:
-            # non-finite / constant series etc. — report instead of crashing
-            rows.append(
-                {"series": col, "verdict": "invalid data", "adf_p": np.nan,
-                 "pp_p": np.nan, "kpss_p": np.nan, "diff_stationary": None, "n": n_obs}
-            )
-            continue
-        lvl = c["levels"]
-        rows.append(
-            {
-                "series": col,
-                "verdict": c["verdict"],
-                "adf_p": round(lvl["adf_pvalue"], 4),
-                "pp_p": round(lvl["pp_pvalue"], 4),
-                "kpss_p": round(lvl["kpss_pvalue"], 4),
-                "diff_stationary": c.get("diff_stationary"),
-                "n": lvl["n"],
-            }
-        )
+        cv = combined_verdict(df[col], min_obs=min_obs)
+        row = {"series": col, "verdict": cv["combined"], "verdict_c": cv["c"],
+               "verdict_ct": cv["ct"], "n": n_obs}
+        c_res, ct_res = cv["c_res"], cv["ct_res"]
+        for tag, res in (("", c_res), ("_ct", ct_res)):
+            lvl = res["levels"] if res else None
+            row[f"adf_p{tag}"] = round(lvl["adf_pvalue"], 4) if lvl else np.nan
+            row[f"pp_p{tag}"] = round(lvl["pp_pvalue"], 4) if lvl else np.nan
+            row[f"kpss_p{tag}"] = round(lvl["kpss_pvalue"], 4) if lvl else np.nan
+        row["diff_stationary"] = c_res.get("diff_stationary") if c_res else None
+        rows.append(row)
     return pd.DataFrame(rows).set_index("series")
 
 
@@ -527,5 +562,43 @@ def johansen_test(
         "coint_vector_normalized": [float(x) for x in norm],
         "beta": beta,
         "alpha_level": alpha,
+        "k_ar_diff": int(k_ar_diff),
+        "det_order": int(det_order),
         "n_obs": int(len(sub)),
     }
+
+
+def select_var_order(df: pd.DataFrame, columns, max_lags: int = 4) -> Dict[str, int]:
+    """Select the VAR(p) level order on the complete-case (pairwise dropna)
+    subsample by AIC, and derive the Johansen lagged-difference count
+    k_ar_diff = max(1, p-1). Returns {var_order, k_ar_diff, n_obs}."""
+    from statsmodels.tsa.api import VAR
+
+    sub = df[list(columns)].dropna()
+    if len(sub) < max_lags + 10:
+        return {"var_order": 1, "k_ar_diff": 1, "n_obs": int(len(sub))}
+    sel = VAR(sub.values).select_order(maxlags=max_lags)
+    p = int(getattr(sel, "aic", 1) or 1)
+    p = max(1, p)
+    return {"var_order": p, "k_ar_diff": max(1, p - 1), "n_obs": int(len(sub))}
+
+
+def johansen_robustness(df: pd.DataFrame, columns, lags=(1, 2, 3, 4),
+                        det_orders=(-1, 0, 1), alpha: float = 0.05) -> pd.DataFrame:
+    """Run Johansen across a grid of k_ar_diff (lags) × det_order and report
+    coint_rank / valid_coint / β per cell. This is the robustness answer to
+    'does the rank verdict survive lag/deterministic-term choices?'."""
+    rows = []
+    for det in det_orders:
+        for lag in lags:
+            rec = {"det_order": det, "k_ar_diff": lag}
+            try:
+                j = johansen_test(df, columns, det_order=det, k_ar_diff=lag, alpha=alpha)
+                rec.update(coint_rank=j["coint_rank"], valid_coint=j["valid_coint"],
+                           beta=(None if j["beta"] is None else round(j["beta"], 3)),
+                           n_obs=j["n_obs"])
+            except ValueError as e:
+                rec.update(coint_rank=None, valid_coint=None, beta=None,
+                           n_obs=None, error=str(e)[:50])
+            rows.append(rec)
+    return pd.DataFrame(rows)

@@ -11,11 +11,15 @@ import pandas as pd
 import pytest
 
 # project root is added to sys.path by tests/conftest.py
+import lib.gold_anchor as ga
 from lib.gold_anchor import (
     build_anchor_panel,
     classify_integration,
+    combined_verdict,
     integration_table,
+    johansen_robustness,
     johansen_test,
+    select_var_order,
     unit_root_tests,
 )
 
@@ -231,6 +235,54 @@ def test_should_run_johansen_gate():
     assert should_run_johansen("I(1)", "ambiguous") is False
     assert should_run_johansen("I(0)", "I(1)") is False
     assert should_run_johansen("I(1)", "insufficient data") is False
+
+
+def test_gold_hash_mismatch_hard_fails(monkeypatch):
+    # if the pinned source content changes (sha256 != expected) → hard fail
+    monkeypatch.setattr(ga, "_http_get_text", lambda url, timeout=30.0: "Date,Price\n2000-01,1.0\n")
+    with pytest.raises(ValueError, match="sha256 mismatch"):
+        ga.fetch_gold_monthly()
+
+
+def test_combined_verdict_dual_regression():
+    # both regressions are computed and reconciled. A random walk is cleanly
+    # I(1) under c and ct; white noise is never I(1) (so it can't enter Johansen)
+    # — its exact label may be I(0) or ambiguous depending on the KPSS draw.
+    rw = combined_verdict(_random_walk(500, seed=2))
+    assert rw["combined"] == "I(1)" and rw["c"] == "I(1)" and rw["ct"] == "I(1)"
+    wn = combined_verdict(_white_noise(500, seed=1))
+    assert wn["c"] == wn["ct"]            # dual regression consistent
+    assert wn["combined"] != "I(1)"       # stationary noise must not read I(1)
+
+
+def test_pairwise_gate_skips_stationary_anchor():
+    from scripts.gold_anchor_analysis import should_run_johansen
+    gold = combined_verdict(_random_walk(400, seed=9))      # I(1)
+    anchor = combined_verdict(_white_noise(400, seed=10))   # I(0)
+    assert should_run_johansen(gold["combined"], anchor["combined"]) is False
+
+
+def test_select_var_order_and_robustness():
+    n = 500
+    idx = pd.date_range("1980-01-31", periods=n, freq="ME")
+    a = np.cumsum(np.random.default_rng(11).standard_normal(n))
+    g = a + np.random.default_rng(22).standard_normal(n) * 0.3  # cointegrated, β≈1
+    df = pd.DataFrame({"ln_gold_nominal": g, "ln_anchor": a}, index=idx)
+    sel = select_var_order(df, ["ln_gold_nominal", "ln_anchor"], max_lags=4)
+    assert sel["var_order"] >= 1 and sel["k_ar_diff"] >= 1
+    rob = johansen_robustness(df, ["ln_gold_nominal", "ln_anchor"])
+    assert len(rob) == 12  # 4 lags × 3 det_orders
+    # genuine cointegration → rank>=1 dominates the grid
+    assert (rob["coint_rank"].dropna().astype(int) >= 1).mean() >= 0.5
+
+    # independent walks → rank 0 dominates (a stray spurious cell is allowed;
+    # the grid exists precisely to expose that as instability, not a true anchor)
+    g2 = np.cumsum(np.random.default_rng(101).standard_normal(n))
+    a2 = np.cumsum(np.random.default_rng(202).standard_normal(n))
+    df2 = pd.DataFrame({"ln_gold_nominal": g2, "ln_anchor": a2}, index=idx)
+    rob2 = johansen_robustness(df2, ["ln_gold_nominal", "ln_anchor"])
+    vals2 = rob2["coint_rank"].dropna().astype(int)
+    assert (vals2 == 0).mean() >= 0.5
 
 
 def test_full_rank_marks_invalid_coint():
