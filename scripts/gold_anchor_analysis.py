@@ -410,6 +410,11 @@ def _fmt_vecm(tri) -> list:
 # to keep the report focused on the two shifts the spec names.
 GH_MODELS = ("C", "C/S")
 GH_MODEL_LABEL = {"C": "level shift (C)", "C/S": "regime shift (C/S)"}
+# the fixed set of GH systems the verdict EXPECTS to see. Keeping this explicit
+# (rather than building it conditionally) means a system that can't run is
+# counted as skipped/incomplete, never silently dropped — so the kill condition
+# can't fire on a subset of the intended evidence (P1).
+GH_SYSTEMS = ("bivariate", "trivariate")
 
 
 def _run_gregory_hansen(df, notes) -> dict:
@@ -419,22 +424,40 @@ def _run_gregory_hansen(df, notes) -> dict:
     Johansen found no STABLE constant-vector cointegration; GH asks whether a
     relation exists once ONE level/regime shift is allowed (the spec §2 'is 2022
     the anchor itself breaking?' cross-check). Each system is run under both
-    model C (level shift) and C/S (regime shift)."""
-    out = {"systems": {}, "tips_start": notes.get("real_rate_tips_start", "n/a")}
+    model C (level shift) and C/S (regime shift).
 
-    systems = [
-        ("bivariate", "双变量 [ln金价, ln(债务/GDP)] · 全样本",
-         "ln_gold_nominal", ["ln_debt_gdp"], df),
-    ]
+    BOTH systems are ALWAYS present in the result (P1): the trivariate entry is
+    created even when the TIPS cutoff or the real_rate column is missing, in
+    which case it carries a ``skip`` so the verdict counts it as incomplete
+    rather than letting it vanish (which would let the kill condition fire on the
+    bivariate evidence alone)."""
     cutoff = notes.get("real_rate_tips_start", "n/a")
-    if cutoff and cutoff != "n/a":
-        tri_df = df.loc[df.index >= pd.Timestamp(cutoff)]
-        systems.append(
-            ("trivariate", f"三变量 [ln金价, ln(债务/GDP), 实利率] · clean TIPS (≥{cutoff})",
-             "ln_gold_nominal", ["ln_debt_gdp", "real_rate_10y"], tri_df))
+    out = {"systems": {}, "tips_start": cutoff}
 
-    for key, label, ycol, xcols, sub in systems:
+    # build the trivariate sub-panel + an optional pre-skip reason
+    tri_label = "三变量 [ln金价, ln(债务/GDP), 实利率] · clean TIPS"
+    if not cutoff or cutoff == "n/a":
+        tri_df, tri_skip = df.iloc[0:0], "no clean-TIPS cutoff (real_rate_tips_start missing)"
+    elif "real_rate_10y" not in df.columns:
+        tri_df, tri_skip = df.iloc[0:0], "real_rate_10y column absent from panel"
+    else:
+        tri_df, tri_skip = df.loc[df.index >= pd.Timestamp(cutoff)], None
+        tri_label = f"{tri_label} (≥{cutoff})"
+
+    systems = {
+        "bivariate": ("双变量 [ln金价, ln(债务/GDP)] · 全样本",
+                      "ln_gold_nominal", ["ln_debt_gdp"], df, None),
+        "trivariate": (tri_label, "ln_gold_nominal",
+                       ["ln_debt_gdp", "real_rate_10y"], tri_df, tri_skip),
+    }
+
+    for key in GH_SYSTEMS:
+        label, ycol, xcols, sub, pre_skip = systems[key]
         entry = {"label": label, "y": ycol, "x": xcols, "models": {}, "skip": None}
+        if pre_skip is not None:
+            entry["skip"] = pre_skip
+            out["systems"][key] = entry
+            continue
         usable = sub[[ycol] + xcols].dropna()
         # gate on the SAME bound the lib enforces (no divergent magic threshold).
         need = gregory_hansen_min_obs(len(xcols))
@@ -547,28 +570,21 @@ def _gh_verdict_lines(gh_res: dict) -> list:
     as **inconclusive** instead of killing the linear anchor."""
     L = []
     L.append("\n### Gregory-Hansen 裁决(诚实)\n")
-    any_reject_overall = False
-    n_completed = 0
-    n_incomplete = 0  # skipped systems + errored/missing models
     near_0822 = []  # breaks landing near 2008 / 2022
+    # render per-cell lines (no decision counting here — that's _gh_summary's job)
     for key, e in gh_res["systems"].items():
         if e.get("skip"):
-            # a skipped system carries len(GH_MODELS) un-run cells
-            n_incomplete += len(GH_MODELS)
             L.append(f"- **{e['label']}: skipped ({e['skip']})** → 该系统未参与裁决 (推理)。")
             continue
         for model in GH_MODELS:
             gh = e["models"].get(model)
             if gh is None or "error" in gh:
-                n_incomplete += 1
                 err = (gh or {}).get("error", "未产出")
                 L.append(f"- {e['label']} · {GH_MODEL_LABEL[model]}: "
                          f"**{err} → 不计入裁决(测试未产出≠不拒绝)** (推理)。")
                 continue
-            n_completed += 1
             rejecters = [s for s in ("adf", "zt", "zalpha") if gh[s]["reject_no_coint"]]
             if rejecters:
-                any_reject_overall = True
                 bdate = gh["adf"]["break_date"]
                 bstats = ", ".join(s.upper() for s in rejecters)
                 L.append(f"- **{e['label']} · {GH_MODEL_LABEL[model]}: 拒绝「无协整」"
@@ -582,35 +598,41 @@ def _gh_verdict_lines(gh_res: dict) -> list:
                 L.append(f"- {e['label']} · {GH_MODEL_LABEL[model]}: "
                          f"三统计量均不拒绝「无协整」(ADF*={gh['adf']['stat']:.2f} vs "
                          f"cv@5%={(gh['adf']['critical_values'] or {}).get(0.05, float('nan')):.2f}) "
-                         f"→ 即便允许断点也无协整 (推理)。")
+                         f"→ 在此设定下未找到(单断点)协整证据 (推理)。")
     L.append("")
     if near_0822:
         uniq = sorted(set(near_0822))
         L.append(f"- **断点落在 2008/2022 附近**: {'; '.join(uniq)} → 与「2008 危机 / 2022 "
                  "通胀-加息」结构变化吻合 (推理)。")
-    if any_reject_overall:
+
+    # decision is driven SOLELY by the shared tally (single source of truth, P3).
+    s = _gh_summary(gh_res)
+    if s["any_reject"]:
         L.append("- **对照普通 Johansen (PR #2)**: 普通常参数 Johansen 测不出稳健协整,"
-                 "但允许单一断点的 GH 能在上述设定下拒绝「无协整」→ **锚是「分段存在」的**:"
-                 "协整关系在断点前后各自成立、但向量本身发生了位移,这正是常参数检验失败的原因 (推理)。")
-        if n_incomplete:
-            L.append(f"- ⚠️ 注:有 {n_incomplete} 个 system×model 单元被跳过/出错,未纳入裁决 "
+                 "但允许单一断点的 GH 能在上述设定下拒绝「无协整」→ **锚可能是「分段存在」的**:"
+                 "协整关系在断点前后各自成立、向量本身发生位移,这正是常参数检验失败的可能原因 (推理)。")
+        if s["n_incomplete"]:
+            L.append(f"- ⚠️ 注:有 {s['n_incomplete']} 个 system×model 单元被跳过/出错,未纳入裁决 "
                      "(推理)。")
-    elif n_completed == 0:
+    elif s["n_completed"] == 0:
         L.append("- **GH 结果不完整:无任何 system×model 成功产出 → 结论 inconclusive,"
                  "不触发杀死条件** (推理)。检查样本长度 / 数据可得性。")
-    elif n_incomplete > 0:
-        L.append(f"- **GH 结果不完整({n_completed} 成功 / {n_incomplete} 跳过或出错):"
-                 "已完成的单元均不拒绝「无协整」,但并非所有必需设定都产出 → 结论 "
+    elif s["n_incomplete"] > 0:
+        L.append(f"- **GH 结果不完整({s['n_completed']} 成功 / {s['n_incomplete']} 跳过或出错):"
+                 "已完成的单元均未找到协整证据,但并非所有必需设定都产出 → 结论 "
                  "inconclusive,不触发杀死条件** (推理)。补齐缺失单元后再下定论。")
     else:
-        # every required system×model completed AND none rejected
+        # every required system×model completed AND none rejected. Note: failing
+        # to reject H0 (no coint) is NOT proof H0 is true — we report "no
+        # evidence found" and invoke the PRE-REGISTERED kill condition to stop the
+        # constant-parameter / single-break linear route, NOT "anchor disproven".
         L.append("- **对照普通 Johansen (PR #2)**: 普通 Johansen 测不出协整,GH 允许单一断点后"
-                 "**仍测不出** → 连「单断点线性锚」也被否定 (推理)。")
-        L.append("- ⚠️ **杀死条件触发 (spec §杀死条件扩展)**: 双变量与三变量、level 与 regime "
-                 "shift 下 GH 均不拒绝「无协整」→ 线性(含单断点)锚被双向证伪。下一步只能上"
-                 "**Markov-switching / TVP**(时变参数协整,PR #4),不再做常参数/单断点线性设定 (推测)。")
+                 "**仍未找到协整证据**(注:不拒绝 H0 ≠ 证明无协整) (推理)。")
+        L.append("- ⚠️ **杀死条件触发 (spec §杀死条件,预注册)**: 双变量与三变量、level 与 "
+                 "regime shift 下 GH 均未找到(单断点)协整证据 → 按预注册杀死条件,**暂停常参数/"
+                 "单断点线性路线**,转 **Markov-switching / TVP**(时变参数协整,PR #4) (推测)。")
         L.append("- 注:三变量 clean TIPS 子样本短(2003+),GH 断点检验**功效有限**,"
-                 "「测不出」需谨慎解读(见 §4 功效限制) (事实)。")
+                 "「未找到证据」可能是功效不足而非真无协整,需谨慎解读(见 §4 功效限制) (事实)。")
     return L
 
 
@@ -790,8 +812,8 @@ def _build_report(df, notes, itab, jres, args, rr_segs=None, tri=None, gh_res=No
             nxt = ("GH 结果不完整(部分 system×model 跳过/出错)→ 下一步先补齐缺失单元(放宽样本/"
                    "数据),再据完整结果决定是否转 Markov-switching / TVP (PR #4)")
         else:
-            nxt = ("GH 在全部设定下均不拒绝「无协整」(线性单断点锚已证伪)→ 下一步直接上 "
-                   "Markov-switching / TVP 时变参数协整 (PR #4)")
+            nxt = ("GH 在全部设定下均未找到(单断点)协整证据(不拒绝 H0 ≠ 证伪)→ 按预注册"
+                   "杀死条件暂停常参数/单断点线性路线,转 Markov-switching / TVP 时变参数协整 (PR #4)")
         L.append(f"\n- 下一步 (下一 PR) (推测): {nxt};并做发布日对齐 + 2022 分解 (spec §3–§4)。")
     else:
         L.append("\n- 下一步 (下一 PR) (推测): 运行 GH 断点协整后据结果决定 regime-switching/TVP "

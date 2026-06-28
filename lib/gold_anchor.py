@@ -998,6 +998,13 @@ def gregory_hansen_test(
         raise ValueError("gregory_hansen_test needs >=1 regressor in x_cols")
     if model not in _GH_CV:
         raise ValueError(f"model must be one of {sorted(_GH_CV)}, got {model!r}")
+    # GH (1996) Table 1 only tabulates m=1..4. Reject an untabulated m up front:
+    # without critical values reject_no_coint would silently be False, which a
+    # caller could misread as "fail to reject" rather than "cannot test".
+    if m not in _GH_CV[model]["adf_zt"]:
+        raise ValueError(
+            f"gregory_hansen_test: m={m} regressors has no GH (1996) critical "
+            f"values (tabulated m∈{sorted(_GH_CV[model]['adf_zt'])})")
     if not (0.0 < trim < 0.5):
         raise ValueError(f"trim must be in (0, 0.5), got {trim}")
     # CVs are tabulated only at 1/5/10% — index without an implicit KeyError.
@@ -1087,11 +1094,19 @@ def gregory_hansen_test(
         cv = _gh_critical_values(model, m, "zalpha" if stat_key == "zalpha" else "adf")
         stat_val = float(b["stat"])
         reject = bool(cv is not None and stat_val < cv[alpha])
+        k = b["k"]
+        # the break dummy is φ_t = 1{t > k}: row k is the LAST pre-break period and
+        # row k+1 is the FIRST post-break period. Report the latter as the break
+        # date (the period the structure actually shifts), and expose both.
+        last_pre = None if k is None else idx[k].date().isoformat()
+        first_post = None if k is None else idx[min(k + 1, T - 1)].date().isoformat()
         out = {
             "stat": stat_val,
-            "break_index": (None if b["k"] is None else int(b["k"])),
-            "break_date": (None if b["k"] is None else idx[b["k"]].date().isoformat()),
-            "break_fraction": (None if b["k"] is None else round((b["k"] + 1) / T, 3)),
+            "break_index": (None if k is None else int(k)),
+            "break_date": first_post,
+            "last_pre_break_date": last_pre,
+            "first_post_break_date": first_post,
+            "break_fraction": (None if k is None else round((k + 1) / T, 3)),
             "critical_values": cv,
             "reject_no_coint": reject,
         }
