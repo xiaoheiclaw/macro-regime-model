@@ -1,5 +1,6 @@
 data/
 analysis/
+.worktrees/
 __pycache__/
 *.pyc
 *.bak
