@@ -269,7 +269,9 @@ def test_select_var_order_and_robustness():
     g = a + np.random.default_rng(22).standard_normal(n) * 0.3  # cointegrated, β≈1
     df = pd.DataFrame({"ln_gold_nominal": g, "ln_anchor": a}, index=idx)
     sel = select_var_order(df, ["ln_gold_nominal", "ln_anchor"], max_lags=4)
-    assert sel["var_order"] >= 1 and sel["k_ar_diff"] >= 1
+    # k_ar_diff is lagged *differences*: VAR(p) -> p-1, so VAR(1) -> 0
+    assert sel["var_order"] >= 1
+    assert sel["k_ar_diff"] == max(0, sel["var_order"] - 1)
     rob = johansen_robustness(df, ["ln_gold_nominal", "ln_anchor"])
     assert len(rob) == 12  # 4 lags × 3 det_orders
     # genuine cointegration → rank>=1 dominates the grid

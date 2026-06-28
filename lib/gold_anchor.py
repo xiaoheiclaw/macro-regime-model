@@ -571,16 +571,17 @@ def johansen_test(
 def select_var_order(df: pd.DataFrame, columns, max_lags: int = 4) -> Dict[str, int]:
     """Select the VAR(p) level order on the complete-case (pairwise dropna)
     subsample by AIC, and derive the Johansen lagged-difference count
-    k_ar_diff = max(1, p-1). Returns {var_order, k_ar_diff, n_obs}."""
+    k_ar_diff = p - 1 (statsmodels coint_johansen uses lagged *differences*,
+    so VAR(1) -> k_ar_diff=0). Returns {var_order, k_ar_diff, n_obs}."""
     from statsmodels.tsa.api import VAR
 
     sub = df[list(columns)].dropna()
     if len(sub) < max_lags + 10:
-        return {"var_order": 1, "k_ar_diff": 1, "n_obs": int(len(sub))}
+        return {"var_order": 1, "k_ar_diff": 0, "n_obs": int(len(sub))}
     sel = VAR(sub.values).select_order(maxlags=max_lags)
     p = int(getattr(sel, "aic", 1) or 1)
     p = max(1, p)
-    return {"var_order": p, "k_ar_diff": max(1, p - 1), "n_obs": int(len(sub))}
+    return {"var_order": p, "k_ar_diff": max(0, p - 1), "n_obs": int(len(sub))}
 
 
 def johansen_robustness(df: pd.DataFrame, columns, lags=(1, 2, 3, 4),
