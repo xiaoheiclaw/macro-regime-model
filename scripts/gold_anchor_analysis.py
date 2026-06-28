@@ -79,15 +79,22 @@ def _fmt_johansen(j: dict) -> str:
     if j["full_rank_stationary"]:
         lines.append("- ⚠️ **full-rank** (raw rank = n): series look stationary / model assumptions "
                      "may not hold — this is NOT evidence the anchor holds.")
-    lines.append(f"- cointegrating vector (normalized on gold): {[round(x,4) for x in j['coint_vector_normalized']]}")
-    if j["beta"] is None:
-        if j["coint_rank"] > 1:
-            lines.append(f"- **long-run β = n/a** (coint_rank={j['coint_rank']}>1 → 单一协整向量"
-                         "不唯一,不报告 β)")
+    interpretable = j["valid_coint"] and j["coint_rank"] == 1
+    if interpretable:
+        # only a valid+unique relation has an interpretable (normalized) vector
+        lines.append(f"- cointegrating vector (normalized on gold): "
+                     f"{[round(x, 4) for x in j['coint_vector_normalized']]}")
+        if n > 2:
+            # trivariate: report the βs list, NOT the bivariate 'gold vs anchor' wording
+            lines.append(f"- **long-run coefs βs (debt, real) = "
+                         f"{[round(b, 4) for b in j['betas']]}** (gold normalized)")
         else:
-            lines.append("- **long-run elasticity β = n/a** (no valid cointegrating relation)")
+            lines.append(f"- **long-run elasticity β = {j['beta']:.4f}** (gold vs anchor)")
+    elif j["coint_rank"] > 1:
+        lines.append(f"- raw first eigenvector omitted (coint_rank={j['coint_rank']}>1 → "
+                     "non-unique basis vector, not interpretable; β = n/a)")
     else:
-        lines.append(f"- **long-run elasticity β = {j['beta']:.4f}** (gold vs anchor)")
+        lines.append("- cointegrating vector / β = n/a (no valid cointegrating relation)")
     return "\n".join(lines)
 
 
@@ -135,6 +142,7 @@ def _run_one_window(use, label, cols) -> dict:
     w = {"window": label, "n": int(len(use)), "lag": None, "k_point": None,
          "point": None, "robust": None, "rank_set": None, "n_cells": 0,
          "n_failed": 0, "all_cells_ok": False, "robust_unique_rank1": False,
+         "beta_grid_stable": False, "anchor_robust": False,
          "vecm": None, "vecm_note": None, "error": None}
     lag = select_var_order(use, cols, max_lags=4)
     w["lag"] = lag
@@ -162,7 +170,22 @@ def _run_one_window(use, label, cols) -> dict:
     point_rank1 = w["point"]["coint_rank"] == 1
     w["n_cells"], w["n_failed"], w["all_cells_ok"] = n_cells, n_failed, all_cells_ok
     w["robust_unique_rank1"] = all_cells_ok and all_valid and ranks == [1] and point_rank1
-    if w["robust_unique_rank1"]:
+
+    # β-grid stability: a stable RANK with sign-flipping β across lag/det is NOT
+    # an "anchor". Require every valid grid cell's (β_debt, β_real) to keep a
+    # consistent strict sign (P2). anchor_robust = rank robust AND β stable.
+    grid_betas = [b for b in robust["betas"].tolist() if b is not None]
+
+    def _sign_stable(vals):
+        signs = {(1 if v > 0 else -1 if v < 0 else 0) for v in vals}
+        return len(signs) == 1 and 0 not in signs
+
+    beta_grid_stable = bool(grid_betas) and _sign_stable([b[0] for b in grid_betas]) \
+        and _sign_stable([b[1] for b in grid_betas])
+    w["beta_grid_stable"] = beta_grid_stable
+    w["anchor_robust"] = w["robust_unique_rank1"] and beta_grid_stable
+
+    if w["robust_unique_rank1"]:  # estimate VECM whenever rank is robust-unique-1
         try:
             w["vecm"] = estimate_vecm(use, cols, k_ar_diff=k, coint_rank=1, det_order=0)
         except (ValueError, np.linalg.LinAlgError) as e:
@@ -204,14 +227,36 @@ def _run_trivariate(df, notes) -> dict:
     for label, sub in eligible:
         entry["windows"][label] = _run_one_window(sub, label, cols)
 
-    flags = [w["robust_unique_rank1"] for w in entry["windows"].values()]
+    # verdict uses anchor_robust (rank robust-unique-1 AND β-grid sign-stable).
+    flags = [w["anchor_robust"] for w in entry["windows"].values()]
     if len(flags) >= 2:
-        entry["verdict"] = ("robust_both" if all(flags)
-                            else "window_sensitive" if any(flags)
-                            else "not_robust")
+        if all(flags):
+            # both windows anchor-robust → require their VECM "placement" to AGREE
+            # (β₂ sign+significance, λ corrects, where) before claiming robust_both;
+            # rank-1 in both windows with different long-run vectors is NOT robust.
+            sigs = {_vecm_signature(w["vecm"]) for w in entry["windows"].values() if w.get("vecm")}
+            entry["verdict"] = "robust_both" if len(sigs) <= 1 else "window_sensitive"
+        elif any(flags):
+            entry["verdict"] = "window_sensitive"
+        else:
+            entry["verdict"] = "not_robust"
     else:
         entry["verdict"] = "robust_single" if flags[0] else "not_robust"
     return entry
+
+
+def _vecm_signature(v):
+    """Cross-window comparable 'placement' of the real rate: (β₂ sign, β₂
+    significant, λ corrects, where). Two windows are consistent iff equal."""
+    if v is None:
+        return None
+    b2 = v["betas"].get("real_rate_10y", {})
+    b2b = b2.get("beta", 0.0)
+    b2_sign = 1 if b2b > 0 else -1 if b2b < 0 else 0
+    short_sig = any(t["significant"] for t in v["short_run"] if t["var"] == "real_rate_10y")
+    where = ("both" if (b2.get("significant") and short_sig) else
+             "anchor" if b2.get("significant") else "deviation" if short_sig else "neither")
+    return (b2_sign, bool(b2.get("significant")), bool(v["ec_speed"]["corrects"]), where)
 
 
 def _fmt_window_block(w) -> list:
@@ -240,8 +285,13 @@ def _fmt_window_block(w) -> list:
     if not w["all_cells_ok"]:
         rv = (f"网格 {nf}/{nc} 单元数值失败 → **稳健性不足**,不能宣称全设定稳定;"
               f"成功单元 coint_rank∈{ranks}")
-    elif ranks == [1] and w["point"]["coint_rank"] == 1:
-        rv = f"coint_rank=1 在 lag∈{list(ROBUST_LAGS)}×det∈{list(ROBUST_DET_ORDERS)} 全设定下**稳定**(点估计同为 1)"
+    elif w["robust_unique_rank1"]:
+        if w["beta_grid_stable"]:
+            rv = (f"coint_rank=1 在 lag∈{list(ROBUST_LAGS)}×det∈{list(ROBUST_DET_ORDERS)} 全设定下**稳定**"
+                  "(点估计同为 1)且 β(债务,实利率)符号网格内稳定 → **anchor robust**")
+        else:
+            rv = ("coint_rank=1 全设定稳定,但 **β 符号在 lag/det 网格内漂移/跨 0 → 非 anchor robust**"
+                  "(rank 稳不代表长期向量稳)")
     elif ranks == [0]:
         rv = "coint_rank=0 在所有设定下**稳定** → **无协整**"
     else:
@@ -271,10 +321,10 @@ def _fmt_trivariate(tri) -> list:
     for w in tri["windows"].values():
         L.extend(_fmt_window_block(w))
 
-    vmap = {"robust_both": "两个窗口均 robust-unique-rank-1 且一致 → **稳健成立**",
-            "robust_single": "唯一合格窗口 robust-unique-rank-1 → 该窗口内**成立**(另一窗口非全-I(1),无法交叉验证)",
-            "window_sensitive": "**窗口间结论冲突(一个稳健、一个不稳健)→ 样本窗口敏感,不判稳健成立**",
-            "not_robust": "无窗口 robust-unique-rank-1 → **不稳健**"}
+    vmap = {"robust_both": "两个窗口均 anchor-robust(rank=1 + β 符号稳定)且 VECM 落点一致 → **稳健成立**",
+            "robust_single": "唯一合格窗口 anchor-robust(rank+β 稳定)→ 该窗口内**成立**(另一窗口非全-I(1),无法交叉验证)",
+            "window_sensitive": "**窗口间冲突(rank/β 稳健性或 VECM 落点不一致)→ 样本窗口敏感,不判稳健成立**",
+            "not_robust": "无窗口 anchor-robust(rank 不稳/β 漂移/无协整)→ **不稳健**"}
     L.append(f"\n- **跨窗口裁决 (推理): {vmap.get(tri['verdict'], tri['verdict'])}**")
     return L
 
@@ -473,16 +523,17 @@ def _build_report(df, notes, itab, jres, args, rr_segs=None, tri=None) -> str:
                 short_sig = any(t["significant"] for t in v["short_run"] if t["var"] == "real_rate_10y")
                 where = ("锚里+偏离里" if (long_sig and short_sig) else
                          "锚里" if long_sig else "偏离里" if short_sig else "都不显著")
-                cross = ("两窗口一致" if verdict == "robust_both" else "仅此窗口合格")
-                L.append(f"- **三变量锚成立 ({cross}, 窗口={wv['window']}, coint_rank 全网格唯一=1) (事实/推理)。** "
+                cross = ("两窗口 rank+β 稳定且 VECM 落点一致" if verdict == "robust_both"
+                         else "仅此窗口合格")
+                L.append(f"- **三变量锚成立 ({cross}, 窗口={wv['window']}, rank=1 全网格 + β 符号稳定) (事实/推理)。** "
                          f"长期 β₁(债务)={v['betas']['ln_debt_gdp']['beta']:.3f}, "
                          f"β₂(实利率)={b2.get('beta', float('nan')):.3f} "
                          f"(p={b2.get('p', float('nan')):.3f}); 误差修正 λ={ec['lambda']:.3f} "
                          f"(p={ec['p']:.3f}, 修正={ec['corrects']}) (事实)。")
                 L.append(f"- **实利率落点: {where}** (推理) — 回答了 spec §修订的核心问句。")
         elif verdict == "window_sensitive":
-            L.append("- **窗口间结论冲突: 一个窗口稳健 rank=1、另一个不稳健 → 样本窗口敏感,"
-                     "不判三变量锚稳健成立 (事实/推理)。**")
+            L.append("- **窗口间冲突: rank/β 稳健性或 VECM 落点(β₂ 符号/显著性、λ 修正)在 full 与 "
+                     "clean 窗口不一致 → 样本窗口敏感,不判三变量锚稳健成立 (事实/推理)。**")
             L.append("- ⚠️ **杀死条件触发 (扩展)**: 锚结论依赖样本窗口选择 → "
                      "留待 regime-switching / 断点协整 (PR #3)。")
         else:  # not_robust

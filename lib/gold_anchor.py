@@ -476,7 +476,9 @@ def integration_segments(series, segments: Dict[str, tuple], alpha: float = 0.05
                          min_obs: int = 20) -> Dict[str, Dict[str, object]]:
     """Run the dual-regression (c + ct) I(d) verdict on named sub-windows of a
     single series. ``segments`` maps a label → (start, end) bounds (either may
-    be None for open-ended). Returns label → {combined, c, ct, n, start, end}.
+    be None for open-ended). Returns label → {combined, c, ct, n, start, end}
+    — lightweight, JSON-serializable fields only (the full c_res/ct_res test
+    objects are intentionally NOT returned; callers only need the verdicts).
 
     Used to read the long-end real rate on two regimes separately: the full
     spliced series (GS10−CPI proxy pre-TIPS + DFII10) vs the clean post-TIPS
@@ -496,7 +498,6 @@ def integration_segments(series, segments: Dict[str, tuple], alpha: float = 0.05
         cv = combined_verdict(seg, alpha=alpha, min_obs=min_obs)
         out[name] = {
             "combined": cv["combined"], "c": cv["c"], "ct": cv["ct"],
-            "c_res": cv["c_res"], "ct_res": cv["ct_res"],
             "n": int(len(seg)),
             "start": (seg.index.min().date().isoformat() if len(seg) else None),
             "end": (seg.index.max().date().isoformat() if len(seg) else None),

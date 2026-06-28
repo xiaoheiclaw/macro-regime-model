@@ -383,7 +383,9 @@ def test_johansen_trivariate_betas_contract():
         index=idx,
     )
     j = johansen_test(df, list(df.columns), k_ar_diff=1)
-    assert (j["betas"] is None) == (not j["valid_coint"])  # invariant
+    # β populated iff the relation is both VALID and UNIQUE (matches the impl)
+    expected = j["valid_coint"] and j["coint_rank"] == 1
+    assert (j["betas"] is not None) == expected
     if j["betas"] is not None:
         assert len(j["betas"]) == 2
 
@@ -478,6 +480,26 @@ def test_estimate_vecm_validates_inputs():
         estimate_vecm(df.iloc[:20], cols, k_ar_diff=1)       # too few rows
     with pytest.raises(ValueError):
         estimate_vecm(df, cols, k_ar_diff=1, coint_rank=2)   # rank>1 → no unique β
+
+
+def test_vecm_signature_distinguishes_placement():
+    # cross-window consistency key: opposite β₂ signs (or different significance /
+    # λ-correction) → different signatures → would be flagged window_sensitive.
+    from scripts.gold_anchor_analysis import _vecm_signature
+
+    def fake(beta2, b2_sig, lam_corrects, rr_short_sig):
+        return {
+            "betas": {"real_rate_10y": {"beta": beta2, "significant": b2_sig}},
+            "ec_speed": {"corrects": lam_corrects},
+            "short_run": [{"var": "real_rate_10y", "lag": 1, "significant": rr_short_sig}],
+        }
+
+    base = _vecm_signature(fake(-0.5, True, True, False))
+    same = _vecm_signature(fake(-0.4, True, True, False))   # same sign/flags
+    flip = _vecm_signature(fake(+0.5, True, True, False))   # β₂ sign flipped
+    assert base == same          # consistent → robust_both allowed
+    assert base != flip          # inconsistent → window_sensitive
+    assert _vecm_signature(None) is None
 
 
 def test_estimate_vecm_alpha_threshold_propagates():
