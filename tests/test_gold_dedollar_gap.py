@@ -35,6 +35,7 @@ from lib.gold_dedollar_gap import (
     rolling_ols_resid,
     rolling_percentile,
     rolling_zscore,
+    zscore_over,
 )
 
 
@@ -94,6 +95,42 @@ def test_di_missing_component_fallback():
     _close_equal_nan(res.di, res.components["cb_cum_excess"])
 
 
+def test_di_rejects_negative_weights():
+    """A negative weight would invert a sign-oriented leg → reject (codex P2)."""
+    df = _panel()
+    with pytest.raises(ValueError):
+        build_di(df, weights={"cb_cum_excess": -1.0, "custody_share": 2.0})
+
+
+def test_di_zscore_over_common_window():
+    """Components are z-scored over their COMMON coverage, not each own coverage
+    (codex P2): a longer-history leg's out-of-common-window months must not shift
+    its mean/std used in DI."""
+    idx = pd.date_range("2002-12-31", periods=60, freq="ME")
+    # custody present for the whole span; cb only from index 24 onward.
+    custody = pd.Series(np.linspace(0.30, 0.20, 60), index=idx)  # falling
+    cb = pd.Series(np.nan, index=idx)
+    cb.iloc[24:] = np.arange(36, dtype=float)
+    df = pd.DataFrame({"cb_cum_excess": cb, "custody_share": custody}, index=idx)
+    res = build_di(df)
+    common = idx[24:]
+    # custody's signed z in the result must equal a z computed on the COMMON window
+    expected = zscore_over(custody, common) * (-1.0)
+    _close_equal_nan(res.components["custody_share"], expected)
+    assert "common-coverage" in res.notes["z_base"]
+
+
+def test_zscore_over_uses_baseline_only():
+    s = pd.Series([1.0, 2.0, 3.0, 100.0],
+                  index=pd.date_range("2010-01-31", periods=4, freq="ME"))
+    base = s.index[:3]
+    z = zscore_over(s, base)
+    # mean/std from first 3 (1,2,3): mean=2, std(ddof0)=0.8165
+    np.testing.assert_allclose(z.iloc[0], (1 - 2) / np.std([1, 2, 3]), atol=1e-9)
+    # the out-of-baseline outlier is standardized by the baseline scale, not its own
+    np.testing.assert_allclose(z.iloc[3], (100 - 2) / np.std([1, 2, 3]), atol=1e-9)
+
+
 def test_di_all_components_missing_raises():
     idx = pd.date_range("2010-01-31", periods=12, freq="ME")
     df = pd.DataFrame({"cb_cum_excess": np.nan, "custody_share": np.nan}, index=idx)
@@ -142,6 +179,16 @@ def test_rolling_resid_sign_positive_when_gold_above():
     y2.iloc[-1] += 0.5  # gold jumps above the fundamentals-implied level
     resid1 = rolling_ols_resid(y2, di, w)
     assert resid1.dropna().iloc[-1] > 0.4
+
+
+def test_rolling_resid_rejects_misaligned_index():
+    """y/x are read positionally → a mismatched index must raise (codex P3)."""
+    y = pd.Series(np.arange(10.0),
+                  index=pd.date_range("2010-01-31", periods=10, freq="ME"))
+    x = pd.Series(np.arange(10.0),
+                  index=pd.date_range("2011-01-31", periods=10, freq="ME"))
+    with pytest.raises(ValueError):
+        rolling_ols_resid(y, x, 6)
 
 
 def test_rolling_resid_constant_x_window_is_nan():
@@ -346,3 +393,37 @@ def test_build_gap_panel_offline_injection():
     di_res = build_di(df)
     dev = compute_deviation(df["ln_gold"], di_res.di, window=24)
     assert dev.resid.notna().any()
+
+
+def test_build_gap_panel_does_not_forward_fetch_fn_to_dedollar():
+    """fetch_fn (CPI/DXY) must NOT reach the dedollar panel; an explicit
+    dedollar_fetch_fn does (codex P2)."""
+    idx = pd.date_range("2010-01-31", periods=12, freq="ME")
+    base = pd.DataFrame(
+        {"gold_nominal": pd.Series(np.exp(np.arange(12) * 0.01 + 6), index=idx),
+         "custody_share": pd.Series(np.linspace(0.3, 0.25, 12), index=idx)},
+        index=idx)
+    seen = {}
+
+    def fake_dedollar(**kw):
+        seen.update(kw)
+        return SimpleNamespace(data=base, notes={})
+
+    def fake_fetch(series_id, start):
+        di = pd.date_range("2009-12-31", periods=500, freq="D")
+        return pd.Series(200.0 + np.arange(len(di)) * 0.01, index=di)
+
+    def fake_wgc(start, end):
+        return pd.Series(np.arange(12.0), index=idx)
+
+    # default: fetch_fn is NOT forwarded
+    build_gap_panel(start="2010-01", end="2010-12", fetch_fn=fake_fetch,
+                    dedollar_fn=fake_dedollar, wgc_fn=fake_wgc)
+    assert "fetch_fn" not in seen
+
+    # explicit dedollar_fetch_fn IS forwarded
+    seen.clear()
+    build_gap_panel(start="2010-01", end="2010-12", fetch_fn=fake_fetch,
+                    dedollar_fetch_fn=fake_fetch, dedollar_fn=fake_dedollar,
+                    wgc_fn=fake_wgc)
+    assert seen.get("fetch_fn") is fake_fetch

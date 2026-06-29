@@ -112,15 +112,28 @@ HIGH_Z = 1.5
 
 # ── small stats helpers (kept local; mirror the repo's _zscore / leak-free
 #    rank conventions rather than importing private names) ─────────────────
-def full_zscore(s: pd.Series) -> pd.Series:
-    """Full-sample z-score: (s − mean) / std (ddof=0), NaN-preserving. A constant
-    or all-NaN series → all zeros / NaN (no div-by-0). Descriptive / in-sample by
-    construction — used for the 'vs whole history' headline reads."""
-    sv = s.dropna()
-    sd = float(sv.std(ddof=0)) if len(sv) else np.nan
+def zscore_over(s: pd.Series, base_index: Optional[pd.Index] = None) -> pd.Series:
+    """z-score `s` using the mean/std computed over `base_index` (the *baseline*
+    window), applied to the full series. ``base_index=None`` → use s's own full
+    coverage (the plain full-sample z-score). NaN-preserving; a constant/empty
+    baseline → all zeros / NaN (no div-by-0).
+
+    The explicit baseline lets ``build_di`` standardize every component on the
+    *common* eligible window so the composite's scale is internally consistent on
+    the window DI is actually reported (codex PR#14 P2), instead of letting a
+    longer-history leg's out-of-window data shift its mean/std."""
+    base = s.dropna() if base_index is None else s.reindex(base_index).dropna()
+    sd = float(base.std(ddof=0)) if len(base) else np.nan
     if not (np.isfinite(sd) and sd > 0):
         return s - s  # preserves NaN positions; constant → 0.0
-    return (s - float(sv.mean())) / sd
+    return (s - float(base.mean())) / sd
+
+
+def full_zscore(s: pd.Series) -> pd.Series:
+    """Full-sample z-score (= ``zscore_over(s, None)``): (s − mean) / std (ddof=0),
+    NaN-preserving. Descriptive / in-sample by construction — used for the
+    'vs whole history' headline reads."""
+    return zscore_over(s, None)
 
 
 def rolling_zscore(s: pd.Series, window: int) -> pd.Series:
@@ -191,6 +204,7 @@ def build_gap_panel(
     *,
     fetch_fn: Callable[[str, str], pd.Series] = fetch_fred_series,
     dedollar_fn: Callable[..., object] = build_dedollar_panel,
+    dedollar_fetch_fn: Optional[Callable[[str, str], pd.Series]] = None,
     wgc_fn: Optional[Callable[[str, Optional[str]], pd.Series]] = None,
     include_dxy: bool = False,
     cpi_id: str = DEFAULT_CPI_ID,
@@ -208,10 +222,16 @@ def build_gap_panel(
       * cb_cum_excess comes from ``make_wgc_fn(signal='cum_excess')`` (PR #10);
         inject ``wgc_fn`` to override.
       * ``fetch_fn`` covers ONLY this module's own pulls (CPI, optional DXY); it is
-        NOT forwarded to the dedollar panel's own (anchor) fetchers, so a caller
-        stubbing CPI cannot corrupt the base gold/custody panel.
+        **never** forwarded to the dedollar panel, which owns its own
+        (gold/custody/anchor) fetchers — so a caller stubbing just CPI cannot
+        silently corrupt the base gold/custody panel (codex PR#14 P2). To inject
+        the dedollar panel's fetcher explicitly (e.g. an alternative custody
+        vintage), pass the separate ``dedollar_fetch_fn``.
     """
-    dp = dedollar_fn(start=start, end=end, fetch_fn=fetch_fn)
+    if dedollar_fetch_fn is not None:
+        dp = dedollar_fn(start=start, end=end, fetch_fn=dedollar_fetch_fn)
+    else:
+        dp = dedollar_fn(start=start, end=end)
     base = dp.data  # type: ignore[attr-defined]
     keep = [c for c in ("gold_nominal", "custody_share",
                         "foreign_official_custody", "total_public_debt")
@@ -285,10 +305,16 @@ def build_di(
     """Build the de-dollarization index = weighted sum of signed z-scored
     components.
 
-    * Each component column is z-scored over its own coverage and multiplied by
-      its sign (so larger = more de-dollarization).
-    * ``weights`` (col→w) default to equal weight; they are renormalized to sum to
-      1 over the components actually present (the missing-component fallback).
+    * Each present component is z-scored over the **common eligible window** (the
+      months where every present component is observed) so the composite's scale
+      is internally consistent on the window DI is reported on (codex PR#14 P2);
+      if there is no common overlap it falls back to per-component own coverage
+      (recorded in notes). Each z is then multiplied by its sign (so larger = more
+      de-dollarization).
+    * ``weights`` (col→w) default to equal weight; they must be **non-negative**
+      (a negative weight would invert an already sign-oriented leg and break the
+      'larger = more de-dollarization' contract) and are renormalized to sum to 1
+      over the components actually present (the missing-component fallback).
     * A component that is **entirely NaN** (or absent from the panel) is dropped
       and recorded in ``dropped``; remaining weights renormalize.
     * DI at a row is the weighted mean over the components **non-NaN at that row**,
@@ -300,23 +326,37 @@ def build_di(
     dropped list, notes)."""
     if not components:
         raise ValueError("components must be non-empty")
-    signed: Dict[str, pd.Series] = {}
-    dropped: List[str] = []
-    for col, sign in components:
-        if col not in panel.columns or panel[col].dropna().empty:
-            dropped.append(col)
-            continue
-        signed[col] = full_zscore(panel[col]) * float(sign)
-    if not signed:
+    present = [c for c, _ in components
+               if c in panel.columns and not panel[c].dropna().empty]
+    dropped = [c for c, _ in components if c not in present]
+    if not present:
         raise ValueError(
             f"no usable components (all of {[c for c, _ in components]} are "
             "absent or all-NaN)")
 
-    present = list(signed.keys())
+    # common eligible window = months where EVERY present component is observed.
+    common_idx: Optional[pd.Index] = None
+    for c in present:
+        vi = panel[c].dropna().index
+        common_idx = vi if common_idx is None else common_idx.intersection(vi)
+    if common_idx is not None and len(common_idx) == 0:
+        common_idx = None  # no overlap → fall back to own-coverage z-score
+    z_base = ("common-coverage" if common_idx is not None
+              else "own-coverage (no common window)")
+
+    sign_map = {c: s for c, s in components}
+    signed: Dict[str, pd.Series] = {
+        c: zscore_over(panel[c], common_idx) * float(sign_map[c]) for c in present
+    }
+
     if weights is None:
         w = {c: 1.0 for c in present}
     else:
         w = {c: float(weights.get(c, 0.0)) for c in present}
+        if any(v < 0 for v in w.values()):
+            raise ValueError(
+                f"weights must be non-negative (a negative weight inverts a "
+                f"sign-oriented component), got {w}")
         if sum(w.values()) <= 0:
             raise ValueError(
                 f"weights over present components {present} sum to <= 0")
@@ -342,6 +382,7 @@ def build_di(
         "definition": "DI = Σ w_i · sign_i · z(component_i); per-row weighted mean "
                       "over present components (renormalized); larger = more "
                       "de-dollarization.",
+        "z_base": f"components z-scored over {z_base}",
         "weights": ", ".join(f"{c}={w[c]:.3f}" for c in present),
         "min_present": str(min_present),
     }
@@ -366,6 +407,12 @@ def rolling_ols_resid(y: pd.Series, x: pd.Series, window: int) -> pd.Series:
     relationship."""
     if window < 3:
         raise ValueError(f"window must be >= 3 (need slope + intercept), got {window}")
+    if not y.index.equals(x.index):
+        # the function reads y/x positionally; a misaligned index would silently
+        # pair the wrong rows (codex PR#14 P3). Callers must align first.
+        raise ValueError(
+            "y and x must share an identical index; align/reindex before calling "
+            "(e.g. via compute_deviation, which intersects then reindexes)")
     yv = y.astype(float)
     xv = x.astype(float)
     out = pd.Series(np.nan, index=y.index, dtype="float64")

@@ -163,6 +163,16 @@ def main() -> None:
     dev_diff = compute_deviation(dln_gold, ddi, window=args.reg_window)
     cr_diff = current_reading(dev_diff, ddi, roll_window=args.reg_window)
 
+    # ── guard degenerate states before rendering (codex PR#14 P1) ──
+    di_cov = di.dropna()
+    if di_cov.empty:
+        raise RuntimeError(
+            "DI has no valid months — the de-dollarization components have no "
+            "common overlap on this window; cannot compute a deviation reading. "
+            "Widen --start/--end or check the component coverage in the panel.")
+    asof_str = cr_nom.asof.strftime("%Y-%m") if cr_nom.asof is not None else "n/a"
+    di_latest_str = _fmt(di_cov.iloc[-1])
+
     # ── write report ──
     os.makedirs(args.out_dir, exist_ok=True)
     report_path = os.path.join(args.out_dir, f"gold_dedollar_gap_{file_stamp}.md")
@@ -175,7 +185,7 @@ def main() -> None:
     P.append(f"**{label}** — {verdict_msg}\n")
     P.append("- 名义口径 ln(gold) vs DI:当前偏离 "
              f"z={_fmt(cr_nom.gap_z_full)},历史分位 {_fmt_pct(cr_nom.gap_pct_full)}"
-             f"(截至 {cr_nom.asof:%Y-%m} ); 滚动分位 {_fmt_pct(cr_nom.gap_pct_roll)}。")
+             f"(截至 {asof_str} ); 滚动分位 {_fmt_pct(cr_nom.gap_pct_roll)}。")
     P.append("- 实际购买力口径 ln(gold/CPI) vs DI:当前偏离 "
              f"z={_fmt(cr_real.gap_z_full)},历史分位 {_fmt_pct(cr_real.gap_pct_full)}。")
     P.append(f"- DI 自身历史分位 {_fmt_pct(cr_nom.di_pct_full)}(去美元化基本面本身处于"
@@ -196,9 +206,9 @@ def main() -> None:
                      f"{cov.index.max():%Y-%m} (n={len(cov)})")
         else:
             P.append(f"  - `{c}` (sign {sgn}) 无数据")
-    di_cov = di.dropna()
+    P.append(f"- DI z-score 基准: {di_res.notes.get('z_base', 'n/a')}。")
     P.append(f"- DI 时序覆盖: {di_cov.index.min():%Y-%m}..{di_cov.index.max():%Y-%m} "
-             f"(n={len(di_cov)});DI 最新值 {_fmt(di_cov.iloc[-1])}。\n")
+             f"(n={len(di_cov)});DI 最新值 {di_latest_str}。\n")
 
     P.append("## 2. 金价相对 DI 的偏离度 (两口径)\n")
     P.append("偏离度 = ln(gold) 对 DI 的**滚动 OLS** 残差,再标准化。滚动(非全样本"
