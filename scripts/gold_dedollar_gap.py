@@ -175,7 +175,15 @@ def main() -> None:
             "common overlap on this window; cannot compute a deviation reading. "
             "Widen --start/--end or check the component coverage in the panel.")
     asof_str = cr_nom.asof.strftime("%Y-%m") if cr_nom.asof is not None else "n/a"
-    di_latest_str = _fmt(di_cov.iloc[-1])
+    # all "current" DI displays align to the verdict's asof, not DI's last month
+    # (which may lag/lead it) — codex PR#14 R6 P2.
+    if cr_nom.asof is not None:
+        di_asof_cov = di.loc[:cr_nom.asof].dropna()
+        di_at_asof = di.reindex([cr_nom.asof]).iloc[0]
+        di_latest_str = _fmt(di_at_asof)
+    else:
+        di_asof_cov = di_cov
+        di_latest_str = _fmt(di_cov.iloc[-1])
 
     # ── write report ──
     os.makedirs(args.out_dir, exist_ok=True)
@@ -212,8 +220,10 @@ def main() -> None:
         else:
             P.append(f"  - `{c}` (sign {sgn}) 无数据")
     P.append(f"- DI z-score 基准: {di_res.notes.get('z_base', 'n/a')}。")
-    P.append(f"- DI 时序覆盖: {di_cov.index.min():%Y-%m}..{di_cov.index.max():%Y-%m} "
-             f"(n={len(di_cov)});DI 最新值 {di_latest_str}。\n")
+    P.append(f"- DI 时序覆盖(截至裁决 asof {asof_str}): "
+             f"{di_asof_cov.index.min():%Y-%m}..{di_asof_cov.index.max():%Y-%m} "
+             f"(n={len(di_asof_cov)});DI@asof 值 {di_latest_str}"
+             f"(数据集 DI 最新月 {di_cov.index.max():%Y-%m})。\n")
 
     P.append("## 2. 金价相对 DI 的偏离度 (两口径)\n")
     P.append("偏离度 = ln(gold) 对 DI 的**滚动 OLS** 残差,再标准化。滚动(非全样本"

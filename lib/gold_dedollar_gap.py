@@ -162,17 +162,32 @@ def full_percentile(s: pd.Series, value: Optional[float] = None) -> float:
 
 def rolling_percentile(s: pd.Series, window: int) -> pd.Series:
     """Leak-free trailing percentile rank ∈[0,1] of `s` within its trailing
-    `window` (mirrors the PR #8 dedollar_rank construction): 0 = trailing-window
-    min, 1 = max. NaN until the window fills and on all-NaN input. A degenerate
-    flat window (max==min, no information) → NaN. Trailing → ex-ante."""
+    `window`: the current value equal to the window **max → 1.0** and equal to the
+    window **min → 0.0** (even under ties), otherwise the fraction of the window
+    strictly below it. NaN until the window fills, on all-NaN input, and on a
+    degenerate flat window (max==min, no information). Trailing → ex-ante.
+
+    Defined via an explicit last-point rule rather than ``rank(method='min')``,
+    which floors a tied maximum below 1.0 and would systematically depress the
+    percentile of low-volatility / discretized residuals (codex PR#14 R6 P3)."""
     if window < 2:
         raise ValueError(f"window must be >= 2, got {window}")
-    roll = s.rolling(window, min_periods=window)
-    raw = roll.rank(method="min")
-    rank = ((raw - 1.0) / (window - 1.0)).clip(lower=0.0, upper=1.0)
-    rmin, rmax = roll.min(), roll.max()
-    rank[rmax == rmin] = np.nan
-    return rank
+
+    def _pct_last(arr: np.ndarray) -> float:
+        cur = arr[-1]
+        mx = arr.max()
+        mn = arr.min()
+        if mx == mn:
+            return np.nan  # flat window → no information
+        if cur >= mx:
+            return 1.0
+        if cur <= mn:
+            return 0.0
+        return float((arr < cur).sum()) / (len(arr) - 1)
+
+    # min_periods=window ⇒ called only on full windows of finite values, so the
+    # raw array passed to _pct_last never contains NaN.
+    return s.rolling(window, min_periods=window).apply(_pct_last, raw=True)
 
 
 def _to_monthly_last(s: pd.Series) -> pd.Series:
@@ -647,7 +662,8 @@ def current_reading(
     residual) so the "current" reading never mixes dates (codex PR#14 P2): the
     rolling percentile is taken at `asof` (NaN if undefined there, not the last
     non-NaN month before it), and the DI percentile uses DI's value at `asof`
-    within the full DI history.
+    within **DI history up to and including `asof`** (never months after it, even
+    if DI extends past the last residual — codex PR#14 R6 P2).
 
     A **degenerate** residual (constant / fewer than 2 distinct values) carries no
     deviation information, yet ``full_percentile`` would return 1.0 on it and
@@ -656,10 +672,10 @@ def current_reading(
     ``n_resid`` / ``di_pct_full`` are still reported."""
     resid = dev.resid.dropna()
     asof = resid.index.max() if not resid.empty else None
-    di_hist = di.dropna()
     if asof is None:
         return CurrentReading(asof=None, gap_z_full=np.nan, gap_pct_full=np.nan,
                               gap_pct_roll=np.nan, di_pct_full=np.nan, n_resid=0)
+    di_hist = di.loc[:asof].dropna()  # ≤ asof only — no post-asof leakage
     di_at_asof0 = di.reindex([asof]).iloc[0]
     di_pct = (full_percentile(di_hist, float(di_at_asof0))
               if np.isfinite(di_at_asof0) else np.nan)

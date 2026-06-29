@@ -394,6 +394,19 @@ def test_rolling_percentile_leak_free_and_range():
     assert pv.min() >= 0.0 and pv.max() <= 1.0
 
 
+def test_rolling_percentile_tied_max_is_one():
+    """A current value equal to the window max returns 1.0 even under ties (codex
+    R6 P3); rank(method='min') would have floored it below 1.0."""
+    idx = pd.date_range("2010-01-31", periods=6, freq=pd.offsets.MonthEnd())
+    # window of 4: [1, 5, 5, 5] — current (last) ties the max → 1.0; min → 0.0
+    s = pd.Series([0.0, 1.0, 5.0, 5.0, 5.0, 0.0], index=idx)
+    pct = rolling_percentile(s, 4)
+    # at idx[4]: window [5,5,5,5]? no — window = s[1:5] = [1,5,5,5]; last=5=max → 1.0
+    np.testing.assert_allclose(pct.iloc[4], 1.0)
+    # at idx[5]: window = s[2:6] = [5,5,5,0]; last=0=min → 0.0
+    np.testing.assert_allclose(pct.iloc[5], 0.0)
+
+
 def test_rolling_percentile_flat_window_is_nan():
     idx = pd.date_range("2010-01-31", periods=20, freq=pd.offsets.MonthEnd())
     s = pd.Series(np.ones(20), index=idx)
@@ -470,6 +483,29 @@ def test_current_reading_fields():
     assert cr.asof is not None
     assert 0.0 <= cr.gap_pct_full <= 1.0
     assert 0.0 <= cr.di_pct_full <= 1.0
+
+
+def test_di_percentile_ignores_post_asof_months():
+    """di_pct_full uses DI history ≤ asof only — a post-asof spike must not move it
+    (codex R6 P2)."""
+    from lib.gold_dedollar_gap import DeviationResult
+    idx = pd.date_range("2010-01-31", periods=100, freq=pd.offsets.MonthEnd())
+    # residual defined only through month 60; DI extends to month 99 with a spike
+    resid = pd.Series(np.nan, index=idx)
+    rng = np.random.RandomState(71)
+    resid.iloc[:61] = rng.randn(61)
+    dev = DeviationResult(resid=resid, gap_z_roll=full_zscore(resid),
+                          gap_z_full=full_zscore(resid), window=36)
+    di = pd.Series(np.linspace(0.0, 1.0, 100), index=idx)  # rising
+    di_spiked = di.copy()
+    di_spiked.iloc[61:] = 1e6  # huge post-asof values
+    cr_a = current_reading(dev, di, roll_window=36)
+    cr_b = current_reading(dev, di_spiked, roll_window=36)
+    assert cr_a.asof == idx[60]
+    # DI percentile identical — post-asof spike ignored
+    np.testing.assert_allclose(cr_a.di_pct_full, cr_b.di_pct_full, atol=1e-12)
+    # and the asof DI value sits at the top of its ≤asof history (rising series)
+    assert cr_a.di_pct_full == 1.0
 
 
 def test_current_reading_is_asof_aligned():
