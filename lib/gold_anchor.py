@@ -798,3 +798,801 @@ def estimate_vecm(
         "ec_speed": ec_speed,
         "short_run": short_run,
     }
+
+
+# ── Gregory-Hansen cointegration with a single endogenous break (step 3) ─
+# PR #3. PR #1 (bivariate Johansen) and PR #2 (trivariate Johansen) both fail to
+# find a STABLE constant-parameter cointegrating relation. The next falsifiable
+# question (spec §2 cross-validation): is the anchor *segmented* — i.e. does a
+# cointegrating relation exist once we allow ONE structural break (level shift /
+# regime shift) at an unknown date? Gregory & Hansen (1996, J. Econometrics 70)
+# answer this with a residual-based test whose null is "no cointegration" and
+# whose alternative is "cointegration with a regime shift at an unknown break".
+#
+# Procedure (GH 1996):
+#   For every candidate break index in the trimmed interior τ∈[trim, 1−trim]:
+#     fit the cointegrating regression with a break dummy φ_t = 1{t > [Tτ]}:
+#       model "C"  (level shift)  : y1 = μ1 + μ2·φ + αᵀy2 + e
+#       model "C/T"(level+trend)  : y1 = μ1 + μ2·φ + β·t + αᵀy2 + e
+#       model "C/S"(regime shift) : y1 = μ1 + μ2·φ + α1ᵀy2 + α2ᵀ(y2·φ) + e
+#     then test the residual e for a unit root (ADF*, Phillips Zt*, Zα*).
+#   The GH statistic for each flavor = the SMALLEST (most negative) statistic
+#   across all break points; the argmin is the estimated break. Reject "no
+#   cointegration" when the GH statistic < the GH critical value (which is more
+#   negative than the standard ADF/PP CVs because we minimized over breaks).
+#
+# Critical values: Gregory & Hansen (1996) Table 1, indexed by model and m =
+# number of I(1) regressors (m=1 bivariate, m=2 trivariate). ADF* and Zt* share
+# one CV table; Zα* has its own.
+_GH_CV = {
+    "C": {  # level shift
+        "adf_zt": {
+            1: {0.01: -5.13, 0.05: -4.61, 0.10: -4.34},
+            2: {0.01: -5.44, 0.05: -4.92, 0.10: -4.69},
+            3: {0.01: -5.77, 0.05: -5.28, 0.10: -5.02},
+            4: {0.01: -6.05, 0.05: -5.56, 0.10: -5.31},
+        },
+        "zalpha": {
+            1: {0.01: -50.07, 0.05: -40.48, 0.10: -36.19},
+            2: {0.01: -57.28, 0.05: -47.96, 0.10: -43.22},
+            3: {0.01: -63.64, 0.05: -53.58, 0.10: -48.65},
+            4: {0.01: -70.27, 0.05: -59.40, 0.10: -54.38},
+        },
+    },
+    "C/T": {  # level shift with trend
+        "adf_zt": {
+            1: {0.01: -5.45, 0.05: -4.99, 0.10: -4.72},
+            2: {0.01: -5.80, 0.05: -5.29, 0.10: -5.03},
+            3: {0.01: -6.05, 0.05: -5.57, 0.10: -5.33},
+            4: {0.01: -6.36, 0.05: -5.83, 0.10: -5.59},
+        },
+        "zalpha": {
+            1: {0.01: -57.01, 0.05: -47.65, 0.10: -43.34},
+            2: {0.01: -64.77, 0.05: -53.92, 0.10: -48.94},
+            3: {0.01: -70.15, 0.05: -59.76, 0.10: -54.94},
+            4: {0.01: -76.10, 0.05: -65.44, 0.10: -60.12},
+        },
+    },
+    "C/S": {  # regime shift (level + slope)
+        "adf_zt": {
+            1: {0.01: -5.47, 0.05: -4.95, 0.10: -4.68},
+            2: {0.01: -5.97, 0.05: -5.50, 0.10: -5.23},
+            3: {0.01: -6.51, 0.05: -6.00, 0.10: -5.75},
+            4: {0.01: -6.92, 0.05: -6.41, 0.10: -6.17},
+        },
+        "zalpha": {
+            1: {0.01: -57.17, 0.05: -47.04, 0.10: -41.85},
+            2: {0.01: -68.21, 0.05: -58.33, 0.10: -52.85},
+            3: {0.01: -80.15, 0.05: -68.94, 0.10: -63.42},
+            4: {0.01: -90.84, 0.05: -78.87, 0.10: -72.75},
+        },
+    },
+}
+
+
+def gregory_hansen_min_obs(m: int, max_lag: int = 6) -> int:
+    """Minimum complete rows ``gregory_hansen_test`` requires for ``m`` regressors
+    and ``max_lag`` ADF augmentation. Exposed so callers gate on the SAME bound
+    the test enforces internally (no divergent magic thresholds)."""
+    n_params_cs = 2 + 2 * m  # the largest design (C/S)
+    return max(40, 4 * (n_params_cs + max_lag))
+
+
+def _gh_critical_values(model: str, m: int, stat: str) -> Optional[Dict[float, float]]:
+    """GH (1996) Table 1 critical values for ``model`` (C / C/T / C/S), ``m``
+    I(1) regressors, and ``stat`` ('adf'/'zt' share a table; 'zalpha' its own).
+    Returns {0.01,0.05,0.10: cv} or None if m is outside the tabulated 1..4. A
+    COPY is returned so a caller mutating it cannot corrupt the module table."""
+    table = _GH_CV[model]["zalpha" if stat == "zalpha" else "adf_zt"]
+    cv = table.get(m)
+    return dict(cv) if cv is not None else None
+
+
+def _adf_resid_stat(resid: np.ndarray, max_lag: int) -> tuple:
+    """ADF* t-statistic on cointegrating residuals — NO deterministic term
+    (regression='n'), since the residuals are mean-zero by OLS construction.
+    Lag chosen by AIC up to ``max_lag`` (GH use a data-dependent ADF lag).
+    Returns (stat, used_lag)."""
+    from statsmodels.tsa.stattools import adfuller
+
+    res = adfuller(np.asarray(resid, dtype=float), maxlag=max_lag,
+                   regression="n", autolag="AIC")
+    return float(res[0]), int(res[2])
+
+
+def _phillips_z_resid(resid: np.ndarray, bandwidth: Optional[int] = None) -> tuple:
+    """Phillips (1987) Zα and Zt unit-root statistics for the residual AR(1)
+    e_t = ρ·e_{t-1} + u_t (NO intercept — residuals are mean-zero by OLS).
+
+    Long-run variance λ̂² uses a Bartlett kernel; default bandwidth is the
+    Newey-West rule l = floor(4·(n/100)^{2/9}). Formulas follow Hamilton (1994)
+    §17.6 (Phillips-Perron, no-deterministic case):
+
+        Zα = n(ρ̂−1) − ½(λ̂²−γ̂₀)·n²/M
+        Zt = √(γ̂₀/λ̂²)·t_ρ − ((λ̂²−γ̂₀)/(2λ̂))·(n/√M)
+
+    where M = Σ e_{t-1}², γ̂₀ = (1/n)Σû², t_ρ = (ρ̂−1)√M/s_ols.
+    Returns (z_alpha, z_t, rho, bandwidth)."""
+    e = np.asarray(resid, dtype=float)
+    y, ylag = e[1:], e[:-1]
+    M = float(ylag @ ylag)
+    if M <= 0:
+        raise ValueError("phillips_z: degenerate residual (Σe_{t-1}²≤0)")
+    rho = float(y @ ylag) / M
+    u = y - rho * ylag
+    n = len(u)
+    ssr = float(u @ u)
+    if ssr <= 0 or n < 3:
+        raise ValueError("phillips_z: degenerate residual autoregression")
+    gamma0 = ssr / n
+    s_ols = np.sqrt(ssr / (n - 1))
+    t_rho = (rho - 1.0) * np.sqrt(M) / s_ols
+    if bandwidth is None:
+        bandwidth = int(4.0 * (n / 100.0) ** (2.0 / 9.0))
+    bandwidth = max(0, int(bandwidth))
+    lam2 = gamma0
+    for j in range(1, bandwidth + 1):
+        w = 1.0 - j / (bandwidth + 1.0)
+        cov = float(u[j:] @ u[:-j]) / n
+        lam2 += 2.0 * w * cov
+    if lam2 <= 0:
+        # a non-positive Bartlett long-run variance makes Zα/Zt undefined. Do NOT
+        # silently fall back to γ̂₀ (that would disguise an invalid statistic as a
+        # valid one and could flip reject_no_coint). Raise so the caller marks
+        # this break/stat as failed rather than scoring it.
+        raise ValueError("phillips_z: non-positive long-run variance (λ̂²≤0)")
+    z_alpha = n * (rho - 1.0) - 0.5 * (lam2 - gamma0) * n * n / M
+    z_t = (np.sqrt(gamma0 / lam2) * t_rho
+           - ((lam2 - gamma0) / (2.0 * np.sqrt(lam2))) * (n / np.sqrt(M)))
+    return float(z_alpha), float(z_t), float(rho), int(bandwidth)
+
+
+def _gh_design(y2: np.ndarray, k: int, model: str) -> np.ndarray:
+    """Build the GH regressor matrix for a break AFTER row index ``k`` (0-based;
+    dummy φ_t = 1 for t > k). ``y2`` is (T, m) of I(1) regressors.
+      C   : [1, φ, y2]
+      C/T : [1, φ, t, y2]
+      C/S : [1, φ, y2, φ·y2]"""
+    T = y2.shape[0]
+    phi = (np.arange(T) > k).astype(float)
+    const = np.ones(T)
+    if model == "C":
+        return np.column_stack([const, phi, y2])
+    if model == "C/T":
+        trend = np.arange(1, T + 1, dtype=float)
+        return np.column_stack([const, phi, trend, y2])
+    if model == "C/S":
+        return np.column_stack([const, phi, y2, y2 * phi[:, None]])
+    raise ValueError(f"gregory_hansen: unknown model {model!r} (use C / C/T / C/S)")
+
+
+def gregory_hansen_test(
+    df: pd.DataFrame,
+    y_col: str,
+    x_cols,
+    model: str = "C/S",
+    trim: float = 0.15,
+    max_lag: int = 6,
+    bandwidth: Optional[int] = None,
+    alpha: float = 0.05,
+) -> Dict[str, object]:
+    """Gregory-Hansen (1996) residual-based cointegration test allowing ONE
+    endogenous structural break.
+
+    H0: no cointegration. H1: cointegration with a level/regime shift at an
+    unknown break. For each candidate break in the trimmed interior the
+    cointegrating regression is refit with a break dummy and the residual is
+    tested for a unit root; the GH statistic is the minimum (most negative)
+    ADF*/Zt*/Zα* over all breaks, with the argmin giving the estimated break.
+
+    Parameters
+    ----------
+    y_col   : dependent (ln gold).
+    x_cols  : I(1) regressor column(s); len == m (1 bivariate, 2 trivariate).
+    model   : "C" (level shift), "C/T" (level+trend), or "C/S" (regime shift).
+    trim    : interior fraction excluded at each end (GH default 0.15).
+    max_lag : max ADF* augmentation lag (AIC chooses ≤ this).
+    bandwidth: Bartlett bandwidth for Zα*/Zt* (None → Newey-West rule).
+    alpha   : reported reject flag uses this level (CVs for all levels returned).
+
+    Returns a dict with, per statistic, the min value, the break index/date, the
+    GH critical values, and a reject flag; plus the cointegrating-vector
+    coefficients at the ADF*-optimal break (pre/post for a regime shift)."""
+    x_cols = list(x_cols)
+    m = len(x_cols)
+    if m < 1:
+        raise ValueError("gregory_hansen_test needs >=1 regressor in x_cols")
+    if model not in _GH_CV:
+        raise ValueError(f"model must be one of {sorted(_GH_CV)}, got {model!r}")
+    # GH (1996) Table 1 only tabulates m=1..4. Reject an untabulated m up front:
+    # without critical values reject_no_coint would silently be False, which a
+    # caller could misread as "fail to reject" rather than "cannot test".
+    if m not in _GH_CV[model]["adf_zt"]:
+        raise ValueError(
+            f"gregory_hansen_test: m={m} regressors has no GH (1996) critical "
+            f"values (tabulated m∈{sorted(_GH_CV[model]['adf_zt'])})")
+    if not (0.0 < trim < 0.5):
+        raise ValueError(f"trim must be in (0, 0.5), got {trim}")
+    # CVs are tabulated only at 1/5/10% — index without an implicit KeyError.
+    if alpha not in (0.01, 0.05, 0.10):
+        raise ValueError(
+            f"alpha must be one of {{0.01, 0.05, 0.10}} (GH Table 1 levels), got {alpha}")
+
+    cols = [y_col] + x_cols
+    sub = df[cols].dropna()
+    # break_date reporting needs a datetime index; validate up front, not via a
+    # late AttributeError deep in _pack().
+    if not isinstance(sub.index, pd.DatetimeIndex):
+        raise ValueError(
+            "gregory_hansen_test requires a DatetimeIndex (break dates are "
+            f"reported from it); got {type(sub.index).__name__}")
+    # GH searches breaks by ROW ORDER and interprets trend/break_date by time. An
+    # unsorted or duplicated index would search breaks in the wrong temporal order
+    # while start/end (min/max) hide it — reject rather than silently mis-search.
+    if not sub.index.is_monotonic_increasing:
+        raise ValueError(
+            "gregory_hansen_test requires a time-sorted index "
+            "(break search is row-ordered); sort the frame first")
+    if sub.index.has_duplicates:
+        raise ValueError("gregory_hansen_test requires a unique time index "
+                         "(duplicate timestamps break the row↔date mapping)")
+    if not np.isfinite(sub.values).all():
+        raise ValueError(f"gregory_hansen_test got non-finite values in {cols}")
+    T = len(sub)
+    # need enough rows so each regime can fit the design and the ADF* lags.
+    n_params_cs = 2 + 2 * m  # the largest design (C/S)
+    min_obs = gregory_hansen_min_obs(m, max_lag)
+    if T < min_obs:
+        raise ValueError(
+            f"gregory_hansen_test needs >={min_obs} complete rows for {cols}, "
+            f"got {T} after dropna"
+        )
+
+    y = sub[y_col].to_numpy(dtype=float)
+    y2 = sub[x_cols].to_numpy(dtype=float)
+    idx = sub.index
+
+    lo = int(np.floor(trim * T))
+    hi = int(np.ceil((1.0 - trim) * T)) - 1
+    # keep a margin so both regimes have rows for the design + ADF lags
+    margin = n_params_cs + max_lag + 2
+    lo = max(lo, margin)
+    hi = min(hi, T - margin - 1)
+    if hi <= lo:
+        raise ValueError(
+            f"gregory_hansen_test: trimmed break window empty (T={T}, trim={trim})"
+        )
+
+    best = {
+        "adf": {"stat": np.inf, "k": None, "lag": None},
+        "zt": {"stat": np.inf, "k": None},
+        "zalpha": {"stat": np.inf, "k": None},
+    }
+    # per-statistic valid-break counts, tracked INDEPENDENTLY: a Phillips-Z
+    # failure (non-positive long-run variance) at a break must NOT drop that
+    # break's ADF* result from the ADF min search, and vice-versa.
+    n_valid = {"adf": 0, "zt": 0, "zalpha": 0}
+    n_breaks = 0  # breaks where the design was identified (>=1 stat could be tried)
+    n_failed = 0  # breaks where the design itself was unusable (rank-deficient)
+    for k in range(lo, hi + 1):
+        X = _gh_design(y2, k, model)
+        # OLS via lstsq. A rank-deficient design (collinear break regressors at
+        # extreme breaks) does NOT raise — lstsq returns a least-norm solution on
+        # an unidentified model. Detect it via the returned rank and skip, so an
+        # unidentified break never enters the min-statistic search.
+        try:
+            coef, _res, rank, _sv = np.linalg.lstsq(X, y, rcond=None)
+        except np.linalg.LinAlgError:
+            n_failed += 1
+            continue
+        if rank < X.shape[1]:
+            n_failed += 1
+            continue
+        resid = y - X @ coef
+        n_breaks += 1
+        # ADF* and the Phillips Z's are computed and counted SEPARATELY so one's
+        # numerical failure never contaminates the other's min-statistic search.
+        try:
+            adf_stat, used_lag = _adf_resid_stat(resid, max_lag)
+            if adf_stat < best["adf"]["stat"]:
+                best["adf"] = {"stat": adf_stat, "k": k, "lag": used_lag}
+            n_valid["adf"] += 1
+        except (ValueError, np.linalg.LinAlgError):
+            pass
+        try:
+            za, zt, _rho, _bw = _phillips_z_resid(resid, bandwidth)
+            if zt < best["zt"]["stat"]:
+                best["zt"] = {"stat": zt, "k": k}
+            if za < best["zalpha"]["stat"]:
+                best["zalpha"] = {"stat": za, "k": k}
+            n_valid["zt"] += 1
+            n_valid["zalpha"] += 1
+        except (ValueError, np.linalg.LinAlgError):
+            pass
+
+    if all(v == 0 for v in n_valid.values()):
+        raise ValueError(
+            "gregory_hansen_test: no statistic produced a valid break "
+            f"(T={T}, model={model}; all designs rank-deficient or degenerate)"
+        )
+
+    def _pack(stat_key: str) -> Dict[str, object]:
+        b = best[stat_key]
+        cv = _gh_critical_values(model, m, "zalpha" if stat_key == "zalpha" else "adf")
+        k = b["k"]
+        # a statistic with zero valid breaks is UNAVAILABLE — not "fail to reject".
+        available = k is not None
+        stat_val = float(b["stat"]) if available else None
+        reject = bool(available and cv is not None and stat_val < cv[alpha])
+        # the break dummy is φ_t = 1{t > k}: row k is the LAST pre-break period and
+        # row k+1 is the FIRST post-break period. Report the latter as the break
+        # date (the period the structure actually shifts), and expose both.
+        last_pre = None if k is None else idx[k].date().isoformat()
+        first_post = None if k is None else idx[min(k + 1, T - 1)].date().isoformat()
+        out = {
+            "stat": stat_val,
+            "available": available,
+            "n_valid_breaks": int(n_valid[stat_key]),
+            "break_index": (None if k is None else int(k)),
+            "break_date": first_post,
+            "last_pre_break_date": last_pre,
+            "first_post_break_date": first_post,
+            "break_fraction": (None if k is None else round((k + 1) / T, 3)),
+            "critical_values": cv,
+            "reject_no_coint": reject,
+        }
+        if "lag" in b:
+            out["adf_lag"] = b["lag"]
+        return out
+
+    results = {s: _pack(s) for s in ("adf", "zt", "zalpha")}
+
+    # cointegrating-vector coefficients at a given break. For C/S report pre/post
+    # regime slopes; for C/C-T the slope is constant and only the intercept shifts.
+    # Computed PER STATISTIC at that statistic's own optimal break, so a Zt*- or
+    # Zα*-driven rejection is explained by ITS break/vector, not ADF*'s.
+    def _coint_vector_at(k: Optional[int]) -> Optional[Dict[str, object]]:
+        if k is None:
+            return None
+        Xk = _gh_design(y2, k, model)
+        coef, _r, rk, _s = np.linalg.lstsq(Xk, y, rcond=None)
+        if rk < Xk.shape[1]:
+            return None
+        mu1, mu2 = float(coef[0]), float(coef[1])
+        trend_coef = None
+        if model == "C/S":
+            betas_pre = [float(c) for c in coef[2:2 + m]]
+            betas_post = [float(coef[2 + m + i] + coef[2 + i]) for i in range(m)]
+        elif model == "C/T":
+            # design = [const, φ, trend, y2] → coef[2] is the linear trend slope;
+            # without it the C/T regression can't be reconstructed.
+            trend_coef = float(coef[2])
+            betas_pre = betas_post = [float(c) for c in coef[3:3 + m]]
+        else:  # C
+            betas_pre = betas_post = [float(c) for c in coef[2:2 + m]]
+        return {
+            "x_cols": x_cols,
+            "break_index": int(k),
+            "break_date": idx[min(k + 1, T - 1)].date().isoformat(),
+            "intercept_pre": mu1,
+            "intercept_post": mu1 + mu2,
+            "trend_coef": trend_coef,  # None unless model == "C/T" (per-period slope)
+            "betas_pre": betas_pre,
+            "betas_post": betas_post,
+        }
+
+    coint_vectors = {s: _coint_vector_at(best[s]["k"]) for s in ("adf", "zt", "zalpha")}
+    # majority rule (pre-registered primary criterion): a cell "rejects" only when
+    # at least 2 of the 3 statistics reject — guards against an isolated single-
+    # statistic rejection being read as a research conclusion.
+    n_reject = sum(int(results[s]["reject_no_coint"]) for s in ("adf", "zt", "zalpha"))
+
+    return {
+        "model": model,
+        "y_col": y_col,
+        "x_cols": x_cols,
+        "m": int(m),
+        "n_obs": int(T),
+        "trim": float(trim),
+        "alpha_level": float(alpha),
+        "start": idx.min().date().isoformat(),
+        "end": idx.max().date().isoformat(),
+        "n_breaks_evaluated": int(n_breaks),
+        "n_breaks_failed": int(n_failed),
+        "adf": results["adf"],
+        "zt": results["zt"],
+        "zalpha": results["zalpha"],
+        # coint_vector = the ADF* (headline) break vector, back-compat; per-stat
+        # vectors in coint_vectors so a Zt*/Zα*-driven reject shows its own break.
+        "coint_vector": coint_vectors["adf"],
+        "coint_vectors": coint_vectors,
+        "n_reject": int(n_reject),
+        "any_reject": bool(n_reject >= 1),         # raw: ≥1 statistic rejects
+        "majority_reject": bool(n_reject >= 2),    # pre-registered primary rule
+        "cv_available": bool(_gh_critical_values(model, m, "adf") is not None),
+    }
+# ── Markov-switching regression (step 3 / PR #4: discrete time-varying anchor) ─
+# PR #1–#3 killed every linear / constant-parameter / single-break anchor
+# (bivariate, trivariate Johansen, Gregory-Hansen). The remaining hypothesis is
+# a DISCRETE time-varying anchor: the world jumps between 2–3 regimes, each with
+# its own driver coefficients. We test it with a Markov-switching regression on
+# the STATIONARY left-hand side Δln(gold) (not I(1) levels — avoids spurious
+# regression), regressing on Δln(debt/GDP) and Δ(real rate) with regime-
+# dependent coefficients AND residual variance (switching_variance=True). The
+# question "is the long end an anchor" becomes regime-conditional: in which
+# regimes is the real-rate coefficient significant?
+#
+# HARDENING (PR #4 round 2): real-data MS fits routinely return DEGENERATE
+# solutions — a regime collapses onto a single outlier (σ²→0, expected duration
+# ~1 month, coefficient |t|~1e13 from a standard error ≈0). statsmodels reports
+# p=0.000 for those, which naively reads as "significant" when it is the opposite
+# (the parameter is numerically NOT identified). We therefore (a) require a finite
+# t below `_MS_T_IDENT_MAX` for a coefficient to count as significant, and
+# (b) flag whole regimes as degenerate (σ² below a data-scaled floor, too-short
+# expected duration, or any non-identified |t|), excluding them from the verdict.
+_MS_DIFF_PREFIX = "d_"
+# |t| above this means SE≈0 → the parameter is numerically unidentified, NOT
+# significant (real regression t-stats are ~O(1..100); 1e6+ is pure degeneracy).
+_MS_T_IDENT_MAX = 1e6
+# residual-variance floor as a fraction of the LHS (Δln gold) sample variance:
+# a regime with σ² below this has collapsed onto a near-deterministic sliver.
+_MS_VAR_FLOOR_RATIO = 1e-3
+# a real regime should persist; an expected duration shorter than this (months)
+# is an outlier-absorbing artifact, not a macro regime.
+_MS_MIN_DURATION = 3.0
+
+
+def _ms_coeff_significant(p: float, t: float, alpha: float,
+                          t_ident_max: float = _MS_T_IDENT_MAX) -> bool:
+    """A coefficient counts as significant only if its two-sided p is below
+    ``alpha`` AND its t-stat is finite and below the identification ceiling. A
+    |t|~1e13 with p=0.000 is a standard-error-≈0 numerical artifact (the
+    parameter is NOT identified), the opposite of real significance."""
+    return bool(np.isfinite(p) and p < alpha
+                and np.isfinite(t) and abs(t) < t_ident_max)
+
+
+def choose_markov_k(fits: Dict[int, Dict[str, object]]) -> Dict[str, object]:
+    """Choose K from already-fitted MS models. Returns the lowest-BIC K (for
+    transparency) AND the **largest trustworthy K** (converged, no degenerate
+    regime, ≥2 non-degenerate regimes — see :func:`assess_markov_degeneracy`).
+    If no fit is trustworthy, ``selected_k`` is None and ``no_switching`` True —
+    the honest "no credible regime switching survives" (effectively K=1)."""
+    bic = {k: f["bic"] for k, f in fits.items()}
+    clean_k = {k: bool(f.get("trustworthy")) for k, f in fits.items()}
+    trusted = [k for k, ok in clean_k.items() if ok]
+    return {
+        "bic": bic,
+        "clean_k": clean_k,
+        "selected_k": (max(trusted) if trusted else None),
+        "bic_selected_k": (min(bic, key=bic.get) if bic else None),
+        "no_switching": not trusted,
+    }
+
+
+def build_ms_frame(df: pd.DataFrame, exog_level_cols,
+                   lhs_level: str = "ln_gold_nominal") -> pd.DataFrame:
+    """Build the stationary first-difference frame for the Markov-switching
+    regression: the monthly change Δln(gold) regressed on the monthly change of
+    each exog level column (Δln(debt/GDP), Δ real rate).
+
+    Differencing the I(1) levels makes the LHS/RHS stationary so the MS
+    regression is statistically clean (no I(1)-levels spurious regression). The
+    real rate is already a level in %, so Δ is its month-over-month change.
+    NaNs (the first diff row + any missing-data gaps) are dropped so the fit
+    sees a complete-case panel. The frame's ``.attrs`` carry the LHS name and
+    the ordered exog names for downstream fitting/reporting.
+    """
+    if lhs_level not in df.columns:
+        raise ValueError(f"build_ms_frame: missing LHS column {lhs_level!r}")
+    missing = [c for c in exog_level_cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"build_ms_frame: missing exog columns {missing}")
+    dname = f"{_MS_DIFF_PREFIX}{lhs_level}"
+    cols = {dname: df[lhs_level].astype(float).diff()}
+    exog_names = []
+    for c in exog_level_cols:
+        en = f"{_MS_DIFF_PREFIX}{c}"
+        cols[en] = df[c].astype(float).diff()
+        exog_names.append(en)
+    out = pd.DataFrame(cols, index=df.index).dropna()
+    out.attrs["lhs"] = dname
+    out.attrs["exog"] = exog_names
+    return out
+
+
+def _summarize_markov(res, mod, exog_names, lhs, k_regimes, alpha, index) -> Dict[str, object]:
+    """Parse a fitted statsmodels MarkovRegression into a plain JSON-friendly
+    dict: per-regime coefficient/variance tables, the transition matrix,
+    expected durations, and the smoothed regime-probability time series.
+
+    statsmodels names switching params ``const[j]`` / ``x{i}[j]`` / ``sigma2[j]``
+    and transition params ``p[i->j]``. The MS regime labels are NOT identified
+    (a relabeling gives the same likelihood) — callers must interpret regimes by
+    their coefficients ex-post, never by index.
+    """
+    import re
+
+    names = list(mod.param_names)
+    params = np.asarray(res.params, dtype=float)
+    pvals = np.asarray(res.pvalues, dtype=float)
+    tvals = np.asarray(res.tvalues, dtype=float)
+    bse = np.asarray(res.bse, dtype=float)
+    # display map: statsmodels exog name x{i} (1-based) → the real diff column
+    exog_names = list(exog_names or [])
+    exog_map = {f"x{i + 1}": exog_names[i] for i in range(len(exog_names))}
+
+    regimes = [{"regime": j, "coeffs": {}, "sigma2": None,
+                "expected_duration": float(res.expected_durations[j])}
+               for j in range(k_regimes)]
+    pat = re.compile(r"^(.*)\[(\d+)\]$")
+    for name, c, t, p, se in zip(names, params, tvals, pvals, bse):
+        if name.startswith("p["):
+            continue  # transition probability — handled via the matrix below
+        m = pat.match(name)
+        if not m:
+            continue
+        base, reg = m.group(1), int(m.group(2))
+        if reg >= k_regimes:
+            continue
+        if base == "sigma2":
+            regimes[reg]["sigma2"] = float(c)
+            continue
+        disp = "const" if base == "const" else exog_map.get(base, base)
+        # a coefficient is significant only if its t is finite AND below the
+        # identification ceiling: a |t|~1e13 (SE≈0) is degeneracy, not evidence.
+        sig = _ms_coeff_significant(p, t, alpha)
+        regimes[reg]["coeffs"][disp] = {
+            "coef": float(c), "t": float(t), "p": float(p), "se": float(se),
+            "significant": sig,
+            "identified": bool(np.isfinite(t) and abs(t) < _MS_T_IDENT_MAX),
+        }
+
+    # transition matrix: statsmodels regime_transition[i, j] = P(s_t=i | s_{t-1}=j)
+    # (columns sum to 1). Time-invariant → trailing nobs axis of length 1.
+    rt = np.asarray(res.regime_transition, dtype=float)
+    trans = rt[..., 0] if rt.ndim == 3 else rt
+
+    smp = np.asarray(res.smoothed_marginal_probabilities, dtype=float)
+    smoothed = pd.DataFrame(
+        smp, index=index[-smp.shape[0]:],
+        columns=[f"regime_{j}" for j in range(k_regimes)],
+    )
+
+    converged = None
+    rv = getattr(res, "mle_retvals", None)
+    if isinstance(rv, dict):
+        converged = bool(rv.get("converged", True))
+
+    return {
+        "k_regimes": int(k_regimes),
+        "lhs": lhs,
+        "exog": exog_names,
+        "n_obs": int(res.nobs),
+        "llf": float(res.llf),
+        "aic": float(res.aic),
+        "bic": float(res.bic),
+        "converged": converged,
+        "regimes": regimes,
+        "transition_matrix": [[float(x) for x in row] for row in trans],
+        "expected_durations": [float(d) for d in res.expected_durations],
+        "smoothed_probabilities": smoothed,
+        "alpha_level": float(alpha),
+    }
+
+
+def assess_markov_degeneracy(fit: Dict[str, object], lhs_var: float,
+                             var_floor_ratio: float = _MS_VAR_FLOOR_RATIO,
+                             min_duration: float = _MS_MIN_DURATION,
+                             t_ident_max: float = _MS_T_IDENT_MAX) -> Dict[str, object]:
+    """Tag each regime degenerate / non-degenerate and roll the result up to the
+    whole fit — the gate that stops a collapsed MS solution from being read as a
+    real regime structure.
+
+    A regime is DEGENERATE if ANY of:
+      * its residual variance σ² is below ``var_floor_ratio × Var(Δln gold)``
+        (collapsed onto a near-deterministic sliver), or non-finite;
+      * its expected duration is < ``min_duration`` months (an outlier-absorbing
+        1-month state, not a macro regime);
+      * any of its coefficients is non-identified — non-finite t or |t| above
+        ``t_ident_max`` (SE≈0, the |t|~1e13 pathology).
+
+    The fit is ``trustworthy`` only if it converged AND has no degenerate regime
+    AND ≥2 non-degenerate regimes survive (otherwise there is no credible
+    *switching* structure). Mutates and returns ``fit``.
+    """
+    var_floor = float(var_floor_ratio) * float(lhs_var) if np.isfinite(lhs_var) else 0.0
+    for r in fit["regimes"]:
+        reasons = []
+        s2 = r.get("sigma2")
+        if s2 is None or not np.isfinite(s2) or s2 < var_floor:
+            reasons.append(f"σ²<floor({var_floor:.2e})")
+        if not np.isfinite(r.get("expected_duration", np.nan)) or r["expected_duration"] < min_duration:
+            reasons.append(f"dur<{min_duration:g}m")
+        for nm, c in r["coeffs"].items():
+            t = c.get("t")
+            if t is None or not np.isfinite(t) or abs(t) > t_ident_max:
+                reasons.append(f"{nm}:|t|>{t_ident_max:g}/nan")
+        r["degenerate"] = bool(reasons)
+        r["degenerate_reasons"] = reasons
+    n_nondeg = int(sum(not r["degenerate"] for r in fit["regimes"]))
+    fit["var_floor"] = var_floor
+    fit["min_duration"] = float(min_duration)
+    fit["t_ident_max"] = float(t_ident_max)
+    fit["n_nondegenerate"] = n_nondeg
+    fit["degenerate"] = bool(any(r["degenerate"] for r in fit["regimes"]))
+    # trustworthy = converged + no degenerate regime + a genuine ≥2-regime switch
+    fit["trustworthy"] = bool(fit.get("converged") and not fit["degenerate"] and n_nondeg >= 2)
+    return fit
+
+
+def fit_markov_switching(frame: pd.DataFrame, exog_names=None, lhs: Optional[str] = None,
+                         k_regimes: int = 2, switching_variance: bool = True,
+                         n_restarts: int = 50, seed: int = 0,
+                         alpha: float = 0.05, em_iter: int = 50,
+                         maxiter: int = 500) -> Dict[str, object]:
+    """Fit a Markov-switching regression of Δln(gold) on the diffed drivers with
+    regime-dependent coefficients (and variance, by default).
+
+    ``frame`` is the output of :func:`build_ms_frame` (LHS/exog names taken from
+    its ``.attrs`` unless overridden). MS likelihoods are multimodal and the
+    fit is sensitive to starting values / local optima, so we take the best of
+    the default EM start plus ``n_restarts`` random restarts (statsmodels
+    ``search_reps`` — driven by the global numpy RNG, which we seed and restore
+    for reproducibility), with raised ``em_iter`` / ``maxiter`` for a real shot
+    at convergence. The returned :func:`_summarize_markov` dict is then passed
+    through :func:`assess_markov_degeneracy` so degenerate/unconverged solutions
+    are flagged (``trustworthy`` / per-regime ``degenerate``) rather than read as
+    real regimes.
+    """
+    from statsmodels.tsa.regime_switching.markov_regression import MarkovRegression
+
+    lhs = lhs or frame.attrs.get("lhs")
+    exog_names = list(exog_names if exog_names is not None else frame.attrs.get("exog", []))
+    if lhs is None or lhs not in frame.columns:
+        raise ValueError(f"fit_markov_switching: LHS column {lhs!r} not in frame")
+    if k_regimes < 2:
+        raise ValueError(f"fit_markov_switching: k_regimes must be >=2, got {k_regimes}")
+    missing = [c for c in exog_names if c not in frame.columns]
+    if missing:
+        raise ValueError(f"fit_markov_switching: exog columns {missing} not in frame")
+
+    endog = frame[lhs].astype(float).values
+    exog = frame[exog_names].astype(float).values if exog_names else None
+    # need enough data to identify k regimes × (1 + n_exog + 1 var) params plus a
+    # k×(k-1) transition block; require a sane floor scaled by k and #params.
+    n = len(endog)
+    n_params_regime = 1 + len(exog_names) + (1 if switching_variance else 0)
+    min_obs = max(40, 10 * k_regimes * n_params_regime)
+    if n < min_obs:
+        raise ValueError(
+            f"fit_markov_switching: {n} obs (<{min_obs}) for k_regimes={k_regimes} "
+            f"with {len(exog_names)} exog — too few to identify regimes"
+        )
+    if not np.isfinite(endog).all() or (exog is not None and not np.isfinite(exog).all()):
+        raise ValueError("fit_markov_switching: non-finite values in endog/exog")
+
+    mod = MarkovRegression(endog, k_regimes=k_regimes, exog=exog,
+                           switching_variance=switching_variance)
+    # reproducible restarts: search_reps uses the global numpy RNG
+    state = np.random.get_state()
+    try:
+        np.random.seed(seed)
+        res = mod.fit(em_iter=em_iter, maxiter=maxiter)
+        if n_restarts and n_restarts > 0:
+            try:
+                cand = mod.fit(search_reps=int(n_restarts), em_iter=em_iter, maxiter=maxiter)
+                if np.isfinite(cand.llf) and cand.llf > res.llf:
+                    res = cand
+            except (np.linalg.LinAlgError, RuntimeError, ValueError):
+                pass  # keep the default-start fit if the random search blows up
+    finally:
+        np.random.set_state(state)
+
+    out = _summarize_markov(res, mod, exog_names, lhs, k_regimes, alpha, frame.index)
+    out["switching_variance"] = bool(switching_variance)
+    out["n_restarts"] = int(n_restarts)
+    # degeneracy / trustworthiness gate (σ² floor scaled by the LHS variance)
+    assess_markov_degeneracy(out, lhs_var=float(np.var(endog, ddof=1)))
+    return out
+
+
+def select_markov_k(frame: pd.DataFrame, exog_names=None, lhs: Optional[str] = None,
+                    k_values=(2, 3), switching_variance: bool = True,
+                    n_restarts: int = 50, seed: int = 0,
+                    alpha: float = 0.05) -> Dict[str, object]:
+    """Fit the Markov-switching regression at each K in ``k_values`` and choose K.
+
+    Two selections are returned, on purpose:
+      * ``bic_selected_k`` — the lowest-BIC K (for transparency; BIC happily
+        over-fits to a K that only "wins" via a degenerate outlier-absorbing
+        regime, so this is reported but NOT trusted);
+      * ``selected_k`` — the **largest K whose fit is trustworthy** (converged,
+        no degenerate regime, ≥2 non-degenerate regimes). If no fitted K is
+        trustworthy, ``selected_k`` is None and ``no_switching`` is True — the
+        honest "no credible regime switching survives" outcome (effectively K=1).
+
+    ``clean_k`` maps each fitted K → trustworthy?. A K that fails to fit is
+    recorded in ``errors`` and excluded rather than crashing the comparison.
+    """
+    fits: Dict[int, object] = {}
+    errors: Dict[int, str] = {}
+    for k in k_values:
+        try:
+            fits[k] = fit_markov_switching(
+                frame, exog_names=exog_names, lhs=lhs, k_regimes=k,
+                switching_variance=switching_variance, n_restarts=n_restarts,
+                seed=seed, alpha=alpha)
+        except (ValueError, np.linalg.LinAlgError, RuntimeError) as e:
+            errors[k] = f"{type(e).__name__}: {str(e)[:80]}"
+    chosen = choose_markov_k(fits)
+    return {"fits": fits, "errors": errors, **chosen}
+
+
+def regime_coeff_spread(fit: Dict[str, object], alpha: float = 0.05,
+                        nondegenerate_only: bool = True) -> Dict[str, Dict[str, object]]:
+    """Summarize, per driver, whether the regimes are economically DISTINCT —
+    the input to PR #4's kill condition. For each coefficient (const + each
+    exog) across regimes: the coef list, the spread (max−min), whether the sign
+    flips across regimes, and how many regimes it is significant in. A driver
+    that is significant in some regimes but not others (or flips sign, or has a
+    beyond-noise magnitude gap) is the 'regime-conditional anchor' signature.
+
+    By default ``nondegenerate_only`` restricts the comparison to non-degenerate
+    regimes (see :func:`assess_markov_degeneracy`): a 1-month, σ²≈0,
+    |t|~1e13 outlier-absorbing regime must NOT manufacture a "regime-conditional"
+    verdict. ``n_compared`` reports how many regimes survived the filter — with
+    fewer than 2, there is nothing to compare and ``distinct`` is False."""
+    out: Dict[str, Dict[str, object]] = {}
+    names = ["const"] + list(fit.get("exog", []))
+    regimes = fit.get("regimes", [])
+    if nondegenerate_only:
+        # if degeneracy was assessed, drop degenerate regimes; if not assessed
+        # (no "degenerate" key), keep all (back-compat for hand-built fits).
+        regimes = [r for r in regimes if not r.get("degenerate", False)]
+    n_compared = len(regimes)
+    for nm in names:
+        cells = [r["coeffs"].get(nm) for r in regimes]
+        cells = [c for c in cells if c is not None]
+        coefs = [c["coef"] for c in cells]
+        ses = [c.get("se", float("nan")) for c in cells]
+        sigs = [bool(c["significant"]) for c in cells]
+        spread = (max(coefs) - min(coefs)) if coefs else None
+        # All distinctness must involve SIGNIFICANT regimes — a sign flip or
+        # magnitude gap between two INSIGNIFICANT coefficients is noise, not a
+        # regime-conditional anchor (gate C: compare only significant regimes).
+        sig_coefs = [c["coef"] for c in cells if c["significant"]]
+        sig_ses = [c.get("se", float("nan")) for c in cells if c["significant"]]
+        sig_signs = {1 if c > 0 else -1 if c < 0 else 0 for c in sig_coefs}
+        # sign flip: ≥2 significant regimes with opposite signs
+        sign_flip = (len(sig_coefs) >= 2) and (1 in sig_signs) and (-1 in sig_signs)
+        # magnitude gap among significant regimes beyond ~2× their largest SE
+        max_sig_se = max((s for s in sig_ses if np.isfinite(s)), default=float("nan"))
+        sig_spread = (max(sig_coefs) - min(sig_coefs)) if sig_coefs else None
+        magnitude_distinct = bool(
+            len(sig_coefs) >= 2 and sig_spread is not None
+            and np.isfinite(max_sig_se) and max_sig_se > 0
+            and sig_spread > 2.0 * max_sig_se
+        )
+        # regime-conditional: significant in some but not all non-degenerate regimes
+        regime_conditional = (n_compared >= 2) and any(sigs) and not all(sigs)
+        # need ≥2 (non-degenerate) regimes to talk about a difference at all
+        can_compare = n_compared >= 2
+        out[nm] = {
+            "coefs": coefs,
+            "ses": ses,
+            "spread": spread,
+            "n_compared": n_compared,
+            "sign_flip": bool(can_compare and sign_flip),
+            "magnitude_distinct": bool(can_compare and magnitude_distinct),
+            "n_sig": int(sum(sigs)),
+            "sig_in_any": any(sigs),
+            "sig_in_all": all(sigs) if sigs else False,
+            "regime_conditional": bool(regime_conditional),
+            # the driver genuinely differs across SIGNIFICANT regimes: opposite
+            # signs, significant-in-some-not-all, OR a beyond-noise magnitude gap.
+            "distinct": bool(
+                can_compare and (sign_flip or regime_conditional or magnitude_distinct)
+            ),
+        }
+    return out
