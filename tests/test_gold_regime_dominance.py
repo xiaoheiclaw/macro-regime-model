@@ -192,6 +192,56 @@ def test_level_divergence_warmup_and_no_lookahead():
     np.testing.assert_allclose(a[mask], b[mask])
 
 
+def test_nan_in_one_subsignal_does_not_blank_valid_signal():
+    """P1-2 regression: a NaN in one sub-signal must NOT wipe out the others. A
+    perfectly FLAT real rate makes Δreal_rate exactly 0 → zero variance → rolling
+    corr is NaN; the divergence/level signals are well-defined (both 0 here, a
+    flat rate is real-rate-dominant). The combined probability must be the valid
+    0.0, never NaN (the old np.maximum propagated the NaN and blanked it)."""
+    n = 80
+    idx = pd.date_range("2015-01-31", periods=n, freq="ME")
+    window = 24
+    rng = np.random.RandomState(11)
+    gold = pd.Series(np.exp(np.cumsum(0.01 + rng.randn(n) * 0.02)), index=idx)
+    rr = pd.Series(2.0, index=idx)             # exactly flat → Δrr ≡ 0.0 (exact)
+    corr = rolling_gold_realrate_corr(gold, rr, window)
+    assert corr.dropna().empty                 # corr is NaN everywhere (zero var)
+    p = dominance_probability(gold, rr, window=window)
+    assert p.iloc[window:].notna().all()       # NOT blanked to NaN by the corr NaN
+    np.testing.assert_allclose(p.iloc[window:].to_numpy(), 0.0)  # real-rate-dominant
+
+
+def test_cb_demand_all_nan_preserves_base_probability():
+    """P1-2 regression (cb half): an entirely-unavailable cb_demand (all NaN,
+    e.g. pre-coverage) must leave the probability identical to the no-cb path —
+    cb can only RAISE p, never blank it. The old np.maximum(p, NaN)=NaN broke
+    this, wiping every valid month where cb had no data."""
+    panel = _panel()
+    g, rr = panel["gold_nominal"], panel["real_rate_10y"]
+    base = dominance_probability(g, rr, window=36)
+    cb_nan = pd.Series(np.nan, index=panel.index)
+    with_cb = dominance_probability(g, rr, window=36, cb_demand=cb_nan)
+    np.testing.assert_array_equal(np.isnan(base.to_numpy()), np.isnan(with_cb.to_numpy()))
+    m = base.notna().to_numpy()
+    np.testing.assert_allclose(base.to_numpy()[m], with_cb.to_numpy()[m])
+
+
+def test_s3_reindexes_prob_to_panel():
+    """P2-2 regression: a prob series with extra/missing months must be aligned
+    to the panel — the position is indexed exactly on panel.index, never on a
+    union that introduces off-panel dates."""
+    panel = _panel(n=120)
+    prob = dominance_probability(panel["gold_nominal"], panel["real_rate_10y"], window=36)
+    # prob carrying an extra out-of-panel month + dropping an in-panel one
+    extra = pd.Series(
+        {pd.Timestamp("2099-12-31"): 1.0},
+    )
+    prob_dirty = pd.concat([prob.iloc[5:], extra])
+    pos = s3_dominance(panel, prob_dirty)
+    assert pos.index.equals(panel.index)            # exactly the panel index
+    assert pd.Timestamp("2099-12-31") not in pos.index
+
+
 # ── 3. regime-conditional switch ─────────────────────────────────────────
 def test_s3_prob_one_equals_s1_trend():
     """With prob = 1 (de-dollarization everywhere) the strategy must reduce to

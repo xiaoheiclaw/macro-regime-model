@@ -42,12 +42,10 @@ from lib.gold_trend_timing import (  # noqa: E402
     DEFAULT_LOOKBACKS,
     DEFAULT_SEGMENTS,
     build_timing_panel,
-    compute_metrics,
     equity_curve,
     run_backtest,
     s0_buy_hold,
     s1_trend,
-    slice_segment,
 )
 from lib.gold_regime_dominance import (  # noqa: E402
     DEFAULT_CORR_WINDOW,
@@ -67,9 +65,6 @@ from scripts.gold_trend_backtest import (  # noqa: E402
     _md_table,
 )
 from lib.paths import ANALYSIS_DIR, DATA_DIR  # noqa: E402
-
-METRIC_COLS = ["sharpe", "calmar", "cagr", "ann_vol", "max_dd", "hit_rate",
-               "ann_turnover", "n_months"]
 
 
 def build_positions(panel: pd.DataFrame, prob: pd.Series) -> Dict[str, pd.Series]:
@@ -134,14 +129,22 @@ def verdict(full: pd.DataFrame) -> str:
                      "is in charge (price trend tracks the dominant driver), so the "
                      "explicit classifier is redundant complexity. Sit on S1.**")
         lines.append("")
+        # the drawdown clause is generated from the actual figures, never asserted:
+        # SD only "gives back more in drawdowns" if its max_dd is genuinely deeper.
+        if sd["max_dd"] < s1["max_dd"]:
+            dd_clause = (f"and gives back more in drawdowns (SD max_dd {sd['max_dd']:.1%} "
+                         f"vs S1 {s1['max_dd']:.1%})")
+        else:
+            dd_clause = (f"with a comparable/shallower drawdown (SD max_dd {sd['max_dd']:.1%} "
+                         f"vs S1 {s1['max_dd']:.1%}), so the shortfall is on risk-adjusted "
+                         f"return, not tail risk")
         lines.append("_Mechanism: in de-dollarization months SD switches to the trend "
                      "signal, so it can at best tie S1 there; in real-rate-dominant "
-                     "months SD trades the real-rate 'not rising' signal, which lags "
-                     "trend (and gives back more in drawdowns — see SD's deeper max_dd). "
-                     "Net SD ≤ S1. The classifier can correctly flip to de-dollarization "
-                     "post-2022 (see the timeline) yet still not help, precisely because "
-                     "'follow price when de-dollarization dominates' is what S1 already "
-                     "does everywhere._")
+                     f"months SD trades the real-rate 'not rising' signal, which lags trend "
+                     f"{dd_clause}. Net SD ≤ S1. The classifier can correctly flip to "
+                     "de-dollarization post-2022 (see the timeline) yet still not help, "
+                     "precisely because 'follow price when de-dollarization dominates' is "
+                     "what S1 already does everywhere._")
     return "\n".join(lines)
 
 
@@ -192,7 +195,11 @@ def main() -> None:
         print("ERROR: no common investable window across strategies "
               "(sample too short for warm-up). Widen --start/--end.", file=sys.stderr)
         raise SystemExit(2)
-    full = metrics_table(backtests)
+    # full-sample metrics on the common investable window. metrics_table() also
+    # derives this window internally from common_span(), so passing cstart/cend
+    # is the same result made explicit (and self-documents the contract that
+    # S0/S1/SD are scored on identical months — verified by equal n_months).
+    full = metrics_table(backtests, cstart, cend)
 
     # ── corr-window sensitivity band {24, 36, 48} (anti-overfit) ──
     sens_windows: Dict[int, pd.DataFrame] = {}

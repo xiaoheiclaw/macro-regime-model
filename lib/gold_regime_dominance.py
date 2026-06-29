@@ -119,8 +119,13 @@ def divergence_share(
         raise ValueError(f"window must be a positive integer, got {window}")
     dg = _log_diff(gold_nominal)
     drr = real_rate.diff()
-    both_up = (dg > 0) & (drr > 0)
-    return both_up.astype(float).rolling(window, min_periods=window).mean()
+    both_up = ((dg > 0) & (drr > 0)).astype(float)
+    # the first diff() is NaN; NaN>0 is False, which would otherwise count the
+    # no-data month as a (biased) non-divergence and let the first window report
+    # one slot early. Mark it NaN so min_periods=window requires `window` real
+    # observations — honouring the "NaN until the window fills" contract.
+    both_up[dg.isna() | drr.isna()] = np.nan
+    return both_up.rolling(window, min_periods=window).mean()
 
 
 def level_divergence(
@@ -205,18 +210,23 @@ def dominance_probability(
 
     p_level = level_divergence(gold_nominal, real_rate, window)
 
-    # element-wise max; all three share the same ~window-month warm-up, so the
-    # NaN union is just that warm-up (np.maximum propagates NaN → trimmed later).
-    p = np.maximum(np.maximum(p_corr, p_div), p_level)
+    # skip-na row-wise max so "any one sub-signal firing is sufficient": a NaN
+    # in one component (e.g. p_corr undefined when Δreal_rate has zero variance
+    # over the window) must NOT wipe out a valid p_div/p_level. Only when ALL
+    # three are NaN (the shared warm-up) is the result NaN → trimmed downstream.
+    comps = pd.concat([p_corr, p_div, p_level], axis=1)
+    p = comps.max(axis=1, skipna=True)
+    p[comps.isna().all(axis=1)] = np.nan
 
     if cb_demand is not None:
         cb = cb_demand.reindex(gold_nominal.index)
         cb_mean = cb.rolling(window, min_periods=window).mean()
-        # sustained net buying (trailing mean > 0) → confirm at full strength;
-        # can only raise p, never lower it. cb_mean NaN where not yet filled.
+        # sustained net buying (trailing mean > 0) → confirm at full strength.
+        # skip-na max so cb can only RAISE p (per contract): where cb_mean is NaN
+        # (pre-2010 / warm-up) p is preserved unchanged, never blanked to NaN.
         cb_pos = (cb_mean > 0).astype(float)
         cb_pos[cb_mean.isna()] = np.nan
-        p = np.maximum(p, cb_pos)
+        p = pd.concat([p, cb_pos], axis=1).max(axis=1, skipna=True)
 
     return p
 
@@ -259,8 +269,12 @@ def s3_dominance(
     trims those months rather than crediting a cash stub."""
     if rr_window <= 0:
         raise ValueError(f"rr_window must be a positive integer, got {rr_window}")
+    # align prob to the panel up front: a prob series with missing/extra months
+    # would otherwise let pandas union-align the arithmetic below, producing
+    # off-panel dates or surprise NaN that the backtest then mis-aligns on.
+    prob = prob.reindex(panel.index)
     rr = panel["real_rate_10y"]
-    rr_chg = rr - rr.shift(rr_window)        # forward shift → reads the past
+    rr_chg = rr - rr.shift(rr_window)        # trailing change: rr[t] - rr[t-rr_window]
     rr_falling = (rr_chg <= 0).astype(float)  # 1 when real rate not rising
     rr_falling[rr_chg.isna()] = np.nan        # warm-up NaN
 
