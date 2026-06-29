@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from lib.gold_dedollar_gap import full_percentile, full_zscore
+from lib.gold_dedollar_gap import forward_log_return, full_percentile, full_zscore
 from lib.gold_dedollar_gap_walkforward import (
     current_walk_forward_reading,
     expanding_percentile,
@@ -237,20 +237,57 @@ def test_extreme_reclassification_rejects_bad_q():
         extreme_reclassification(resid, top_q=0.0)
 
 
-def test_walk_forward_conditional_table_is_ex_ante_and_split():
-    n = 90
+def test_walk_forward_conditional_table_groups_match_independent_calibrator():
+    """The extreme/rest split must match what the (independently-tested) expanding
+    calibrator + forward-observability rule produce — not just 'a row exists'
+    (codex PR#15 P3). This catches an empty, miscounted, or leaking extreme set."""
+    from lib.gold_dedollar_gap_walkforward import expanding_percentile
+    n, warm, top_q, h = 90, 24, 0.9, 12
     rng = np.random.RandomState(10)
     resid = pd.Series(rng.randn(n), index=_me_index(n))
     resid.iloc[30:40] = 4.0  # an observable mid-sample extreme block
-    price = pd.Series(np.exp(np.cumsum(rng.randn(n) * 0.02)),
-                      index=_me_index(n))
+    price = pd.Series(np.exp(np.cumsum(rng.randn(n) * 0.02)), index=_me_index(n))
+
     tbl = walk_forward_conditional_table(
-        resid, price, horizons=(12,), top_q=0.9, warmup=24)
+        resid, price, horizons=(h,), top_q=top_q, warmup=warm)
     assert set(tbl["regime"]) == {"extreme_high_wf", "rest"}
-    ext = tbl[tbl["regime"] == "extreme_high_wf"].iloc[0]
-    assert int(ext["n"]) >= 0  # may be 0 if all extremes fall in warm-up/tail
+
+    # reconstruct the expected groups from the calibrator + the same observability
+    pct = expanding_percentile(resid, min_periods=warm, exclude_current=False)
+    fwd = forward_log_return(price, h)
+    valid = pct.dropna().index.intersection(fwd.dropna().index)
+    fv = pct.reindex(valid)
+    exp_ext = fv[fv >= top_q].index
+    exp_rest = fv[fv < top_q].index
+
+    ext_n = int(tbl[tbl["regime"] == "extreme_high_wf"]["n"].iloc[0])
+    rest_n = int(tbl[tbl["regime"] == "rest"]["n"].iloc[0])
+    assert ext_n == len(exp_ext) > 0          # non-empty AND exactly matches
+    assert rest_n == len(exp_rest)
+    assert ext_n + rest_n == len(valid)       # exhaustive, no double-count/leak
     for col in ("n", "mean", "median", "p25", "p75", "hit"):
         assert col in tbl.columns
+
+
+def test_walk_forward_conditional_table_rejects_bad_q():
+    n = 40
+    resid = pd.Series(np.arange(n, dtype=float), index=_me_index(n))
+    price = pd.Series(np.exp(np.arange(n) * 0.01), index=_me_index(n))
+    with pytest.raises(ValueError):
+        walk_forward_conditional_table(resid, price, top_q=1.0)
+
+
+# ── 6. monotonic-index (no-lookahead) guard ──────────────────────────────
+def test_expanding_rejects_non_monotonic_index():
+    """An out-of-order index would let a future month sit in an earlier position
+    and leak into a past calibration → must raise (codex PR#15 P2)."""
+    idx = _me_index(10)
+    shuffled = idx[[0, 1, 5, 2, 3, 4, 6, 7, 8, 9]]  # not increasing
+    s = pd.Series(np.arange(10.0), index=shuffled)
+    with pytest.raises(ValueError):
+        expanding_zscore(s, min_periods=3)
+    with pytest.raises(ValueError):
+        expanding_percentile(s, min_periods=3)
 
 
 def test_warmup_sensitivity_table():
@@ -265,3 +302,50 @@ def test_warmup_sensitivity_table():
     # a larger warm-up starts the ex-ante trajectory later
     firsts = tbl.set_index("warmup")["first_wf_date"]
     assert firsts[12] <= firsts[24] <= firsts[36]
+
+
+# ── 7. verdict guards (script-level adjudication) ─────────────────────────
+def _load_script_module():
+    """Load scripts/gold_dedollar_gap_walkforward.py by path (it is a script, not a
+    package) so its module-level _verdict can be unit-tested."""
+    import importlib.util
+    import os
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    path = os.path.join(here, "scripts", "gold_dedollar_gap_walkforward.py")
+    spec = importlib.util.spec_from_file_location("_wf_script", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_verdict_not_robust_without_evaluable_extreme():
+    """No evaluable historical extreme (warm-up swallows them / warmup > history) ⇒
+    NO ex-ante evidence ⇒ must NOT return ROBUST (codex PR#15 P1)."""
+    script = _load_script_module()
+    n = 40
+    rng = np.random.RandomState(99)
+    # a non-degenerate residual with a defined current full-sample reading…
+    resid = pd.Series(np.sort(rng.randn(n)), index=_me_index(n))
+    # …but a warm-up larger than the whole history → every expanding rank is NaN,
+    # so any full-sample extreme month is in warm-up → n_evaluable == 0.
+    rd = current_walk_forward_reading(resid, warmup=n + 50)
+    rc = extreme_reclassification(resid, top_q=0.9, warmup=n + 50)
+    assert rc.summary["n_evaluable"] == 0
+    assert not np.isfinite(rc.summary["agreement_rate"])
+    label, _ = script._verdict(rd, rc, None)
+    assert label != "ROBUST"
+    assert label == "UNKNOWN"
+
+
+def test_verdict_robust_when_current_stable_and_extremes_agree():
+    """Sanity-check the positive branch still fires: current pct ≈ full-sample and
+    all evaluable historical extremes agree ex-ante ⇒ ROBUST."""
+    script = _load_script_module()
+    # ramp then high plateau → late months full-sample extreme AND ex-ante extreme.
+    base = np.concatenate([np.linspace(-1, 2.5, 70), np.full(40, 2.6)])
+    resid = pd.Series(base, index=_me_index(110))
+    rd = current_walk_forward_reading(resid, warmup=24)
+    rc = extreme_reclassification(resid, top_q=0.9, warmup=24)
+    assert rc.summary["n_evaluable"] > 0
+    label, _ = script._verdict(rd, rc, None)
+    assert label == "ROBUST"

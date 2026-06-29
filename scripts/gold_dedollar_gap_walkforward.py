@@ -90,7 +90,27 @@ def _cond_md(tbl: pd.DataFrame) -> str:
         rows)
 
 
-def _verdict(rd, rc) -> tuple[str, str]:
+def _wf_extreme_caveat(rc, cond_wf) -> str:
+    """Dynamically describe how thin the ex-ante extreme sample is, from the actual
+    run (NOT hardcoded to a particular vintage; codex PR#15 P2). Reports the date
+    span of the ex-ante-extreme months and the observable N per horizon."""
+    ep = rc.episodes
+    wf_ext = ep[ep.get("wf_extreme", False) == True] if not ep.empty else ep  # noqa: E712
+    if wf_ext is None or wf_ext.empty:
+        span = "无 ex-ante 极端月"
+    else:
+        d = pd.to_datetime(wf_ext["date"])
+        span = f"集中在 {d.min():%Y-%m}..{d.max():%Y-%m}"
+    if cond_wf is not None and not cond_wf.empty:
+        ext = cond_wf[cond_wf["regime"] == "extreme_high_wf"]
+        ns = ", ".join(f"{int(r['horizon'])}m: n={int(r['n'])}"
+                       for _, r in ext.iterrows())
+    else:
+        ns = "n/a"
+    return f"ex-ante 极端月{span};各 horizon 可观测前瞻 N（{ns}）"
+
+
+def _verdict(rd, rc, cond_wf=None) -> tuple[str, str]:
     """Honest adjudication. The CURRENT reading is near-invariant to calibration
     (the window ends *now*), so the discriminating evidence is the historical
     extreme-episode reread: how often a full-sample 'extreme' was extreme ex-ante.
@@ -99,34 +119,47 @@ def _verdict(rd, rc) -> tuple[str, str]:
     QUALIFIED — current robust but a non-trivial share of historical 'extremes'
                 were not extreme in real time (the *narrative* is partly hindsight).
     DOWNGRADE — current walk-forward pct drops materially below full-sample.
+    UNKNOWN — no current reading, OR no evaluable historical extreme (e.g. warm-up
+              swallows them all / warmup > evaluable history): then there is NO
+              ex-ante evidence to certify robustness, so we must NOT claim ROBUST
+              (codex PR#15 P1).
     """
     pct_full = rd.pct_full
     pct_wf = rd.pct_wf_excl  # strict ex-ante current read
     agree = rc.summary.get("agreement_rate", float("nan"))
+    n_eval = rc.summary.get("n_evaluable", 0)
     if not np.isfinite(pct_full):
-        return "UNKNOWN", "no defined current deviation reading."
+        return "UNKNOWN", "无可定义的当前偏离读数,无法裁决。"
     drop = pct_full - pct_wf if np.isfinite(pct_wf) else 0.0
     if np.isfinite(pct_wf) and drop > 0.15:
         return ("DOWNGRADE",
                 f"当前分位在 walk-forward(strict ex-ante)下从 {_fmt_pct(pct_full)} "
                 f"降到 {_fmt_pct(pct_wf)}(降 {drop * 100:.0f}pp)——「偏贵」部分是"
                 "全样本 in-sample 标定的产物,PR#14 高估了极端性,应降级。")
-    # current is robust; differentiate on the historical episode reread
-    if np.isfinite(agree) and agree < 0.7:
+    # Historical extreme reread is the discriminator — but only if there is any
+    # evaluable extreme month. No evaluable sample ⇒ no ex-ante evidence ⇒ UNKNOWN.
+    if not np.isfinite(agree) or n_eval == 0:
+        return ("UNKNOWN",
+                f"当前分位 walk-forward 与全样本接近({_fmt_pct(pct_wf)} vs "
+                f"{_fmt_pct(pct_full)}),但历史极端重判没有可评估样本"
+                f"(可评估月 n={int(n_eval)};warm-up={rc.summary.get('n_warmup', 0)} "
+                "月、或 --warmup 超过可评估历史)——无 ex-ante 证据,不能据此判定 ROBUST。")
+    caveat = _wf_extreme_caveat(rc, cond_wf)
+    if agree < 0.7:
         return ("QUALIFIED",
                 f"当前分位 walk-forward 与全样本接近({_fmt_pct(pct_wf)} vs "
                 f"{_fmt_pct(pct_full)})——今天的「偏贵」读数本身不是 look-ahead 产物"
                 "(窗口终点即当下);但历史「极端」月份中只有 "
-                f"{_fmt_pct(agree)} 在当时(ex-ante)也算极端——PR#14『历史极端后回调』"
-                "的叙事部分依赖事后视角,应谨慎。")
+                f"{_fmt_pct(agree)}(可评估 n={int(n_eval)})在当时(ex-ante)也算极端"
+                "——PR#14『历史极端后回调』的叙事部分依赖事后视角,应谨慎。")
     return ("ROBUST",
             f"当前分位 walk-forward 与全样本一致({_fmt_pct(pct_wf)} vs "
-            f"{_fmt_pct(pct_full)}),且历史「极端」月份 {_fmt_pct(agree)} 在 ex-ante "
-            "下也算极端——PR#14 的**估值「偏贵」分位结论**对标定口径稳健,未见 in-sample "
-            "假象。⚠️ 注意范围:本裁决只认证「今天有多贵」这个分位读数;PR#14 §3 的"
-            "「历史极端→之后回调」**预测性**叙事在 ex-ante 旗标下样本被 warm-up 与"
-            "不可观测前瞻窗砍得很薄(见 §4b,极端簇集中在 2025-26、24/36m 前瞻多不可观测),"
-            "无法 ex-ante 证实——稳健的是估值分位,不是回调预测。")
+            f"{_fmt_pct(pct_full)}),且历史「极端」月份 {_fmt_pct(agree)}"
+            f"(可评估 n={int(n_eval)})在 ex-ante 下也算极端——PR#14 的**估值「偏贵」"
+            "分位结论**对标定口径稳健,未见 in-sample 假象。⚠️ 注意范围:本裁决只认证"
+            "「今天有多贵」这个分位读数;PR#14 §3 的「历史极端→之后回调」**预测性**叙事"
+            f"在 ex-ante 旗标下样本被砍薄({caveat}),无法 ex-ante 证实——稳健的是估值"
+            "分位,不是回调预测。")
 
 
 def main() -> None:
@@ -175,7 +208,7 @@ def main() -> None:
         resid, df["gold_nominal"], horizons=DEFAULT_HORIZONS,
         top_q=args.top_q, warmup=args.warmup, exclude_current=False)
 
-    label, verdict_msg = _verdict(rd, rc)
+    label, verdict_msg = _verdict(rd, rc, cond_wf)
     asof_str = rd.asof.strftime("%Y-%m") if rd.asof is not None else "n/a"
 
     # ── trajectory divergence summary (mean/max |pct_wf − pct_full|) ──
@@ -191,8 +224,9 @@ def main() -> None:
     P.append(f"# 金价偏离度 Walk-forward 标定重估 (PR#15, {stamp})\n")
     P.append("> **治本的一票否决式便宜检验。** 把 PR#14 偏离度的 z-score/分位数标定从"
              "「全样本 in-sample」改成「expanding window ex-ante」(每月 t 只用截至当月的"
-             "历史算均值/标准差/累计分位),诚实重估「当前 ~88 分位」到底靠不靠谱。"
-             "**DI 构造与滚动回归拟合数据完全不动,只改标定口径。** ex-post 描述,非预测。\n")
+             f"历史算均值/标准差/累计分位),诚实重估「当前 {_fmt_pct(rd.pct_full)} 分位」"
+             "到底靠不靠谱。**DI 构造与滚动回归拟合数据完全不动,只改标定口径。** "
+             "ex-post 描述,非预测。\n")
 
     P.append("## 裁决 (Verdict)\n")
     P.append(f"**{label}** — {verdict_msg}\n")
@@ -214,10 +248,10 @@ def main() -> None:
          ["walk-forward · exclude-current (strict ex-ante)",
           _fmt(rd.z_wf_excl), _fmt_pct(rd.pct_wf_excl)]]))
     P.append("")
-    P.append(f"**裁决数字:88 分位在 walk-forward 下 = {_fmt_pct(rd.pct_wf_excl)}"
-             f"(strict ex-ante)/ {_fmt_pct(rd.pct_wf_incl)}(include)。** "
-             "include 与全样本恒等;exclude 仅去最新点,故二者均≈全样本——"
-             "当前读数对标定口径稳健。\n")
+    P.append(f"**裁决数字:全样本 {_fmt_pct(rd.pct_full)} 分位在 walk-forward 下 = "
+             f"{_fmt_pct(rd.pct_wf_excl)}(strict ex-ante)/ {_fmt_pct(rd.pct_wf_incl)}"
+             "(include)。** include 与全样本恒等;exclude 仅去最新点,故二者均≈全样本"
+             "——当前读数对标定口径稳健。\n")
 
     P.append("## 2. 全样本 vs walk-forward 标定:整段轨迹的分位差\n")
     P.append("对每个历史月,比较全样本分位(偷看未来)与 expanding 分位(ex-ante)。"
@@ -230,6 +264,11 @@ def main() -> None:
     P.append("## 3. 历史极端高位重判 (核心 ex-ante 泄露检验)\n")
     P.append("PR#14 用**全样本** top-decile 把某些月标为「极端高位」并称「之后金价回调」。"
              "这里问当时的人(只用截至当月、warm-up 门控后的 expanding 分位)是否也会判其极端。\n")
+    P.append("> **口径说明:本节与 §4 用 `include-current` ex-ante**——即把当月排进它"
+             "自己截至当月的历史里(`<=` 含自身,与 PR#14 `full_percentile` 的计数一致,"
+             "只换窗口、不偷看未来),是 PR#14 in-sample 分位的 apples-to-apples ex-ante "
+             "对照。这与 §1 裁决数字用的 `exclude-current`(strict prior-only,把当月排除"
+             "在 baseline 外)是**不同口径**;两者都不看未来,strict 更保守。\n")
     s = rc.summary
     P.append(_md_table(
         ["全样本极端月数", "其中 ex-ante 也极端", "warm-up 内(不计)", "可评估", "一致率"],
@@ -257,7 +296,7 @@ def main() -> None:
     P.append("### 4a. 全样本旗标 (PR#14 原口径)\n")
     P.append(_cond_md(cond_full))
     P.append("")
-    P.append("### 4b. walk-forward 旗标 (ex-ante)\n")
+    P.append("### 4b. walk-forward 旗标 (ex-ante, include-current)\n")
     P.append(_cond_md(cond_wf))
     P.append("")
 

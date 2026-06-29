@@ -82,6 +82,18 @@ def _validate_warmup(min_periods: int) -> None:
         raise ValueError(f"min_periods (warm-up) must be >= 2, got {min_periods}")
 
 
+def _require_time_sorted(s: pd.Series) -> None:
+    """The expanding calibrators iterate in positional order and treat earlier
+    positions as 'history'. A non-time-sorted index would let a future month sit
+    in an earlier position and leak into a past calibration — silently breaking the
+    no-look-ahead contract (codex PR#15 P2). Reject it loudly instead."""
+    if not s.index.is_monotonic_increasing:
+        raise ValueError(
+            "series index must be monotonic increasing for walk-forward "
+            "calibration (sort_index() first); positional iteration treats earlier "
+            "rows as history, so an out-of-order index would leak the future.")
+
+
 def expanding_zscore(
     s: pd.Series, *, min_periods: int = DEFAULT_WARMUP, exclude_current: bool = False
 ) -> pd.Series:
@@ -99,6 +111,7 @@ def expanding_zscore(
     mirroring PR #14's descriptive convention so the two口径 are directly
     comparable (and coincide at the final month)."""
     _validate_warmup(min_periods)
+    _require_time_sorted(s)
     vals = s.astype(float).to_numpy()
     out = np.full(len(vals), np.nan, dtype="float64")
     seen: List[float] = []
@@ -135,6 +148,7 @@ def expanding_percentile(
     full-sample percentile; ``exclude_current=True`` ranks today only against the
     prior history (strict ex-ante 'was today unprecedented?')."""
     _validate_warmup(min_periods)
+    _require_time_sorted(s)
     vals = s.astype(float).to_numpy()
     out = np.full(len(vals), np.nan, dtype="float64")
     seen: List[float] = []
@@ -215,7 +229,9 @@ class WalkForwardReading:
     z_wf_excl: float
     pct_wf_excl: float
     n_resid: int = 0          # defined residuals in history (sample depth)
-    n_wf: int = 0             # observations the expanding baseline used at asof
+    n_wf: int = 0             # defined residuals available through asof (the
+    #                           include-current baseline size; the strict ex-ante /
+    #                           exclude-current baseline is one fewer, n_wf - 1)
     warmup: int = DEFAULT_WARMUP
 
 
