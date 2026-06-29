@@ -28,6 +28,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sys
 from datetime import datetime, timezone
@@ -150,8 +151,10 @@ def verdict(full: pd.DataFrame) -> str:
 
 def _nonneg_float(x: str) -> float:
     v = float(x)
-    if v < 0:
-        raise argparse.ArgumentTypeError("must be non-negative")
+    # `nan < 0` and `inf < 0` are both False, so a bare `v < 0` would silently
+    # accept "nan"/"inf" as a cost — reject any non-finite value explicitly.
+    if not math.isfinite(v) or v < 0:
+        raise argparse.ArgumentTypeError("must be a finite non-negative number")
     return v
 
 
@@ -202,14 +205,28 @@ def main() -> None:
     full = metrics_table(backtests, cstart, cend)
 
     # ── corr-window sensitivity band {24, 36, 48} (anti-overfit) ──
-    sens_windows: Dict[int, pd.DataFrame] = {}
+    # A longer corr window pushes SD's warm-up later, so each window has a
+    # different common investable span. To isolate the *parameter* effect from
+    # a moving sample start, score every window on ONE shared window =
+    # intersection of all per-window common spans (verified by equal n_months).
+    sens_bts: Dict[int, Dict[str, pd.DataFrame]] = {}
+    sens_spans = []
     for w in (24, 36, 48):
         prob_w = dominance_probability(
             panel["gold_nominal"], panel["real_rate_10y"], window=w
         )
         bt_w = run_all(panel, prob_w, args.cost_bps)
-        m = metrics_table(bt_w).loc[["S1_blend", "SD_blend"]]
-        sens_windows[w] = m[["sharpe", "calmar", "cagr", "max_dd"]]
+        sens_bts[w] = bt_w
+        cs_w, ce_w = common_span(bt_w)
+        if cs_w is not None and ce_w is not None:
+            sens_spans.append((cs_w, ce_w))
+    sens_windows: Dict[int, pd.DataFrame] = {}
+    if sens_spans:
+        sens_start = max(s for s, _ in sens_spans)
+        sens_end = min(e for _, e in sens_spans)
+        for w, bt_w in sens_bts.items():
+            m = metrics_table(bt_w, sens_start, sens_end).loc[["S1_blend", "SD_blend"]]
+            sens_windows[w] = m[["sharpe", "calmar", "cagr", "max_dd", "n_months"]]
 
     # ── cost sensitivity {0, 10, 20} bps ──
     sens_cost: Dict[float, pd.DataFrame] = {}
@@ -290,12 +307,18 @@ def main() -> None:
         if lo > hi:
             parts.append(f"### {name}\n_(skipped: no overlap with sample)_\n")
             continue
-        n_in = int(((panel.index >= lo) & (panel.index <= hi)).sum())
-        if n_in < min_seg_months:
-            parts.append(f"### {name}\n_(skipped: only {n_in} months, <{min_seg_months})_\n")
+        # gate on *investable* months (after the common-window warm-up), not the
+        # raw panel count: a long --corr-window or a tight --start/--end can leave
+        # a segment with enough panel months but too few tradeable ones, which
+        # would otherwise print a near-empty / all-NaN table.
+        m = metrics_table(backtests, s, e)
+        n_tradeable = int(m["n_months"].min()) if not m.empty else 0
+        if n_tradeable < min_seg_months:
+            parts.append(f"### {name}\n_(skipped: only {n_tradeable} investable "
+                         f"months after warm-up, <{min_seg_months})_\n")
             continue
         parts.append(f"### {name} ({lo:%Y-%m}–{hi:%Y-%m})\n")
-        parts.append(_fmt(metrics_table(backtests, s, e)))
+        parts.append(_fmt(m))
         parts.append("")
 
     # ── sensitivity bands ──

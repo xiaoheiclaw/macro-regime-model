@@ -164,6 +164,7 @@ def dominance_probability(
     div_chance: float = DEFAULT_DIV_CHANCE,
     div_hi: float = DEFAULT_DIV_HI,
     cb_demand: Optional[pd.Series] = None,
+    cb_lag_months: int = 1,
 ) -> pd.Series:
     """Ex-ante probability ∈ [0,1] that gold is in the **de-dollarization-
     dominant** regime at each month t (1 = de-dollarization, 0 = real-rate).
@@ -184,12 +185,20 @@ def dominance_probability(
                positive reading (sustained official accumulation) confirms
                de-dollarization at full strength; it can only *raise* the
                probability, never manufacture it where the gold–real-rate
-               relation does not cooperate.
+               relation does not cooperate. The series is shifted forward by
+               ``cb_lag_months`` (default 1) before use to model publication
+               lag — WGC central-bank-buying data is released with a quarter+
+               delay, so the month-t figure is NOT known at decision time t.
+               Pass already-lagged data with ``cb_lag_months=0`` if the caller
+               has aligned it to availability dates itself.
 
     All pieces are trailing rollings / forward shifts only → no look-ahead.
     NaN where the window has not yet filled (so warm-up trims cleanly)."""
     if window <= 0:
         raise ValueError(f"window must be a positive integer, got {window}")
+    if cb_lag_months < 0:
+        # a negative lag would shift CB data BACKWARD → read future releases
+        raise ValueError(f"cb_lag_months must be >= 0, got {cb_lag_months}")
     if corr_break <= corr_neg:
         raise ValueError(
             f"corr_break ({corr_break}) must be > corr_neg ({corr_neg}) "
@@ -217,7 +226,9 @@ def dominance_probability(
     p[comps.isna().all(axis=1)] = np.nan
 
     if cb_demand is not None:
-        cb = cb_demand.reindex(gold_nominal.index)
+        # shift forward by the publication lag so the month-t figure is only
+        # used cb_lag_months later (WGC data is released with a quarter+ delay).
+        cb = cb_demand.reindex(gold_nominal.index).shift(cb_lag_months)
         cb_mean = cb.rolling(window, min_periods=window).mean()
         cb_pos = (cb_mean > 0).astype(float)
         cb_pos[cb_mean.isna()] = np.nan
@@ -276,6 +287,14 @@ def s3_dominance(
     # would otherwise let pandas union-align the arithmetic below, producing
     # off-panel dates or surprise NaN that the backtest then mis-aligns on.
     prob = prob.reindex(panel.index)
+    # prob is a regime *probability* — out-of-range values are a caller error
+    # that the final [0,1] exposure clip would otherwise silently mask.
+    bad = prob.dropna()
+    if not bad.between(0.0, 1.0).all():
+        raise ValueError(
+            "prob must be in [0, 1] (regime probability); got out-of-range "
+            f"values, e.g. {list(bad[~bad.between(0.0, 1.0)].round(4).items())[:3]}"
+        )
     rr = panel["real_rate_10y"]
     rr_chg = rr - rr.shift(rr_window)        # trailing change: rr[t] - rr[t-rr_window]
     rr_falling = (rr_chg <= 0).astype(float)  # 1 when real rate not rising

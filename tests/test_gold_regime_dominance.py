@@ -22,6 +22,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from lib.gold_trend_timing import (
     build_timing_panel,
@@ -347,6 +348,46 @@ def test_cb_demand_cannot_manufacture_regime_without_base_fingerprint():
     cb = pd.Series(10.0, index=panel.index)        # sustained heavy net buying
     p = dominance_probability(panel["gold_nominal"], rr_nan, window=36, cb_demand=cb)
     assert p.isna().all()                          # NOT fabricated to 1.0
+
+
+def test_cb_demand_is_publication_lagged_no_lookahead():
+    """P2 regression: cb_demand is shifted by cb_lag_months before use, so a CB
+    figure first appearing at month t cannot influence the month-t (or earlier)
+    probability. With lag=1, a single CB spike at index k may only affect the
+    probability from k+1 onward — index k and before are identical to no-cb."""
+    panel = _panel()
+    g, rr = panel["gold_nominal"], panel["real_rate_10y"]
+    base = dominance_probability(g, rr, window=12)
+    k = 100
+    cb = pd.Series(0.0, index=panel.index)
+    cb.iloc[k] = 1e6                                # one huge spike at month k
+    lagged = dominance_probability(g, rr, window=12, cb_demand=cb, cb_lag_months=1)
+    # months ≤ k are untouched by a spike that is only "published" at k+1
+    a = base.iloc[: k + 1].to_numpy()
+    b = lagged.iloc[: k + 1].to_numpy()
+    m = ~(np.isnan(a) | np.isnan(b))
+    np.testing.assert_allclose(a[m], b[m])
+    np.testing.assert_array_equal(np.isnan(a), np.isnan(b))
+
+
+def test_negative_cb_lag_rejected():
+    panel = _panel()
+    with pytest.raises(ValueError):
+        dominance_probability(panel["gold_nominal"], panel["real_rate_10y"],
+                              cb_demand=pd.Series(1.0, index=panel.index),
+                              cb_lag_months=-1)
+
+
+def test_s3_rejects_out_of_range_prob():
+    """P3 regression: a prob outside [0,1] is a caller error that the final
+    exposure clip would otherwise silently mask — s3_dominance must reject it."""
+    panel = _panel()
+    bad = pd.Series(1.5, index=panel.index)         # > 1
+    with pytest.raises(ValueError):
+        s3_dominance(panel, bad)
+    bad2 = pd.Series(-0.2, index=panel.index)       # < 0
+    with pytest.raises(ValueError):
+        s3_dominance(panel, bad2)
 
 
 def test_cb_demand_none_is_default_and_positive_cb_only_raises_prob():
