@@ -247,36 +247,52 @@ def _zscore(s: pd.Series) -> pd.Series:
     return (s - s.mean()) / sd
 
 
-def available_layers(df: pd.DataFrame, layers: Sequence[Layer] = LAYERS) -> List[Layer]:
-    """Layers whose every component column exists and has >=1 non-NaN value over
-    the panel; optional layers with missing data are dropped."""
-    out: List[Layer] = []
-    for lyr in layers:
-        ok = all(c in df.columns and df[c].notna().any() for c in lyr.components)
-        if ok:
-            out.append(lyr)
-        elif not lyr.optional:
-            # required layer with no data: keep it so the caller sees the gap,
-            # but it will be dropped in build_design with a recorded skip note.
-            out.append(lyr)
-    return out
+DEFAULT_MIN_OBS = 24
 
 
 def build_design(
     df: pd.DataFrame,
     layers: Sequence[Layer] = LAYERS,
+    *,
+    allow_missing_required: bool = False,
+    min_obs: int = DEFAULT_MIN_OBS,
 ) -> "DesignMatrix":
     """Build the per-layer proxy matrix on the rows where ALL included layers'
     components are present. Single-component layers pass through in natural units;
     multi-component layers become the equal-weight mean of z-scored components
-    (z over the retained sample). Layers with no data are skipped and recorded."""
+    (z over the retained sample).
+
+    Layer inclusion contract (codex PR#9 review):
+      * an *optional* layer (e.g. ⑤ flow) with missing data is silently dropped
+        and recorded in `skipped`;
+      * a *required* layer (①–④) with missing data raises `ValueError` so a
+        partial run is never silently mistaken for a complete five-layer
+        attribution — unless `allow_missing_required=True`, in which case it is
+        dropped, recorded, AND flagged in `incomplete` so callers/reports can
+        mark the result invalid/incomplete.
+
+    After the common `dropna()` the retained sample must have `>= min_obs` rows
+    and strictly more rows than the maximum regressor count (all layers + const);
+    otherwise `ValueError` (prevents a silent empty/degenerate lstsq when layers
+    have data individually but no overlapping window)."""
     used: List[Layer] = []
     skipped: Dict[str, str] = {}
+    incomplete: List[str] = []
     needed_cols: List[str] = []
     for lyr in layers:
         missing = [c for c in lyr.components if c not in df.columns or df[c].notna().sum() == 0]
         if missing:
-            skipped[lyr.key] = f"missing/empty components: {missing}"
+            if lyr.optional:
+                skipped[lyr.key] = f"missing/empty components: {missing}"
+                continue
+            msg = f"required layer {lyr.key!r} has missing/empty components: {missing}"
+            if not allow_missing_required:
+                raise ValueError(
+                    msg + " — pass allow_missing_required=True to run a degraded "
+                    "(incomplete) attribution."
+                )
+            skipped[lyr.key] = msg
+            incomplete.append(lyr.key)
             continue
         used.append(lyr)
         needed_cols.extend(lyr.components)
@@ -287,6 +303,19 @@ def build_design(
         if c not in cols:
             cols.append(c)
     sub = df[cols].dropna()
+
+    max_regressors = len(used) + 1  # all layers + const (mode-agnostic upper bound)
+    if len(sub) < max(min_obs, max_regressors + 1):
+        cov = "; ".join(
+            f"{c}:{int(df[c].notna().sum()) if c in df.columns else 0}" for c in cols
+        )
+        raise ValueError(
+            f"attribution design has only {len(sub)} overlapping rows after dropna "
+            f"(need >= {max(min_obs, max_regressors + 1)}); layers' components may "
+            f"have data individually but no common window. per-column non-NaN: {cov}. "
+            f"skipped={skipped}"
+        )
+
     proxies: Dict[str, pd.Series] = {}
     for lyr in used:
         if len(lyr.components) == 1:
@@ -296,7 +325,7 @@ def build_design(
             proxies[lyr.key] = comp.mean(axis=1)
     X = pd.DataFrame(proxies, index=sub.index)
     return DesignMatrix(X=X, ln_gold=sub["ln_gold"], ln_cpi=sub["ln_cpi"],
-                        layers=used, skipped=skipped)
+                        layers=used, skipped=skipped, incomplete=incomplete)
 
 
 @dataclass
@@ -306,6 +335,7 @@ class DesignMatrix:
     ln_cpi: pd.Series
     layers: List[Layer]
     skipped: Dict[str, str] = field(default_factory=dict)
+    incomplete: List[str] = field(default_factory=list)  # required layers dropped
 
 
 # ── OLS fit ─────────────────────────────────────────────────────────────
@@ -322,6 +352,11 @@ class AttributionResult:
     design: DesignMatrix
     fitted: pd.Series
     resid: pd.Series
+
+    @property
+    def incomplete(self) -> List[str]:
+        """Required layers dropped (empty unless allow_missing_required was set)."""
+        return self.design.incomplete
 
 
 def _ols(y: np.ndarray, X: np.ndarray):
@@ -348,17 +383,24 @@ def fit_attribution(
     *,
     layers: Sequence[Layer] = LAYERS,
     cpi_mode: str = "identity",
+    allow_missing_required: bool = False,
+    min_obs: int = DEFAULT_MIN_OBS,
 ) -> AttributionResult:
     """Full-sample OLS attribution fit.
 
     `cpi_mode="identity"`: impose the purchasing-power identity b_CPI≡1 by
     regressing (ln_gold − ln_cpi) on layers ②–⑤; layer ①'s contribution is then
     exactly Δln(CPI). `cpi_mode="free"`: regress ln_gold on ln_cpi + ②–⑤.
+
+    `allow_missing_required` / `min_obs` are forwarded to `build_design`: by
+    default a missing required layer (①–④) or a too-small overlapping sample
+    raises rather than silently producing a partial attribution.
     """
     df = panel.data if isinstance(panel, AttributionPanel) else panel
     if cpi_mode not in ("identity", "free"):
         raise ValueError(f"cpi_mode must be 'identity' or 'free', got {cpi_mode!r}")
-    design = build_design(df, layers)
+    design = build_design(df, layers, allow_missing_required=allow_missing_required,
+                          min_obs=min_obs)
 
     if cpi_mode == "identity":
         y = (design.ln_gold - design.ln_cpi).to_numpy()
@@ -405,14 +447,26 @@ def fit_attribution(
 
 # ── period decomposition ────────────────────────────────────────────────
 def _nearest_row(s: pd.Series, when: str, side: str) -> pd.Timestamp:
-    """Index label at/after (side='start') or at/before (side='end') a period."""
-    target = pd.Period(when, freq="M").to_timestamp("M")
+    """Index label at/after (side='start') or at/before (side='end') a period.
+
+    Raises `ValueError` on an out-of-range request rather than silently snapping
+    to the opposite end (which would quietly turn the requested window into a
+    near-full / reversed window — codex PR#9 review)."""
     idx = s.dropna().index
+    avail = f"{idx.min().date()}..{idx.max().date()}" if len(idx) else "empty"
     if side == "start":
         cand = idx[idx >= pd.Period(when, freq="M").to_timestamp()]
-        return cand[0] if len(cand) else idx[0]
-    cand = idx[idx <= target]
-    return cand[-1] if len(cand) else idx[-1]
+        if not len(cand):
+            raise ValueError(
+                f"window start {when!r} is after the last available row ({avail})"
+            )
+        return cand[0]
+    cand = idx[idx <= pd.Period(when, freq="M").to_timestamp("M")]
+    if not len(cand):
+        raise ValueError(
+            f"window end {when!r} is before the first available row ({avail})"
+        )
+    return cand[-1]
 
 
 def decompose_period(
@@ -428,6 +482,11 @@ def decompose_period(
     design = result.design
     d0 = _nearest_row(design.ln_gold, t0, "start")
     d1 = _nearest_row(design.ln_gold, t1, "end") if t1 else design.ln_gold.dropna().index[-1]
+    if d0 >= d1:
+        raise ValueError(
+            f"empty/reversed window: resolved start {d0.date()} >= end {d1.date()} "
+            f"(requested t0={t0!r}, t1={t1!r})"
+        )
 
     total = float(design.ln_gold.loc[d1] - design.ln_gold.loc[d0])
     rows = []
@@ -502,12 +561,13 @@ def rolling_coefs(
     window: int = 60,
     layers: Sequence[Layer] = LAYERS,
     cpi_mode: str = "identity",
+    allow_missing_required: bool = False,
 ) -> pd.DataFrame:
     """Rolling-window OLS coefficients per layer, to *show* the regime-dependence
     (PR #1–#4: no stable anchor). Each row t is the fit on the trailing `window`
     months ending at t. NOT used for prediction — instability is the point."""
     df = panel.data if isinstance(panel, AttributionPanel) else panel
-    design = build_design(df, layers)
+    design = build_design(df, layers, allow_missing_required=allow_missing_required)
     if cpi_mode == "identity":
         y_full = design.ln_gold - design.ln_cpi
         reg_layers = [l for l in design.layers if l.key != "cpi"]
@@ -532,7 +592,17 @@ def verdict(decomp: pd.DataFrame) -> Dict[str, object]:
     body = decomp[~decomp["layer"].isin(["cpi", "TOTAL"])].copy()
     body = body.dropna(subset=["contribution_ln"])
     if body.empty:
-        return {"sovereign_took_over": False, "reason": "no non-inflation layers"}
+        # uniform schema (codex PR#9 review): callers/report never KeyError on a
+        # degenerate decomposition with only the CPI layer.
+        return {
+            "sovereign_took_over": False,
+            "top_layer": None,
+            "top_label": None,
+            "top_contribution_ln": np.nan,
+            "sov_contribution_ln": np.nan,
+            "ranking": [],
+            "reason": "no non-inflation layers",
+        }
     top = body.loc[body["contribution_ln"].idxmax()]
     sov = body[body["layer"] == "sov"]
     sov_contrib = float(sov["contribution_ln"].iloc[0]) if not sov.empty else np.nan

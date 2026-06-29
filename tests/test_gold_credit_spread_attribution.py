@@ -87,10 +87,10 @@ def test_panel_columns_and_signs():
                                -df["custody_share"].dropna())
     # custody leading gap survives (not silently filled)
     assert df["custody_share"].iloc[:12].isna().all()
-    # layer ⑤ flow unavailable by default
+    # layer ⑤ flow unavailable by default → note documents the fold-into-residual
     assert df["wgc_flow"].isna().all()
-    assert "unavailable" not in panel.notes.get("wgc_flow", "") or True  # note present
-    assert "ex_post" in " ".join(panel.notes).lower() or "ex_post_boundary" in panel.notes
+    assert "folded into the ε_flow residual" in panel.notes["wgc_flow"]
+    assert "ex_post_boundary" in panel.notes
 
 
 def test_design_matrix_layers_and_zscore():
@@ -166,18 +166,74 @@ def test_stacked_path_sums_to_cumulative_dln_gold():
 
 
 # ── 4. missing-data layers skipped cleanly ───────────────────────────────
-def test_missing_credit_drops_tail_layer():
+def test_missing_required_layer_raises_by_default():
+    """④ tail (required) with no credit data → build_design / fit raise rather
+    than silently producing a 4-layer 'attribution' (codex P2)."""
     panel, _ = _panel(with_credit=False)
-    design = build_design(panel.data)
+    with pytest.raises(ValueError, match="required layer 'tail'"):
+        build_design(panel.data)
+    with pytest.raises(ValueError, match="required layer 'tail'"):
+        fit_attribution(panel, cpi_mode="identity")
+
+
+def test_missing_required_layer_degrades_when_allowed():
+    """allow_missing_required=True drops ④, flags it incomplete, and still keeps
+    the decomposition exact over the reduced layer set."""
+    panel, _ = _panel(with_credit=False)
+    design = build_design(panel.data, allow_missing_required=True)
     keys = [l.key for l in design.layers]
-    assert "tail" in design.skipped         # ④ skipped (credit empty)
-    assert keys == ["cpi", "real", "sov"]   # others survive
-    res = fit_attribution(panel, cpi_mode="identity")
+    assert "tail" in design.skipped and keys == ["cpi", "real", "sov"]
+    assert design.incomplete == ["tail"]
+    res = fit_attribution(panel, cpi_mode="identity", allow_missing_required=True)
+    assert res.incomplete == ["tail"]
     decomp = decompose_period(res, t0="2005-01")
-    # decomposition still exact with the reduced layer set
     total = float(decomp.loc[decomp["layer"] == "TOTAL", "contribution_ln"].iloc[0])
     parts = decomp[decomp["layer"] != "TOTAL"]["contribution_ln"].sum()
     assert parts == pytest.approx(total, abs=1e-9)
+
+
+def test_no_overlapping_window_raises():
+    """Layers each have data but in disjoint windows → empty dropna → ValueError
+    (not a silent degenerate lstsq) (codex P2)."""
+    anchor, fetch_fn, idx = _anchor_and_fetch(n=120)
+    # blank out credit on the first half and VIX on the second half → after the
+    # joint dropna across all required components, no rows survive.
+    half = len(idx) // 2
+    df = build_attribution_panel(
+        start="1999-01-01", fetch_fn=fetch_fn, anchor_fn=lambda *a, **k: anchor
+    ).data
+    df.loc[df.index[:half], "credit_spread"] = np.nan
+    df.loc[df.index[half:], "vix"] = np.nan
+    with pytest.raises(ValueError, match="overlapping rows"):
+        build_design(df)
+
+
+def test_out_of_range_window_raises():
+    """A decomposition window outside the sample raises rather than silently
+    snapping to the opposite end (codex P2)."""
+    panel, _ = _panel()
+    res = fit_attribution(panel, cpi_mode="identity")
+    with pytest.raises(ValueError, match="after the last available row"):
+        decompose_period(res, t0="2099-01")
+    with pytest.raises(ValueError, match="before the first available row"):
+        decompose_period(res, t0="2005-01", t1="1980-01")
+
+
+def test_verdict_empty_body_uniform_schema():
+    """verdict() on a CPI-only decomposition returns the full key schema (no
+    KeyError downstream) (codex P2)."""
+    decomp = pd.DataFrame([
+        {"layer": "cpi", "label": "①", "coef": 1.0, "delta_proxy": 0.1,
+         "contribution_ln": 0.1, "contribution_pct_of_total": 100.0},
+        {"layer": "TOTAL", "label": "T", "coef": np.nan, "delta_proxy": np.nan,
+         "contribution_ln": 0.1, "contribution_pct_of_total": 100.0},
+    ])
+    v = verdict(decomp)
+    for k in ("sovereign_took_over", "top_layer", "top_label",
+              "sov_contribution_ln", "ranking"):
+        assert k in v
+    assert v["ranking"] == [] and v["top_layer"] is None
+    assert v["sovereign_took_over"] is False
 
 
 def test_wgc_flow_layer_included_when_injected():

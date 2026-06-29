@@ -55,7 +55,11 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--start", default="1990-01-01", help="panel start (data layer)")
     ap.add_argument("--t0", default="2022-01", help="attribution window start")
-    ap.add_argument("--t1", default=None, help="attribution window end (default latest)")
+    ap.add_argument("--t1", default=None,
+                    help="attribution window end (default latest). NOTE: --t1 only "
+                         "limits the *decomposition* window; the full-sample OLS fit "
+                         "still uses all data through the latest available month "
+                         "(ex-post by design — see report §0).")
     ap.add_argument("--roll-window", type=int, default=60, help="rolling coef window (months)")
     args = ap.parse_args()
 
@@ -145,8 +149,15 @@ def _write_report(path, panel, res_id, res_free, decomp, decomp_free, v, v_free,
     tot_ret = decomp.attrs["total_pct_return"]
     rank = v["ranking"]
 
+    incomplete_banner = ""
+    if res_id.incomplete:
+        incomplete_banner = (
+            f"\n> ⚠️ **降级运行(INCOMPLETE)**:必需层 {res_id.incomplete} 缺数据被跳过,"
+            "本归因**不是**完整五层,裁决仅供参考。\n"
+        )
     verdict_line = (
         f"**主权信用层(③)接管 = {'成立 ✅' if v['sovereign_took_over'] else '未成立 ❌'}**"
+        + incomplete_banner
     )
     # contributions for the nuanced ruling
     def _contrib(layer):
@@ -154,7 +165,12 @@ def _write_report(path, panel, res_id, res_free, decomp, decomp_free, v, v_free,
         return float(row["contribution_ln"].iloc[0]) if not row.empty else np.nan
     real_c, sov_c, resid_c = _contrib("real"), _contrib("sov"), _contrib("flow_resid")
 
-    if v["sovereign_took_over"]:
+    if not v.get("ranking"):
+        ruling = (
+            "⚠️ **不可裁决**:可用的非通胀层不足(归因降级运行,仅 CPI 层),"
+            f"无法判断主权信用是否接管。降级原因:{v.get('reason', 'n/a')}。"
+        )
+    elif v["sovereign_took_over"]:
         ruling = (
             f"在 {t0}→{t1} 的金价涨幅中,**主权信用层(③)是最大正贡献项** "
             f"(Δln={v['sov_contribution_ln']:+.4f}),定量支持「2022 起主权信用 regime 接管」假说。"
@@ -296,7 +312,9 @@ def _write_report(path, panel, res_id, res_free, decomp, decomp_free, v, v_free,
         "- 样本内归因(解释历史),**非**预测;系数 regime 依赖(见 §5 滚动)。",
         "- 各层代理高度共线(§2 条件数),逐层系数对口径敏感 —— identity vs free 两套并报。",
         f"- ⑤ 流量层在无 WGC 注入时并入 ε_flow 残差({notes.get('wgc_flow','')[:60]}…)。",
-        "- ③ 的去美元化分量(外官托管)始于 2003(WMTSECL1),早于此仅 debt/GDP 一项。",
+        "- ③ 主权信用层为 debt/GDP 与外官托管份额(WMTSECL1,始于 2002-12)的等权 z-composite,"
+        "要求**两分量同时非空**;因此整个回归拟合样本自 2003 年起(2003 前无托管数据的行被整体丢弃,"
+        "并非「仅用 debt/GDP」)。如需用足 1990-2002 仅 debt/GDP 的样本,需改为分段 composite(未实现)。",
         f"- ex-post 边界声明:{notes.get('ex_post_boundary','')}",
         "",
         "## 附:产出文件",
