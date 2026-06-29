@@ -183,18 +183,25 @@ def check_2022(rank: pd.Series) -> str:
             f"de-dollarization signal is **{verdict_word}** post-2022.")
 
 
-def verdict(full: pd.DataFrame, rank: pd.Series) -> str:
-    """Honest kill-condition adjudication. Decisive test: S5 (either variant) vs S1
-    (the PR #5 standard). If modulating trend SIZE by a de-dollarization proxy does
-    not beat pure trend on BOTH Sharpe and Calmar net of cost, the proxy lags the
-    price that already discounts the flow — the fourth independent confirmation that
-    S1 suffices and the de-dollarization intuition is closed out for trading."""
+def verdict(full: pd.DataFrame, active: pd.DataFrame, active_label: str, rank: pd.Series) -> str:
+    """Honest kill-condition adjudication. The DECISIVE S5-vs-S1 test is scored on the
+    **active-signal window** (`active`, from the first rank-defined month), NOT the
+    full sample — pre-rank months have S5 ≡ S1 by construction and would only dilute
+    the modulation's effect. S1-vs-S0 context is shown on the full sample. If
+    modulating trend SIZE by a de-dollarization proxy does not beat pure trend on BOTH
+    Sharpe and Calmar net of cost over the window where it is actually ON, the proxy
+    lags the price that already discounts the flow — the 4th independent confirmation
+    that S1 suffices and the de-dollarization intuition is closed out for trading."""
     s0 = full.loc["S0_buyhold"]
     s1 = full.loc["S1_blend"]
-    s5s = full.loc["S5_soft"]
-    s5h = full.loc["S5_hard"]
+    # decisive comparison rows come from the ACTIVE window
+    a_s1 = active.loc["S1_blend"]
+    a_s5s = active.loc["S5_soft"]
+    a_s5h = active.loc["S5_hard"]
 
-    for name, row in (("S0", s0), ("S1_blend", s1), ("S5_soft", s5s), ("S5_hard", s5h)):
+    checks = (("S0", s0), ("S1_blend(full)", s1),
+              ("S1_blend(active)", a_s1), ("S5_soft(active)", a_s5s), ("S5_hard(active)", a_s5h))
+    for name, row in checks:
         if not (pd.notna(row["sharpe"]) and pd.notna(row["calmar"])):
             return ("## Verdict\n\n**Insufficient sample / invalid metrics "
                     f"({name} has NaN Sharpe or Calmar) — cannot adjudicate. "
@@ -204,20 +211,23 @@ def verdict(full: pd.DataFrame, rank: pd.Series) -> str:
         return (a["sharpe"] > b["sharpe"]) and (a["calmar"] > b["calmar"])
 
     s1_beats_s0 = better(s1, s0)
-    s5s_beats_s1 = better(s5s, s1)
-    s5h_beats_s1 = better(s5h, s1)
+    s5s_beats_s1 = better(a_s5s, a_s1)
+    s5h_beats_s1 = better(a_s5h, a_s1)
     s5_beats_s1 = s5s_beats_s1 or s5h_beats_s1
     winners = [lbl for lbl, won in (("S5_soft", s5s_beats_s1), ("S5_hard", s5h_beats_s1)) if won]
 
     lines = ["## Verdict (honest kill conditions, net of cost)\n"]
-    lines.append(f"- S1_blend vs S0: Sharpe {s1['sharpe']:.2f} vs {s0['sharpe']:.2f}, "
+    lines.append(f"_Decisive S5-vs-S1 scored on the **active-signal window** {active_label} "
+                 "(from the first rank-defined month) — where S5 actually differs from S1; "
+                 "the full sample only dilutes it (S5 ≡ S1 pre-rank)._\n")
+    lines.append(f"- S1_blend vs S0 (full sample): Sharpe {s1['sharpe']:.2f} vs {s0['sharpe']:.2f}, "
                  f"Calmar {s1['calmar']:.2f} vs {s0['calmar']:.2f} → "
                  f"{'S1 beats buy-and-hold (PR#5 replicates)' if s1_beats_s0 else 'S1 does NOT beat buy-and-hold here'}")
-    lines.append(f"- **S5_soft vs S1** (decisive): Sharpe {s5s['sharpe']:.2f} vs "
-                 f"{s1['sharpe']:.2f}, Calmar {s5s['calmar']:.2f} vs {s1['calmar']:.2f} → "
+    lines.append(f"- **S5_soft vs S1** (decisive, active): Sharpe {a_s5s['sharpe']:.2f} vs "
+                 f"{a_s1['sharpe']:.2f}, Calmar {a_s5s['calmar']:.2f} vs {a_s1['calmar']:.2f} → "
                  f"{'soft size modulation ADDS edge' if s5s_beats_s1 else 'no edge'}")
-    lines.append(f"- **S5_hard vs S1** (decisive): Sharpe {s5h['sharpe']:.2f} vs "
-                 f"{s1['sharpe']:.2f}, Calmar {s5h['calmar']:.2f} vs {s1['calmar']:.2f} → "
+    lines.append(f"- **S5_hard vs S1** (decisive, active): Sharpe {a_s5h['sharpe']:.2f} vs "
+                 f"{a_s1['sharpe']:.2f}, Calmar {a_s5h['calmar']:.2f} vs {a_s1['calmar']:.2f} → "
                  f"{'hard size modulation ADDS edge' if s5h_beats_s1 else 'no edge'}")
     lines.append("")
     lines.append(check_2022(rank))
@@ -314,6 +324,21 @@ def main() -> None:
         raise SystemExit(2)
     full = metrics_table(backtests, cstart, cend)
 
+    # ── active-signal window: from the first rank-defined month (where S5 actually
+    # differs from S1) to cend. This is the DECISIVE window for the verdict; the full
+    # sample dilutes the modulation (S5 ≡ S1 pre-rank). ──
+    rank_first = rank.first_valid_index()
+    if rank_first is not None:
+        active_lo = max(cstart, rank_first)
+        active_hi = cend
+        if active_lo <= active_hi:
+            active = metrics_table(backtests, active_lo, active_hi)
+            active_label = f"{active_lo:%Y-%m}–{active_hi:%Y-%m}"
+        else:  # rank only defined past the common end → no active window
+            active, active_label = full, f"{cstart:%Y-%m}–{cend:%Y-%m} (full; no active window)"
+    else:  # proxy unavailable → S5 ≡ S1 everywhere; active == full
+        active, active_label = full, f"{cstart:%Y-%m}–{cend:%Y-%m} (full; proxy unavailable)"
+
     # ── rank-window sensitivity band {36, 60} (anti-overfit), one shared window ──
     sens_bts: Dict[int, Dict[str, pd.DataFrame]] = {}
     sens_spans: Dict[int, tuple] = {}
@@ -407,7 +432,15 @@ def main() -> None:
                  "2022+ sanctions era where de-dollarization is strongest._\n")
     parts.append(_fmt(full))
     parts.append("")
-    parts.append(verdict(full, rank))
+
+    # ── active-signal window (decisive) ──
+    parts.append("## Active-signal window (decisive, net of cost)\n")
+    parts.append(f"From the first rank-defined month ({active_label}) — the window where "
+                 "S5 actually differs from S1 (pre-rank S5 ≡ S1). This is the window the "
+                 "verdict adjudicates on, NOT the diluted full sample.\n")
+    parts.append(_fmt(active))
+    parts.append("")
+    parts.append(verdict(full, active, active_label, rank))
     parts.append("")
 
     # ── sub-segments ──
@@ -418,12 +451,16 @@ def main() -> None:
         seg_lo, seg_hi = _month_start(s), _month_end(e)
         score_lo = max(cstart, seg_lo)
         score_hi = min(cend, seg_hi)
-        if seg_lo > pmax or seg_hi < pmin:
-            parts.append(f"### {name}\n_(skipped: no overlap with sample)_\n")
+        # guard BEFORE computing metrics: skip a segment with no overlap or an empty
+        # (lo>hi) common-investable window so metrics_table is only called on a valid
+        # window (a short --end can make a segment's scored window collapse).
+        if seg_lo > pmax or seg_hi < pmin or score_lo > score_hi:
+            parts.append(f"### {name}\n_(skipped: no overlap with the common investable "
+                         "window)_\n")
             continue
         m = metrics_table(backtests, score_lo, score_hi)
         n_tradeable = segment_investable_months(m)
-        if score_lo > score_hi or n_tradeable < min_seg_months:
+        if n_tradeable < min_seg_months:
             parts.append(f"### {name}\n_(skipped: only {n_tradeable} investable "
                          f"months in {score_lo:%Y-%m}–{score_hi:%Y-%m}, <{min_seg_months})_\n")
             continue
@@ -506,7 +543,7 @@ def main() -> None:
     print(f"  signal series → {sig_path}")
 
     print("\n" + _fmt(full))
-    print("\n" + verdict(full, rank))
+    print("\n" + verdict(full, active, active_label, rank))
 
 
 if __name__ == "__main__":

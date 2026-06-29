@@ -110,23 +110,29 @@ DEFAULT_DEBT_PUBLISH_LAG_M = 1  # months after quarter-end the level is treated 
 
 
 def _to_monthly_ffill(
-    s: pd.Series, publish_lag_months: int = DEFAULT_DEBT_PUBLISH_LAG_M
+    s: pd.Series,
+    idx: pd.Index,
+    publish_lag_months: int = DEFAULT_DEBT_PUBLISH_LAG_M,
 ) -> pd.Series:
-    """Resample a quarterly stock (total public debt) to a strictly ex-ante monthly
-    series. GFDEBTN is dated at the quarter START (e.g. 2018-01-01) but its value is
-    the END-of-quarter level (≈2018-03-31), published shortly after. A naive
-    ``resample("ME").last().ffill()`` would stamp that end-of-Q1 level on JANUARY —
-    a within-quarter look-ahead (using March-31 data in January) that would taint
-    the no-look-ahead backtest.
+    """Resample a quarterly stock (total public debt) onto the target month-end grid
+    `idx`, strictly ex-ante. GFDEBTN is dated at the quarter START (e.g. 2018-01-01)
+    but its value is the END-of-quarter level (≈2018-03-31), published shortly after.
+    A naive ``resample("ME").last().ffill()`` would stamp that end-of-Q1 level on
+    JANUARY — a within-quarter look-ahead (using March-31 data in January).
 
     Fix: map each observation to its quarter-END month, add a conservative
     `publish_lag_months` publication lag (the level is only *used* once observable),
-    then put it on the month-end grid and forward-fill. ffill carries the last KNOWN
-    level forward only, and the calendar-based ME grid is independent of where the
-    sample ends, so truncating the future leaves every past month unchanged."""
+    then forward-fill onto the FULL target index `idx`. Forward-filling onto `idx`
+    (not just the quarterly obs' own span) is important: it carries the last KNOWN
+    quarter level forward across the most-recent months that sit AFTER the latest
+    published quarter — otherwise those tail months (e.g. the 2022+ active era) would
+    go NaN and wrongly switch S5 off there. Carrying the last published level forward
+    is ex-ante; months BEFORE the first available value stay NaN (nothing known yet).
+    The grid/availability are independent of where the sample ends, so truncating the
+    future leaves every past month unchanged."""
     s = s.sort_index().dropna()
     if s.empty:
-        return pd.Series(dtype="float64")
+        return pd.Series(np.nan, index=idx)
     # quarter-start stamp → quarter-END (the date the level refers to), then lag for
     # publication, then snap to month-end.
     avail = (s.index + pd.offsets.QuarterEnd(0)
@@ -134,7 +140,28 @@ def _to_monthly_ffill(
              + pd.offsets.MonthEnd(0))
     q = pd.Series(s.to_numpy(), index=avail).sort_index()
     q = q[~q.index.duplicated(keep="last")]
-    return q.resample("ME").last().ffill()
+    # ffill the last KNOWN level forward across the union of availability months and
+    # the target grid, then restrict to idx. ffill never backfills → pre-first-avail
+    # months stay NaN.
+    union = q.index.union(pd.DatetimeIndex(idx))
+    return q.reindex(union).sort_index().ffill().reindex(idx)
+
+
+def _safe_fetch_series(
+    fetch_fn: Callable[[str, str], pd.Series],
+    series_id: str,
+    start: str,
+    errors: list,
+) -> pd.Series:
+    """Fetch a series this module owns, but never let a network / bad-series-id /
+    FRED-outage exception crash the whole run: on failure return an empty series
+    (which the resamplers turn into all-NaN on the panel grid) and record the error
+    so the graceful proxy-unavailable → S1 fallback path actually triggers."""
+    try:
+        return fetch_fn(series_id, start)
+    except Exception as e:  # noqa: BLE001 — any fetch failure must degrade, not crash
+        errors.append(f"{series_id}: {type(e).__name__}: {e}")
+        return pd.Series(dtype="float64")
 
 
 @dataclass
@@ -170,8 +197,11 @@ def build_dedollar_panel(
     df = base[["gold_nominal"]].copy()
     idx = df.index
 
-    custody = _to_monthly_mean(fetch_fn(custody_id, start)).reindex(idx)
-    debt = _to_monthly_ffill(fetch_fn(debt_id, start)).reindex(idx)
+    fetch_errors: list = []
+    custody = _to_monthly_mean(
+        _safe_fetch_series(fetch_fn, custody_id, start, fetch_errors)).reindex(idx)
+    debt = _to_monthly_ffill(
+        _safe_fetch_series(fetch_fn, debt_id, start, fetch_errors), idx)
     df["foreign_official_custody"] = custody
     df["total_public_debt"] = debt
     # share of the US debt market held in foreign official custody. Both legs are
@@ -203,7 +233,15 @@ def build_dedollar_panel(
         "data_constraint": "custody series starts ~2002-12 → this is a post-2002 "
                            "backtest by construction; pre-2003 there is NO leading "
                            "de-dollarization proxy and S5 degrades to S1 (neutral).",
+        "custody_publication": "H.4.1 is published weekly with a ~few-day lag, so a "
+                               "COMPLETED month's custody mean is fully known by "
+                               "month-end; combined with the engine's .shift(1) (the "
+                               "month-t signal is traded month t+1) there is a full "
+                               "month of buffer — no within-month look-ahead.",
     }
+    if fetch_errors:
+        notes["fetch_errors"] = "; ".join(fetch_errors) + " → affected leg is all-NaN; " \
+            "S5 degrades to S1 (graceful proxy-unavailable fallback)."
     return DedollarPanel(data=df, notes=notes)
 
 
@@ -296,6 +334,10 @@ def dedollar_factor(
             f"require f_min <= f_neutral <= f_max, got "
             f"({f_min}, {f_neutral}, {f_max})"
         )
+    # the rank is a [0,1] percentile by contract; clip defensively so an out-of-range
+    # caller can never make the soft segments extrapolate past the tier bounds (NaN
+    # is preserved by clip → still routed to the neutral fallback below).
+    rank = rank.clip(lower=0.0, upper=1.0)
     if mode == "soft":
         # two linear segments meeting at (0.5, f_neutral) so the documented
         # "rank 0.5 = neutral" contract holds for any (f_min, f_neutral, f_max).

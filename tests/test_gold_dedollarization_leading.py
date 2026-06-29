@@ -367,6 +367,50 @@ def test_build_panel_columns_and_debt_ex_ante_ffill():
     assert debt.loc["2003-04-30":].isna().sum() == 0
 
 
+def test_debt_ffill_covers_tail_beyond_last_quarter():
+    """P2 tail fix: panel months AFTER the last published quarter must carry the last
+    KNOWN debt level forward (not go NaN), else custody_share/rank — and thus S5 —
+    would wrongly switch off in the most recent (e.g. 2022+) months."""
+    idx = pd.date_range("2003-01-31", periods=60, freq="ME")  # 2003-01..2007-12
+    gold = pd.Series(np.linspace(300, 600, 60), index=idx)
+    anchor = SimpleNamespace(data=pd.DataFrame({"gold_nominal": gold}, index=idx))
+    custody = pd.Series(np.linspace(3.0e6, 2.5e6, 60), index=idx)
+    # quarterly debt that STOPS early at 2006-07-01 (last published quarter)
+    q_idx = pd.date_range("2003-01-01", "2006-07-01", freq="QS")
+    debt_q = pd.Series(6.0e6 + np.arange(len(q_idx)) * 1.0e5, index=q_idx)
+
+    def fetch_fn(series_id, start="1968-01-01"):
+        return {"WMTSECL1": custody, "GFDEBTN": debt_q}.get(
+            series_id, pd.Series(np.nan, index=idx))
+
+    dp = build_dedollar_panel(
+        start="2003-01-01", fetch_fn=fetch_fn, anchor_fn=lambda *a, **k: anchor
+    )
+    debt = dp.data["total_public_debt"]
+    # last quarter 2006-07-01 (=end-Q3 ≈Sep30, +1m → 2006-10-31) carries forward to
+    # the panel end (2007-12), no tail NaN
+    assert debt.loc["2007-12-31"] == debt_q.iloc[-1]
+    assert debt.loc["2006-10-31":].isna().sum() == 0
+
+
+def test_fetch_exception_degrades_gracefully():
+    """P2: a fetch that RAISES (network / bad series id) must not crash the build —
+    the affected leg becomes all-NaN, the error is recorded, and S5 will fall back to
+    S1 via the neutral factor."""
+    idx = pd.date_range("2003-01-31", periods=60, freq="ME")
+    gold = pd.Series(np.linspace(300, 600, 60), index=idx)
+    anchor = SimpleNamespace(data=pd.DataFrame({"gold_nominal": gold}, index=idx))
+
+    def boom(series_id, start="1968-01-01"):
+        raise RuntimeError(f"network down for {series_id}")
+
+    dp = build_dedollar_panel(
+        start="2003-01-01", fetch_fn=boom, anchor_fn=lambda *a, **k: anchor
+    )
+    assert dp.data["custody_share"].isna().all()
+    assert "fetch_errors" in dp.notes
+
+
 def test_debt_and_signal_truncation_consistent():
     """No look-ahead at the panel level (the P1 regression): building on the full
     sample vs a sample truncated MID-QUARTER leaves every PAST month's debt /
