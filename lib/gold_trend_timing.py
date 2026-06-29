@@ -69,12 +69,16 @@ def _splice_dollar(twex_monthly: pd.Series, dtwex_monthly: pd.Series) -> pd.Seri
         # just take the union. The newer (DTWEXBGS) series takes precedence on
         # any month that somehow appears in both.
         return dtwex_monthly.combine_first(twex_monthly)
-    join = overlap.min()
+    # Join at the *end* of the overlap: keep the discontinued monthly backbone
+    # (TWEXBMTH, the whole reason for the splice — it reaches back to 1973)
+    # through its last overlapping month, then extend with the newer daily-based
+    # series past that point. This avoids switching index methodology mid-history
+    # (e.g. at 2006) and only uses DTWEXBGS where TWEXBMTH no longer exists.
+    join = overlap.max()
     scale = twex_monthly.loc[join] / dtwex_monthly.loc[join]
-    dtwex_scaled = dtwex_monthly * scale
-    # Old series up to (but not including) the join, scaled-new from the join on.
-    old = twex_monthly[twex_monthly.index < join]
-    return pd.concat([old, dtwex_scaled[dtwex_scaled.index >= join]]).sort_index()
+    dtwex_scaled = dtwex_monthly * scale  # rebased to the old level at the join
+    old = twex_monthly[twex_monthly.index <= join]
+    return pd.concat([old, dtwex_scaled[dtwex_scaled.index > join]]).sort_index()
 
 
 @dataclass
@@ -185,13 +189,27 @@ def regime_gate(
     """Fast-exit gate. Favourable (1.0) when BOTH:
       • real rate is not rising:  real_rate[t] − real_rate[t-window] ≤ 0
       • the dollar is not strengthening: usd[t] − usd[t-window] ≤ 0
-    Unfavourable → 0.0. A missing/undefined leg is treated as favourable (the
-    gate is an overlay that only *removes* exposure on a confirmed adverse
-    signal — notably USD pre-1973, where the gate degrades to real-rate-only)."""
-    rr_chg = real_rate - real_rate.shift(window)
-    usd_mom = usd - usd.shift(window)
-    rr_ok = (rr_chg <= 0) | rr_chg.isna()
-    usd_ok = (usd_mom <= 0) | usd_mom.isna()
+    Unfavourable → 0.0. Missing data is handled by *where* it is missing:
+      • a leg that does not exist yet (before its first observation) — e.g. the
+        trade-weighted USD pre-1973 — fails **open** (treated favourable), so
+        the gate degrades to the other leg (real-rate-only) rather than forcing
+        a permanent exit on structurally-absent history;
+      • a gap *after* the leg has started (an interior data hole, or the
+        window's own warm-up) fails **closed** (not favourable → exit), so the
+        gate never holds on stale/unknown macro state. A fully-absent leg fails
+        open everywhere (pure real-rate-only fallback)."""
+    def _not_rising(series: pd.Series) -> pd.Series:
+        first = series.first_valid_index()
+        if first is None:  # leg entirely absent → fail open (favourable) everywhere
+            return pd.Series(True, index=series.index)
+        chg = series - series.shift(window)
+        ok = chg <= 0  # NaN ≤ 0 is False
+        pre = pd.Series(series.index < first, index=series.index)
+        ok = ok | (chg.isna() & pre)  # structural pre-history → fail open
+        return ok.fillna(False)       # remaining interior NaN → fail closed
+
+    rr_ok = _not_rising(real_rate)
+    usd_ok = _not_rising(usd)
     return (rr_ok & usd_ok).astype(float)
 
 
@@ -207,11 +225,16 @@ def s1_trend(
     target_vol: float = DEFAULT_TARGET_VOL,
     vol_window: int = DEFAULT_VOL_WINDOW,
 ) -> pd.Series:
-    """S1: trend exposure × vol-target multiplier, clipped to [0, 1]."""
+    """S1: trend exposure × vol-target multiplier, clipped to [0, 1].
+
+    Warm-up (before all lookbacks + the vol window have history) stays NaN —
+    *not* filled to 0 — so `run_backtest` trims those months rather than
+    crediting the strategy a T-bill cash stub that S0 (always invested) never
+    gets. Once signals exist, a *false* momentum signal correctly yields 0
+    (hold cash); only the no-signal-yet warm-up is NaN."""
     te = trend_exposure(panel["gold_nominal"], lookbacks)
     vs = vol_scale(panel["gold_ret"], target_vol, vol_window)
-    pos = (te * vs).clip(lower=0.0, upper=1.0)
-    return pos.fillna(0.0)
+    return (te * vs).clip(lower=0.0, upper=1.0)
 
 
 def s2_trend_regime(
@@ -224,9 +247,10 @@ def s2_trend_regime(
 ) -> pd.Series:
     """S2: S1 with the regime gate multiplied in. When the gate is unfavourable,
     exposure is scaled by `gate_off_exposure` (default 0 = full exit to cash)."""
-    base = s1_trend(panel, lookbacks, target_vol, vol_window)
+    base = s1_trend(panel, lookbacks, target_vol, vol_window)  # NaN during warm-up
     gate = regime_gate(panel["real_rate_10y"], panel["usd_broad"], regime_window)
-    mult = gate.where(gate == 1.0, other=gate_off_exposure).fillna(1.0)
+    mult = gate.where(gate == 1.0, other=gate_off_exposure)  # gate ∈ {0,1}, no NaN
+    # base's warm-up NaN propagates → trimmed by run_backtest (S0/S1/S2 fair span)
     return (base * mult).clip(lower=0.0, upper=1.0)
 
 

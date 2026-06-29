@@ -68,10 +68,24 @@ def run_all(panel: pd.DataFrame, cost_bps: float) -> Dict[str, pd.DataFrame]:
     }
 
 
+def common_span(backtests: Dict[str, pd.DataFrame]):
+    """The window over which *every* strategy is investable — the latest start
+    and earliest end across all backtests. S1/S2 start after their trend/vol
+    warm-up while S0 is invested from month 1, so a fair head-to-head must
+    evaluate them all on this shared window (else S0 gets free extra months)."""
+    spans = [(bt.index.min(), bt.index.max()) for bt in backtests.values() if len(bt)]
+    if not spans:
+        return None, None
+    return max(s for s, _ in spans), min(e for _, e in spans)
+
+
 def metrics_table(backtests: Dict[str, pd.DataFrame], start=None, end=None) -> pd.DataFrame:
+    cstart, cend = common_span(backtests)
+    lo = cstart if start is None else (cstart if cstart is None else max(cstart, pd.Timestamp(start)))
+    hi = cend if end is None else (cend if cend is None else min(cend, pd.Timestamp(end)))
     rows = {}
     for label, bt in backtests.items():
-        seg = slice_segment(bt, start, end) if (start or end) else bt
+        seg = slice_segment(bt, lo, hi)
         rows[label] = compute_metrics(seg)
     return pd.DataFrame(rows).T[METRIC_COLS]
 
@@ -178,14 +192,21 @@ def main() -> None:
 
     # ── write report ──
     os.makedirs(args.out_dir, exist_ok=True)
-    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    report_path = os.path.join(args.out_dir, f"gold_trend_timing_{stamp}.md")
+    now = datetime.now(timezone.utc)
+    stamp = now.strftime("%Y-%m-%d")
+    # filename carries the time so repeated same-day runs don't silently overwrite
+    file_stamp = now.strftime("%Y-%m-%d_%H%M%S")
+    report_path = os.path.join(args.out_dir, f"gold_trend_timing_{file_stamp}.md")
 
+    cstart, cend = common_span(backtests)
     parts: List[str] = []
     parts.append(f"# Gold long-only trend-timing backtest — {stamp}\n")
-    parts.append(f"Sample: {panel.index.min():%Y-%m} → {panel.index.max():%Y-%m} "
+    parts.append(f"Panel: {panel.index.min():%Y-%m} → {panel.index.max():%Y-%m} "
                  f"({len(panel)} months). Trading cost: {args.cost_bps:.0f} bps/rebalance. "
                  "Long-only 0↔100%, cash leg = 3m T-bill.\n")
+    parts.append(f"All metrics are computed on the **common investable window** "
+                 f"{cstart:%Y-%m}–{cend:%Y-%m} (after S1/S2 trend+vol warm-up) so "
+                 "S0/S1/S2 are compared on the same months.\n")
     parts.append("Strategies: **S0** buy-and-hold · **S1** pure trend (vol-targeted, "
                  "lookbacks {3,6,12,blend}) · **S2** trend + regime gate "
                  "(real-rate-not-rising ∧ dollar-not-strengthening fast exit).\n")
@@ -238,7 +259,7 @@ def main() -> None:
     os.makedirs(DATA_DIR, exist_ok=True)
     curves = {label: equity_curve(bt) for label, bt in backtests.items()}
     eq = pd.DataFrame(curves)
-    csv_path = os.path.join(DATA_DIR, f"gold_trend_timing_curves_{stamp}.csv")
+    csv_path = os.path.join(DATA_DIR, f"gold_trend_timing_curves_{file_stamp}.csv")
     eq.to_csv(csv_path)
     print(f"  equity curves → {csv_path}")
 

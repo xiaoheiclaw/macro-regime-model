@@ -265,6 +265,29 @@ def test_regime_gate_missing_dollar_falls_back_to_real_rate():
     assert gate.iloc[-1] == 1.0
 
 
+def test_regime_gate_structural_prehistory_fails_open():
+    # USD only exists from idx[10] on (e.g. pre-1973). Before it starts, the
+    # gate must fall back to real-rate-only (fail open), not force an exit.
+    idx = _midx(20)
+    rr = pd.Series(np.linspace(2.0, 0.0, 20), index=idx)  # falling → favourable
+    usd = pd.Series(np.nan, index=idx)
+    usd.iloc[10:] = np.linspace(100.0, 90.0, 10)
+    gate = regime_gate(rr, usd, window=3)
+    assert gate.iloc[5] == 1.0  # before USD exists → real-rate-only favourable
+
+
+def test_regime_gate_interior_gap_fails_closed():
+    # A hole *after* the series starts must NOT be treated as favourable — the
+    # gate should exit (0) rather than hold on unknown macro state.
+    idx = _midx(10)
+    rr = pd.Series(np.linspace(2.0, 0.0, 10), index=idx)        # falling
+    usd = pd.Series(np.linspace(110.0, 100.0, 10), index=idx)   # falling
+    usd.iloc[6] = np.nan  # interior hole
+    gate = regime_gate(rr, usd, window=3)
+    assert gate.iloc[6] == 0.0   # change references the hole → fail closed
+    assert gate.iloc[5] == 1.0   # clean month → favourable
+
+
 # ── strategy wiring / integration on synthetic panel ───────────────────
 def _synth_panel(n=60):
     idx = _midx(n)
@@ -283,10 +306,22 @@ def test_positions_long_only_bounded():
     panel = _synth_panel()
     s1 = s1_trend(panel)
     s2 = s2_trend_regime(panel)
-    assert s1.between(0.0, 1.0).all()
-    assert s2.between(0.0, 1.0).all()
-    # S2 ≤ S1 everywhere (gate only removes exposure)
-    assert (s2 <= s1 + 1e-12).all()
+    # warm-up is NaN (not 0); the realised exposure is bounded [0,1]
+    assert s1.dropna().between(0.0, 1.0).all()
+    assert s2.dropna().between(0.0, 1.0).all()
+    # S2 ≤ S1 everywhere they are both defined (gate only removes exposure)
+    both = s1.notna() & s2.notna()
+    assert (s2[both] <= s1[both] + 1e-12).all()
+
+
+def test_s1_warmup_is_nan_not_cash():
+    # Before all lookbacks + the vol window have history, S1 must be NaN
+    # (not 0 = cash), so run_backtest trims rather than crediting T-bill.
+    panel = _synth_panel(n=40)
+    s1 = s1_trend(panel, lookbacks=(3, 6, 12), vol_window=6)
+    # month 0..11 cannot have the 12m signal → NaN
+    assert s1.iloc[:12].isna().all()
+    assert s1.iloc[12:].notna().all()
 
 
 def test_s2_full_exit_when_gate_off():
@@ -329,10 +364,16 @@ def test_splice_dollar_level_continuous():
     old = pd.Series(np.linspace(100, 110, 24), index=old_idx)
     new = pd.Series(np.linspace(50, 60, 24), index=new_idx)  # different base
     spliced = _splice_dollar(old, new)
-    join = old_idx.intersection(new_idx).min()
-    # at the join the spliced value equals the OLD level (new rebased to old)
+    join = old_idx.intersection(new_idx).max()  # join at END of overlap
+    # the old backbone is kept through the join month, verbatim
     assert spliced.loc[join] == pytest.approx(old.loc[join])
-    # monotonic index, no gaps/dups
+    # months after the old series ends come from the rebased new series, and at
+    # the join the rebased new equals the old level (continuity)
+    scale = old.loc[join] / new.loc[join]
+    after = new_idx[new_idx > join][0]
+    assert spliced.loc[after] == pytest.approx(new.loc[after] * scale)
+    # old series fully present up to its end (not truncated at overlap start)
+    assert spliced.loc[old_idx[-1]] == pytest.approx(old.loc[old_idx[-1]])
     assert spliced.index.is_monotonic_increasing
     assert not spliced.index.has_duplicates
 
