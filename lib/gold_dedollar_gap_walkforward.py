@@ -107,6 +107,16 @@ def _require_time_sorted(s: pd.Series) -> None:
             "timestamps collapse the percentile baseline and break the asof read.")
 
 
+def _finite_series(s: pd.Series) -> pd.Series:
+    """Keep only finite values (drop NaN AND ±inf). Single source of truth for the
+    'usable observation' filter so every口径 — full-sample percentile, the current
+    reading's sample/degeneracy checks, the expanding calibrators, and the
+    forward-return summary — agrees on which residuals count (codex PR#15 R4 P2).
+    Otherwise an inf in the residual would be ranked by one口径 and dropped by
+    another, making the current verdict internally inconsistent."""
+    return s[np.isfinite(s.astype(float))]
+
+
 def expanding_zscore(
     s: pd.Series, *, min_periods: int = DEFAULT_WARMUP, exclude_current: bool = False
 ) -> pd.Series:
@@ -192,7 +202,7 @@ def full_percentile_series(s: pd.Series) -> pd.Series:
     the residual would be ranked by full-sample but dropped by walk-forward, making
     the two口径 inconsistent (codex PR#15 R3 P3)."""
     _require_time_sorted(s)
-    sv = s[np.isfinite(s.astype(float))]
+    sv = _finite_series(s)
     if sv.empty:
         return pd.Series(np.nan, index=s.index, name="pct_full")
     arr = sv.to_numpy()
@@ -267,7 +277,7 @@ def current_walk_forward_reading(
     A *large* percentile gap would be surprising — the look-ahead this PR really
     corrects lives in the historical episode reread, not in today's number."""
     _require_time_sorted(resid)
-    rv = resid.dropna()
+    rv = _finite_series(resid)  # finite-only, matching the calibrators (codex R4 P2)
     if rv.empty:
         return WalkForwardReading(
             asof=None, z_full=np.nan, pct_full=np.nan, z_wf_incl=np.nan,
@@ -290,7 +300,9 @@ def current_walk_forward_reading(
     p_excl = expanding_percentile(resid, min_periods=warmup, exclude_current=True)
     return WalkForwardReading(
         asof=asof,
-        z_full=float(full_zscore(resid).reindex([asof]).iloc[0]),
+        # z_full on the finite-only sample (rv), so a non-finite residual cannot
+        # poison the headline z via full_zscore's dropna (codex PR#15 R4 P2).
+        z_full=float(full_zscore(rv).reindex([asof]).iloc[0]),
         pct_full=full_percentile(rv, latest),
         z_wf_incl=float(z_incl.reindex([asof]).iloc[0]),
         pct_wf_incl=float(p_incl.reindex([asof]).iloc[0]),
@@ -410,7 +422,9 @@ def extreme_reclassification(
 
 
 def _summarize(x: pd.Series) -> Dict[str, float]:
-    xv = x.dropna()
+    # finite-only: a 0-price or upstream glitch can make forward_log_return inf,
+    # which would poison mean/quantiles (codex PR#15 R4 P3).
+    xv = _finite_series(x)
     if xv.empty:
         return {"n": 0, "mean": np.nan, "median": np.nan,
                 "p25": np.nan, "p75": np.nan, "hit": np.nan}

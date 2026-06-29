@@ -92,25 +92,33 @@ def _cond_md(tbl: pd.DataFrame) -> str:
 
 def _wf_extreme_caveat(rc, cond_wf) -> str:
     """Dynamically describe how thin the ex-ante extreme sample is, from the actual
-    run (NOT hardcoded to a particular vintage; codex PR#15 P2). Reports the date
-    span of the ex-ante-extreme months and the observable N per horizon."""
+    run (NOT hardcoded to a particular vintage; codex PR#15 P2).
+
+    Two DISTINCT populations are reported and **labeled as such** (codex PR#15 R4
+    P2), not blended into one misleading clause:
+      * span — date range of the **full-sample-extreme months that are ALSO ex-ante
+        extreme** (rc.episodes where wf_extreme; a subset of full-sample extremes).
+      * ns — observable forward-return N per horizon for the **walk-forward extreme
+        flag** (cond_wf's extreme_high_wf, i.e. ALL months with pct_wf >= top_q).
+    The two need not have the same count; conflating them would misstate the
+    ex-ante sample range vs the conditional-table sample size."""
     ep = rc.episodes
     if ep.empty or "wf_extreme" not in ep.columns:
         wf_ext = ep.iloc[0:0]
     else:
         wf_ext = ep[ep["wf_extreme"].astype(bool)]
     if wf_ext.empty:
-        span = "无 ex-ante 极端月"
+        span = "全样本极端月中无 ex-ante 也极端者"
     else:
         d = pd.to_datetime(wf_ext["date"])
-        span = f"集中在 {d.min():%Y-%m}..{d.max():%Y-%m}"
+        span = f"全样本极端月中 ex-ante 也极端者集中在 {d.min():%Y-%m}..{d.max():%Y-%m}"
     if cond_wf is not None and not cond_wf.empty:
         ext = cond_wf[cond_wf["regime"] == "extreme_high_wf"]
         ns = ", ".join(f"{int(r['horizon'])}m: n={int(r['n'])}"
                        for _, r in ext.iterrows())
     else:
         ns = "n/a"
-    return f"ex-ante 极端月{span};各 horizon 可观测前瞻 N（{ns}）"
+    return f"{span};walk-forward 极端旗标各 horizon 可观测前瞻 N({ns})"
 
 
 def _verdict(rd, rc, cond_wf=None) -> tuple[str, str]:
@@ -359,7 +367,7 @@ def main() -> None:
     os.makedirs(DATA_DIR, exist_ok=True)
     series_path = os.path.join(
         DATA_DIR, f"gold_dedollar_gap_walkforward_series_{file_stamp}.csv")
-    frame.to_csv(series_path)
+    frame.rename_axis("date").to_csv(series_path)  # named index for Show Page
     print(f"  trajectory → {series_path}")
 
     cond_path = os.path.join(

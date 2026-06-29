@@ -200,6 +200,38 @@ def test_full_percentile_series_excludes_nonfinite_like_expanding():
         fps.loc[ts], float((finite_vals <= s.loc[ts]).mean()), atol=1e-12)
 
 
+def test_current_reading_treats_inf_like_nan():
+    """current_walk_forward_reading must filter ±inf the SAME way as the
+    calibrators (codex PR#15 R4 P2): an inf residual is a non-observation, so an
+    inf-injected series gives an IDENTICAL reading to a NaN-injected one — the inf
+    is never treated as a real (huge) observation that would distort the rank."""
+    n = 60
+    rng = np.random.RandomState(123)
+    resid = pd.Series(rng.randn(n), index=_me_index(n))
+    with_inf = resid.copy(); with_inf.iloc[20] = np.inf
+    with_nan = resid.copy(); with_nan.iloc[20] = np.nan
+    a = current_walk_forward_reading(with_inf, warmup=24)
+    b = current_walk_forward_reading(with_nan, warmup=24)
+    assert a.n_resid == b.n_resid == int(np.isfinite(resid).sum()) - 1
+    np.testing.assert_allclose(a.pct_full, b.pct_full, atol=1e-12)
+    np.testing.assert_allclose(a.pct_wf_incl, b.pct_wf_incl, atol=1e-12)
+    np.testing.assert_allclose(a.z_wf_excl, b.z_wf_excl, atol=1e-12)
+    np.testing.assert_allclose(a.z_full, b.z_full, atol=1e-12)  # finite-only z_full
+    assert np.isfinite(a.z_full)
+    assert a.asof == b.asof
+
+
+def test_summarize_excludes_inf_forward_returns():
+    """_summarize must drop ±inf (e.g. a 0-price forward return) so mean/quantiles
+    are not poisoned (codex PR#15 R4 P3)."""
+    from lib.gold_dedollar_gap_walkforward import _summarize
+    x = pd.Series([0.1, 0.2, np.inf, -np.inf, 0.3, np.nan])
+    out = _summarize(x)
+    assert out["n"] == 3
+    np.testing.assert_allclose(out["mean"], 0.2, atol=1e-12)
+    assert np.isfinite(out["p25"]) and np.isfinite(out["p75"])
+
+
 def test_expanding_zscore_constant_window_is_nan():
     s = pd.Series(np.full(20, 3.0), index=_me_index(20))
     z = expanding_zscore(s, min_periods=5)
