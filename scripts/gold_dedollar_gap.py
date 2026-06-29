@@ -285,9 +285,11 @@ def main() -> None:
         "ln_gold_real": df["ln_gold_real"],
         "DI": di,
         "resid_nominal": dev_nom.resid,
-        "gap_z_nominal": dev_nom.gap_z_full,
+        "gap_z_full_nominal": dev_nom.gap_z_full,   # full-sample z (vs whole history)
+        "gap_z_roll_nominal": dev_nom.gap_z_roll,   # trailing rolling z (ex-ante)
         "resid_real": dev_real.resid,
-        "gap_z_real": dev_real.gap_z_full,
+        "gap_z_full_real": dev_real.gap_z_full,
+        "gap_z_roll_real": dev_real.gap_z_roll,
     })
     if args.include_dxy and "dxy" in df.columns:
         series["dxy"] = df["dxy"]

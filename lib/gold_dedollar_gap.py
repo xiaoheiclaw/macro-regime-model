@@ -180,7 +180,7 @@ def _to_monthly_last(s: pd.Series) -> pd.Series:
     s = s.sort_index()
     if s.dropna().empty:
         return pd.Series(dtype="float64")
-    return s.resample("ME").last()
+    return s.resample(pd.offsets.MonthEnd()).last()
 
 
 def _to_monthly_mean(s: pd.Series) -> pd.Series:
@@ -188,7 +188,7 @@ def _to_monthly_mean(s: pd.Series) -> pd.Series:
     s = s.sort_index()
     if s.dropna().empty:
         return pd.Series(dtype="float64")
-    return s.resample("ME").mean()
+    return s.resample(pd.offsets.MonthEnd()).mean()
 
 
 # ── panel assembly ──────────────────────────────────────────────────────────
@@ -497,14 +497,16 @@ def compute_deviation(
     full-window default rarely drops a fit, but a caller can relax it to tolerate
     gaps explicitly.
 
-    The regression runs on a **complete month-end grid** spanning the common
-    coverage, with any missing months kept as NaN (codex PR#14 R3 P2): this makes
-    ``window`` mean *calendar months*, not *observations*, so a hole in CPI/DI/gold
-    cannot let a 60-month window silently fit across a multi-month gap — that
-    window simply fails the ``min_obs`` test and yields NaN."""
+    ALL series in the result (resid, gap_z_roll, gap_z_full) live on the
+    **complete month-end grid** spanning the common coverage, with missing months
+    kept as NaN (codex PR#14 R3/R4 P2): this makes every window — the OLS fit, the
+    rolling z-score AND the downstream rolling percentile — count *calendar
+    months*, not *observations*, so a hole in CPI/DI/gold cannot let any window
+    silently span a multi-month gap (it fails ``min_obs`` and yields NaN). A
+    contiguous month-end timeline is the function's output contract."""
     common = y.dropna().index.intersection(di.dropna().index)
     if len(common) == 0:
-        empty = pd.Series(np.nan, index=y.index, dtype="float64")
+        empty = pd.Series(dtype="float64")
         return DeviationResult(resid=empty.rename("resid"),
                                gap_z_roll=empty.copy(), gap_z_full=empty.copy(),
                                window=window,
@@ -513,16 +515,18 @@ def compute_deviation(
     grid = pd.date_range(common.min(), common.max(), freq=pd.offsets.MonthEnd())
     yc = y.reindex(grid)
     dc = di.reindex(grid)
-    resid = rolling_ols_resid(yc, dc, window, min_obs=min_obs).reindex(y.index)
+    resid = rolling_ols_resid(yc, dc, window, min_obs=min_obs)  # on the grid
     return DeviationResult(
-        resid=resid,
-        gap_z_roll=rolling_zscore(resid, window).reindex(y.index),
-        gap_z_full=full_zscore(resid),
+        resid=resid,                                    # grid (calendar months)
+        gap_z_roll=rolling_zscore(resid, window),       # grid → calendar window
+        gap_z_full=full_zscore(resid),                  # grid
         window=window,
         notes={
             "definition": "resid = ln(gold) − rolling-OLS(ln gold ~ DI) prediction; "
                           "gap_z = z-score of that residual (+ = gold above its "
                           "DI-implied level). Rolling fit guards vs spurious trend.",
+            "grid": "all series on a contiguous month-end grid (gaps = NaN) so "
+                    "rolling windows are calendar months, not observations.",
             "window": str(window),
             "n_resid": str(int(resid.notna().sum())),
         },
@@ -531,13 +535,23 @@ def compute_deviation(
 
 # ── historical extreme → forward returns (conditional DESCRIPTION) ──────────
 def forward_log_return(price: pd.Series, horizon_months: int) -> pd.Series:
-    """Forward log return ln(price[t+h] / price[t]). Genuinely forward → NaN in
-    the last `h` months (unobservable), so the return leg itself has no
-    look-ahead; only the conditioning threshold below is in-sample."""
+    """Forward log return ln(price[t+h] / price[t]) over `h` **calendar months**.
+
+    The shift is taken on a complete month-end grid (codex PR#14 R4 P2), so a
+    missing month cannot make the realized horizon longer/shorter than `h`: if the
+    month `t+h` (or `t` itself) is absent the forward return is NaN rather than
+    silently spanning the gap. Genuinely forward → NaN in the last `h` observable
+    months, so the return leg has no look-ahead."""
     if horizon_months <= 0:
         raise ValueError(f"horizon_months must be positive, got {horizon_months}")
-    fwd = np.log(price.shift(-horizon_months) / price)
-    return fwd.rename(f"fwd_{horizon_months}m")
+    pv = price.dropna()
+    if pv.empty:
+        return pd.Series(np.nan, index=price.index,
+                         dtype="float64").rename(f"fwd_{horizon_months}m")
+    grid = pd.date_range(pv.index.min(), pv.index.max(), freq=pd.offsets.MonthEnd())
+    pg = price.reindex(grid)
+    fwd = np.log(pg.shift(-horizon_months) / pg)
+    return fwd.reindex(price.index).rename(f"fwd_{horizon_months}m")
 
 
 def _summ(x: pd.Series) -> Dict[str, float]:
