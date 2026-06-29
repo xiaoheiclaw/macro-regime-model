@@ -117,3 +117,24 @@ def test_build_series_handles_excel_date_formats(monkeypatch, date_fmt):
 def test_to_ym_fails_fast_on_garbage():
     with pytest.raises(ValueError):
         lm._to_ym(pd.Series(["2020-01", "not-a-date", "2020-03"]))
+
+
+def test_pct_reports_100_for_all_time_high():
+    df = pd.DataFrame({"x": [1.0, 2.0, 3.0]})
+    assert lm.pct(df, "x", 3.0) == 100.0
+    assert lm.pct(df, "x", 1.0) <= 100.0
+
+
+def test_mark_stale_degrades_old_snapshot():
+    today = pd.Timestamp("2026-06-29")
+    fresh = lm._mark_stale({"status": "red", "note": "x", "asof": "2026-06-26"}, today)
+    assert fresh["stale"] is False and fresh["status"] == "red"
+    old = lm._mark_stale({"status": "red", "note": "x", "asof": "2026-01-01"}, today)
+    assert old["stale"] is True and old["status"] == "muted" and "STALE" in old["note"]
+
+
+def test_chain_sp_requires_overlap():
+    shiller = pd.Series([100.0], index=["2020-01"])
+    ext = pd.Series([200.0], index=["2021-06"])  # no overlap
+    with pytest.raises(ValueError):
+        lm.chain_sp(shiller, ext)

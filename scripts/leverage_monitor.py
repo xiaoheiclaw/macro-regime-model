@@ -46,9 +46,9 @@ import numpy as np
 # write_signals(), never at import time.
 PROJ = Path(__file__).resolve().parents[1]
 DATA_DIR = PROJ / "data"
-# Optional Show-Page sink: opt-in only. Set LEVERAGE_SHOW_SRC to a Show-Page
-# `src/` dir to also emit signals.ts there; unset → only the repo JSON is written.
-SHOW_SRC = Path(os.environ["LEVERAGE_SHOW_SRC"]).expanduser() if os.environ.get("LEVERAGE_SHOW_SRC") else None
+# Optional Show-Page sink: opt-in only, resolved at write time (see write_signals).
+# Set env LEVERAGE_SHOW_SRC to a Show-Page `src/` dir to also emit signals.ts there.
+SHOW_SRC_ENV = "LEVERAGE_SHOW_SRC"
 
 UA = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"}
 
@@ -70,6 +70,12 @@ def fetch_finra() -> pd.DataFrame:
     """FINRA Customer Margin Balances. Returns ym-indexed: debit, cash_credit, margin_credit (in $M)."""
     raw = _get("https://www.finra.org/sites/default/files/2021-03/margin-statistics.xlsx")
     df = pd.read_excel(io.BytesIO(raw), sheet_name=0)
+    # Be resilient to layout drift (added blurb/blank columns): drop all-empty
+    # columns and take the first 4 meaningful ones (date, debit, cash, margin).
+    df = df.dropna(how="all", axis=1)
+    if df.shape[1] < 4:
+        raise ValueError(f"Unexpected FINRA sheet shape {df.shape}: need ≥4 columns")
+    df = df.iloc[:, :4].copy()
     df.columns = ["ym", "debit_M", "cash_credit_M", "margin_credit_M"]
     df = df.dropna(subset=["debit_M"]).copy()
     df["ym"] = _to_ym(df["ym"])
@@ -91,12 +97,17 @@ def fetch_shiller_sp() -> pd.Series:
     """Shiller S&P price (P), monthly, ym-indexed."""
     raw = _get("http://www.econ.yale.edu/~shiller/data/ie_data.xls")
     r = pd.read_excel(io.BytesIO(raw), sheet_name="Data", header=7)
-    r = r[["Date", "P"]].dropna()
-    dv = pd.to_numeric(r["Date"], errors="coerce"); r = r[dv.notna()]
-    yr = dv.astype(int); mo = np.round((dv - yr) * 100).astype(int)
-    r = r[(mo >= 1) & (mo <= 12)]
-    dt = pd.to_datetime(dict(year=yr.astype(int), month=mo.astype(int), day=1))
-    r["ym"] = dt.dt.strftime("%Y-%m")
+    r = r[["Date", "P"]].dropna().copy()
+    # Keep every derived column in the SAME frame so footnote / hole / bad-month
+    # rows are dropped consistently (no parallel-Series misalignment).
+    r["date_num"] = pd.to_numeric(r["Date"], errors="coerce")
+    r = r.dropna(subset=["date_num"]).copy()
+    r["year"] = r["date_num"].astype(int)
+    r["month"] = np.round((r["date_num"] - r["year"]) * 100).astype(int)
+    r = r[r["month"].between(1, 12)].copy()
+    r["ym"] = pd.to_datetime(
+        dict(year=r["year"], month=r["month"], day=1)
+    ).dt.strftime("%Y-%m")
     r["P"] = pd.to_numeric(r["P"], errors="coerce")
     return r.dropna(subset=["P"]).sort_values("ym").set_index("ym")["P"]
 
@@ -115,12 +126,19 @@ def fetch_sp500_monthly() -> pd.Series:
 
 
 def chain_sp(shiller: pd.Series, ext_sp: pd.Series) -> pd.Series:
-    """Shiller base, extended forward with Yahoo ^GSPC month-over-month returns (keeps one level)."""
-    last_ym = shiller.index.max()
-    fmonths = sorted(m for m in ext_sp.index if m >= last_ym)
-    base = float(shiller.loc[last_ym]); ext = {}; prev = last_ym; P = base
-    for m in fmonths[1:]:
-        P *= ext_sp.loc[m] / ext_sp.loc[prev]; ext[m] = P; prev = m
+    """Shiller base, extended forward with Yahoo ^GSPC month-over-month returns
+    (keeps one price level). Anchored at the last month present in BOTH series,
+    so it never assumes Yahoo contains Shiller's last month."""
+    overlap = shiller.index.intersection(ext_sp.index)
+    if overlap.empty:
+        raise ValueError("Cannot chain S&P: no overlap between Shiller and Yahoo series")
+    anchor = overlap.max()
+    fmonths = sorted(m for m in ext_sp.index if m > anchor)
+    ext = {}; prev = anchor; P = float(shiller.loc[anchor])
+    for m in fmonths:
+        P *= float(ext_sp.loc[m]) / float(ext_sp.loc[prev]); ext[m] = P; prev = m
+    if not ext:
+        return shiller.sort_index()
     out = pd.concat([shiller, pd.Series(ext)]).sort_index()
     return out[~out.index.duplicated(keep="last")]
 
@@ -142,10 +160,33 @@ def build_series() -> pd.DataFrame:
 
 
 def pct(df: pd.DataFrame, col: str, val: float) -> float:
-    return float((df[col] < val).mean() * 100)
+    # "% of history at or below current" — use <= so an all-time high reads 100%,
+    # matching the "percentile" label in the UI.
+    return float((df[col] <= val).mean() * 100)
+
+
+# Manual / research-grade snapshots have no live feed; flag them stale so a
+# refreshed `updated` date can't masquerade them as current auto data.
+STALE_AFTER_DAYS = 21
+
+
+def _mark_stale(item: dict, today: pd.Timestamp) -> dict:
+    """If a manual/semi item carries an `asof`, annotate age and degrade status
+    to muted once older than STALE_AFTER_DAYS."""
+    asof = item.get("asof")
+    if not asof:
+        return item
+    age = int((today - pd.to_datetime(asof)).days)
+    item["age_days"] = age
+    item["stale"] = age > STALE_AFTER_DAYS
+    if item["stale"]:
+        item["status"] = "muted"
+        item["note"] = f"⏳STALE {age}d(>{STALE_AFTER_DAYS}d)；需手工刷新 " + item["note"]
+    return item
 
 
 def compute(df: pd.DataFrame) -> dict:
+    today = pd.Timestamp(datetime.now().date())
     cur = df.iloc[-1]
     prev = df.iloc[-2]
     yoy_row = df[df["dt"] == (cur["dt"] - pd.DateOffset(years=1))]
@@ -182,14 +223,17 @@ def compute(df: pd.DataFrame) -> dict:
         "name": "放大器 (Amplifier) — 弹药与传导",
         "status": "amber",
         "items": [
-            {"label": "杠杆 ETF AUM (TQQQ/SOXL/UPRO 等)", "value": "~$247B",
-             "status": "amber", "note": "JPM 6/26，集中科技；半自动（周度抓发行商）"},
-            {"label": "融资成本 AXW 期货利差", "value": "+140bp",
-             "status": "red", "note": "大摩 6/16，除年末外史上最高；🔴 研报级，手工录入"},
+            _mark_stale({"label": "杠杆 ETF AUM (TQQQ/SOXL/UPRO 等)", "value": "~$247B",
+             "status": "amber", "avail": "semi", "asof": "2026-06-26",
+             "note": "JPM 6/26，集中科技；半自动（周度抓发行商）"}, today),
+            _mark_stale({"label": "融资成本 AXW 期货利差", "value": "+140bp",
+             "status": "red", "avail": "manual", "asof": "2026-06-16",
+             "note": "大摩 6/16，除年末外史上最高；🔴 研报级，手工录入"}, today),
             {"label": "半导体 realized vol", "value": "待接入",
-             "status": "muted", "note": "MVP 待加：SOXX/费半日价格→vol"},
-            {"label": "交易商股权回购敞口", "value": "$2230B",
-             "status": "red", "note": "大摩 6/16 史上最高；🔴 研报级，手工录入"},
+             "status": "muted", "avail": "todo", "note": "MVP 待加：SOXX/费半日价格→vol"},
+            _mark_stale({"label": "交易商股权回购敞口", "value": "$2230B",
+             "status": "red", "avail": "manual", "asof": "2026-06-16",
+             "note": "大摩 6/16 史上最高；🔴 研报级，手工录入"}, today),
         ],
     }
 
@@ -208,8 +252,8 @@ def compute(df: pd.DataFrame) -> dict:
 
     monitors = [
         {"name": "FINRA gross margin debt (6月值)", "current": "待 7月底发布", "threshold": "续创新高=压力续增；掉头=拐点", "status": "watch", "source": "FINRA", "avail": "auto"},
-        {"name": "AXW 期货利差", "current": "+140bp", "threshold": "回落=缓解；续升=临界", "status": "red", "source": "大摩研报", "avail": "manual"},
-        {"name": "市场广度 (>5 行业跑赢)", "current": "仅信息技术 1 个", "threshold": "扩散=健康；持续仅科技=脆弱", "status": "red", "source": "大摩/JPM", "avail": "semi"},
+        _mark_stale({"name": "AXW 期货利差", "current": "+140bp", "threshold": "回落=缓解；续升=临界", "status": "red", "source": "大摩研报", "avail": "manual", "note": "", "asof": "2026-06-16"}, today),
+        _mark_stale({"name": "市场广度 (>5 行业跑赢)", "current": "仅信息技术 1 个", "threshold": "扩散=健康；持续仅科技=脆弱", "status": "red", "source": "大摩/JPM", "avail": "semi", "note": "", "asof": "2026-06-26"}, today),
         {"name": "半导体 realized vol + ETF 流量", "current": "待接入", "threshold": "vol跳+流量激增=点火", "status": "watch", "source": "价格估算", "avail": "todo"},
         {"name": "零售信用违约率", "current": "待接入", "threshold": "margin退潮+零售信用恶化=系统性", "status": "watch", "source": "FRED", "avail": "todo"},
     ]
@@ -267,19 +311,24 @@ def compute(df: pd.DataFrame) -> dict:
     }
 
 
-def write_signals(sig: dict) -> None:
+def write_signals(sig: dict, show_src: Path | None = None) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    (DATA_DIR / "leverage_signals.json").write_text(json.dumps(sig, indent=2, ensure_ascii=False))
-    # Show-Page sink is opt-in via LEVERAGE_SHOW_SRC (see module header).
-    if SHOW_SRC is None:
+    (DATA_DIR / "leverage_signals.json").write_text(
+        json.dumps(sig, indent=2, ensure_ascii=False), encoding="utf-8")
+    # Show-Page sink is opt-in: explicit arg, else env LEVERAGE_SHOW_SRC, resolved
+    # at call time (so importers can set it after import).
+    if show_src is None:
+        env = os.environ.get(SHOW_SRC_ENV)
+        show_src = Path(env).expanduser() if env else None
+    if show_src is None:
         return
-    if SHOW_SRC.exists():
+    if show_src.exists():
         ts = "// AUTO-GENERATED by scripts/leverage_monitor.py — do not edit by hand.\n"
         ts += "export const SIGNALS = " + json.dumps(sig, ensure_ascii=False) + " as const;\n"
-        (SHOW_SRC / "signals.ts").write_text(ts)
-        print(f"  → wrote show page: {SHOW_SRC/'signals.ts'}")
+        (show_src / "signals.ts").write_text(ts, encoding="utf-8")
+        print(f"  → wrote show page: {show_src/'signals.ts'}")
     else:
-        print(f"  (LEVERAGE_SHOW_SRC set but {SHOW_SRC} not found, skipped ts)")
+        print(f"  ({SHOW_SRC_ENV} set but {show_src} not found, skipped ts)")
 
 
 def main() -> None:
