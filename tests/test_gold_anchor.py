@@ -13,17 +13,24 @@ import pytest
 # project root is added to sys.path by tests/conftest.py
 import lib.gold_anchor as ga
 from lib.gold_anchor import (
+    assess_markov_degeneracy,
     build_anchor_panel,
+    build_ms_frame,
+    choose_markov_k,
     classify_integration,
     combined_verdict,
     estimate_vecm,
+    fit_markov_switching,
     integration_segments,
     integration_table,
     johansen_robustness,
     johansen_test,
+    regime_coeff_spread,
+    select_markov_k,
     select_var_order,
     unit_root_tests,
 )
+from lib.gold_anchor import _ms_coeff_significant
 
 def _white_noise(n=400, seed=12345):
     idx = pd.date_range("1980-01-31", periods=n, freq="ME")
@@ -530,3 +537,227 @@ def test_estimate_vecm_det_orders_do_not_crash():
         # negated-β t-stat sign matches the reported (negated) β
         for b in v["betas"].values():
             assert (b["t"] >= 0) == (b["beta"] >= 0) or b["t"] == 0.0
+
+
+# ── PR #4: Markov-switching regression (discrete time-varying anchor) ────
+def _two_regime_panel(n=360, block=30, b_lo=2.5, b_hi=-2.5, seed=0):
+    """Synthetic gold panel whose Δln(gold)→Δln(debt/GDP) coefficient FLIPS sign
+    between two persistent regimes (alternating `block`-month blocks). Levels are
+    cumulated so build_ms_frame sees I(1) levels and differences them back. The
+    MS fit must recover the two opposite-sign coefficients (up to label swap)."""
+    idx = pd.date_range("1980-01-31", periods=n, freq="ME")
+    rng = np.random.default_rng(seed)
+    debt = np.cumsum(rng.standard_normal(n))            # I(1) ln(debt/GDP)
+    d_debt = np.diff(debt, prepend=debt[0])
+    nblk = n // block + 1
+    state = np.repeat(np.tile([0, 1], nblk), block)[:n]
+    d_gold = np.where(state == 0, b_lo, b_hi) * d_debt + rng.standard_normal(n) * 0.4
+    gold = np.cumsum(d_gold)                             # I(1) ln(gold)
+    df = pd.DataFrame({"ln_gold_nominal": gold, "ln_debt_gdp": debt}, index=idx)
+    return df, state
+
+
+def test_build_ms_frame_diffs_and_dropna():
+    df, _ = _two_regime_panel(n=120)
+    fr = build_ms_frame(df, ["ln_debt_gdp"])
+    # diffing drops exactly the first row (no other NaNs in synthetic data)
+    assert len(fr) == len(df) - 1
+    assert fr.attrs["lhs"] == "d_ln_gold_nominal"
+    assert fr.attrs["exog"] == ["d_ln_debt_gdp"]
+    # the diff column equals the level diff
+    expected = df["ln_debt_gdp"].diff().dropna()
+    assert np.allclose(fr["d_ln_debt_gdp"].values, expected.values)
+    assert fr.notna().values.all()
+
+
+def test_build_ms_frame_validates_columns():
+    df, _ = _two_regime_panel(n=80)
+    with pytest.raises(ValueError):
+        build_ms_frame(df, ["ln_debt_gdp"], lhs_level="missing_lhs")
+    with pytest.raises(ValueError):
+        build_ms_frame(df, ["not_a_col"])
+
+
+def test_fit_markov_switching_shapes_and_convergence():
+    df, _ = _two_regime_panel(n=300)
+    fr = build_ms_frame(df, ["ln_debt_gdp"])
+    fit = fit_markov_switching(fr, k_regimes=2, n_restarts=0, seed=0)
+    assert fit["k_regimes"] == 2
+    assert len(fit["regimes"]) == 2
+    for r in fit["regimes"]:
+        assert set(r["coeffs"]) == {"const", "d_ln_debt_gdp"}
+        assert r["sigma2"] is not None and r["sigma2"] > 0
+        assert r["expected_duration"] > 0
+        for cell in r["coeffs"].values():
+            assert {"coef", "t", "p", "se", "significant"} <= set(cell)
+    # transition matrix is k×k with columns summing to 1
+    tm = np.asarray(fit["transition_matrix"])
+    assert tm.shape == (2, 2)
+    assert np.allclose(tm.sum(axis=0), 1.0)
+    assert len(fit["expected_durations"]) == 2
+    assert np.isfinite(fit["bic"]) and np.isfinite(fit["aic"]) and np.isfinite(fit["llf"])
+    # smoothed probabilities: one row per fitted obs, k columns
+    smp = fit["smoothed_probabilities"]
+    assert smp.shape == (fit["n_obs"], 2)
+    # degeneracy gate fields present; clean two-regime DGP → trustworthy, no degenerate
+    assert set(["degenerate", "trustworthy", "n_nondegenerate", "var_floor"]) <= set(fit)
+    for r in fit["regimes"]:
+        assert "degenerate" in r and "degenerate_reasons" in r
+    assert fit["degenerate"] is False
+    assert fit["trustworthy"] is True
+    assert fit["n_nondegenerate"] == 2
+
+
+def test_markov_smoothed_probabilities_sum_to_one():
+    df, _ = _two_regime_panel(n=300)
+    fr = build_ms_frame(df, ["ln_debt_gdp"])
+    fit = fit_markov_switching(fr, k_regimes=2, n_restarts=0, seed=0)
+    smp = fit["smoothed_probabilities"]
+    assert np.allclose(smp.sum(axis=1).values, 1.0, atol=1e-6)
+    assert ((smp.values >= -1e-9) & (smp.values <= 1 + 1e-9)).all()
+
+
+def test_markov_separates_two_regimes():
+    # opposite-sign coefficient blocks → the fit must recover one clearly
+    # positive and one clearly negative Δdebt coefficient (label-invariant), and
+    # assign the two blocks to DIFFERENT dominant regimes.
+    df, state = _two_regime_panel(n=360, block=30, b_lo=2.5, b_hi=-2.5, seed=0)
+    fr = build_ms_frame(df, ["ln_debt_gdp"])
+    fit = fit_markov_switching(fr, k_regimes=2, n_restarts=5, seed=0)
+    coefs = [r["coeffs"]["d_ln_debt_gdp"]["coef"] for r in fit["regimes"]]
+    assert max(coefs) > 0.8 and min(coefs) < -0.8     # two distinct regimes
+    sp = regime_coeff_spread(fit)
+    assert sp["d_ln_debt_gdp"]["sign_flip"] is True
+    assert sp["d_ln_debt_gdp"]["n_sig"] == 2           # significant in both
+    # dominant regime differs between the first and a later opposite block
+    smp = fit["smoothed_probabilities"]
+    dom = smp.values.argmax(axis=1)
+    # align state to the fitted (diffed) sample: frame dropped the first row
+    state_fit = state[1:]
+    blk0 = dom[state_fit == 0]
+    blk1 = dom[state_fit == 1]
+    # each true block is dominated by a single (and different) fitted regime
+    assert np.bincount(blk0, minlength=2).argmax() != np.bincount(blk1, minlength=2).argmax()
+
+
+def test_select_markov_k_reports_bic_and_trusted():
+    df, _ = _two_regime_panel(n=300)
+    fr = build_ms_frame(df, ["ln_debt_gdp"])
+    sel = select_markov_k(fr, k_values=(2, 3), n_restarts=2, seed=0)
+    assert set(sel["bic"]) <= {2, 3}
+    # bic_selected_k is the pure-BIC pick (transparency)
+    assert sel["bic_selected_k"] == min(sel["bic"], key=sel["bic"].get)
+    # trusted selection is the largest K among trustworthy fits (or None)
+    trusted = [k for k, ok in sel["clean_k"].items() if ok]
+    assert sel["selected_k"] == (max(trusted) if trusted else None)
+    # K=2 fit on a clean two-regime DGP must be trustworthy
+    assert sel["clean_k"].get(2) is True
+    assert sel["fits"][2]["trustworthy"] is True
+
+
+def test_choose_markov_k_skips_degenerate():
+    # pure selection logic on hand-built fit dicts: K=3 is BIC-min but degenerate,
+    # K=2 is trustworthy → trusted selection must skip K=3 and pick K=2.
+    fits = {
+        2: {"bic": -100.0, "trustworthy": True},
+        3: {"bic": -200.0, "trustworthy": False},   # better BIC but degenerate
+    }
+    ch = choose_markov_k(fits)
+    assert ch["bic_selected_k"] == 3          # BIC alone would pick 3
+    assert ch["selected_k"] == 2              # trusted skips the degenerate 3
+    assert ch["clean_k"] == {2: True, 3: False}
+    assert ch["no_switching"] is False
+    # no trustworthy fit → selected_k None, no_switching True (≈ K=1)
+    ch2 = choose_markov_k({2: {"bic": -1.0, "trustworthy": False},
+                           3: {"bic": -2.0, "trustworthy": False}})
+    assert ch2["selected_k"] is None and ch2["no_switching"] is True
+
+
+def test_assess_markov_degeneracy_flags_collapsed_regime():
+    # one healthy regime + one collapsed regime (σ²≈0, 1-month duration, |t|~1e13)
+    fit = {
+        "k_regimes": 2, "exog": ["d_x"], "converged": True,
+        "regimes": [
+            {"regime": 0, "sigma2": 0.01, "expected_duration": 40.0,
+             "coeffs": {"const": {"coef": 0.0, "t": 1.2, "p": 0.2, "se": 0.1, "significant": False},
+                        "d_x": {"coef": 2.0, "t": 8.0, "p": 0.0, "se": 0.25, "significant": True}}},
+            {"regime": 1, "sigma2": 1e-9, "expected_duration": 1.0,
+             "coeffs": {"const": {"coef": 0.18, "t": float("nan"), "p": float("nan"), "se": 0.0, "significant": False},
+                        "d_x": {"coef": -28.0, "t": 1e13, "p": 0.0, "se": 1e-13, "significant": True}}},
+        ],
+    }
+    assess_markov_degeneracy(fit, lhs_var=0.02)
+    assert fit["regimes"][0]["degenerate"] is False
+    assert fit["regimes"][1]["degenerate"] is True
+    assert fit["n_nondegenerate"] == 1
+    assert fit["degenerate"] is True
+    # only 1 non-degenerate regime → not a credible *switching* structure
+    assert fit["trustworthy"] is False
+    # spread comparison excludes the degenerate regime → nothing to compare
+    sp = regime_coeff_spread(fit)["d_x"]
+    assert sp["n_compared"] == 1
+    assert sp["distinct"] is False
+
+
+def test_ms_coeff_significant_rejects_unidentified_t():
+    # p<alpha but |t|>1e6 (SE≈0) → NOT significant; nan t → NOT significant
+    assert _ms_coeff_significant(0.0, 2.5, 0.05) is True
+    assert _ms_coeff_significant(0.0, 1e13, 0.05) is False
+    assert _ms_coeff_significant(0.0, float("nan"), 0.05) is False
+    assert _ms_coeff_significant(0.20, 2.5, 0.05) is False   # p too high
+
+
+def test_unconverged_fit_not_trustworthy():
+    # a converged=False fit with otherwise-fine regimes is still not trustworthy
+    fit = {
+        "k_regimes": 2, "exog": ["d_x"], "converged": False,
+        "regimes": [
+            {"regime": 0, "sigma2": 0.01, "expected_duration": 30.0,
+             "coeffs": {"d_x": {"coef": 1.0, "t": 5.0, "p": 0.0, "se": 0.2, "significant": True}}},
+            {"regime": 1, "sigma2": 0.02, "expected_duration": 25.0,
+             "coeffs": {"d_x": {"coef": -1.0, "t": -5.0, "p": 0.0, "se": 0.2, "significant": True}}},
+        ],
+    }
+    assess_markov_degeneracy(fit, lhs_var=0.02)
+    assert fit["degenerate"] is False        # regimes themselves are fine
+    assert fit["trustworthy"] is False       # but MLE did not converge
+
+
+def test_regime_coeff_spread_distinctness():
+    # hand-built fit dicts → no fitting, fast; checks the three distinctness paths
+    def mk(c0, p0, se0, c1, p1, se1, exog="d_x"):
+        return {"exog": [exog], "k_regimes": 2, "regimes": [
+            {"coeffs": {exog: {"coef": c0, "t": 0, "p": p0, "se": se0,
+                               "significant": p0 < 0.05}}},
+            {"coeffs": {exog: {"coef": c1, "t": 0, "p": p1, "se": se1,
+                               "significant": p1 < 0.05}}},
+        ]}
+
+    # sign flip (both significant, opposite sign)
+    sp = regime_coeff_spread(mk(2.0, 0.0, 0.1, -2.0, 0.0, 0.1))["d_x"]
+    assert sp["sign_flip"] and sp["distinct"]
+    # regime-conditional: significant only in one regime
+    sp = regime_coeff_spread(mk(2.0, 0.0, 0.1, 0.05, 0.8, 0.1))["d_x"]
+    assert sp["regime_conditional"] and sp["distinct"]
+    # magnitude-distinct: both significant, same sign, range >> 2·SE
+    sp = regime_coeff_spread(mk(3.0, 0.0, 0.1, 0.2, 0.0, 0.1))["d_x"]
+    assert sp["magnitude_distinct"] and sp["distinct"]
+    assert not sp["sign_flip"] and not sp["regime_conditional"]
+    # NOT distinct: near-identical coefficients within noise
+    sp = regime_coeff_spread(mk(1.00, 0.0, 0.3, 1.05, 0.0, 0.3))["d_x"]
+    assert not sp["distinct"]
+
+
+def test_fit_markov_validates_inputs():
+    df, _ = _two_regime_panel(n=300)
+    fr = build_ms_frame(df, ["ln_debt_gdp"])
+    with pytest.raises(ValueError):
+        fit_markov_switching(fr, k_regimes=1)          # need >=2 regimes
+    with pytest.raises(ValueError):
+        fit_markov_switching(fr.iloc[:20], k_regimes=2)  # too few obs
+    with pytest.raises(ValueError):
+        fit_markov_switching(fr, exog_names=["nope"], k_regimes=2)  # bad exog
+    bad = fr.copy()
+    bad.iloc[3, 0] = np.inf
+    with pytest.raises(ValueError):
+        fit_markov_switching(bad, k_regimes=2)         # non-finite
