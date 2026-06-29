@@ -80,9 +80,9 @@ def fetch_finra() -> pd.DataFrame:
     df = df.dropna(how="all", axis=1)
     if df.shape[1] < 4:
         raise ValueError(f"Unexpected FINRA sheet shape {df.shape}: need ≥4 columns")
-    # Prefer matching columns BY HEADER KEYWORD (robust to inserted columns);
-    # fall back to first-4-positional if the headers aren't recognizable.
-    df = _select_finra_columns(df)
+    # Live fetch fails closed: header keywords must resolve the 4 columns,
+    # else raise rather than risk eating semantically-wrong data.
+    df = _select_finra_columns(df, strict=True)
     df = df.dropna(subset=["debit_M"]).copy()
     # Validate column SEMANTICS, not just count — guards against layout drift
     # silently feeding a wrong (e.g. text-blurb) column in as debit_M.
@@ -98,9 +98,11 @@ def fetch_finra() -> pd.DataFrame:
     return df
 
 
-def _select_finra_columns(df: pd.DataFrame) -> pd.DataFrame:
+def _select_finra_columns(df: pd.DataFrame, strict: bool = False) -> pd.DataFrame:
     """Map FINRA columns to [ym, debit_M, cash_credit_M, margin_credit_M] by header
-    keyword (robust to inserted columns); fall back to the first 4 columns."""
+    keyword (robust to inserted columns). If keywords don't resolve 4 distinct
+    columns: raise when strict=True (live fetch — fail closed on layout drift),
+    else fall back to the first 4 columns (legacy/test frames without headers)."""
     low = {c: str(c).lower() for c in df.columns}
 
     def find(*keys, exclude=()):
@@ -117,6 +119,8 @@ def _select_finra_columns(df: pd.DataFrame) -> pd.DataFrame:
     picked = [date_c, debit_c, cash_c, margin_c]
     if all(c is not None for c in picked) and len(set(picked)) == 4:
         out = df[picked].copy()
+    elif strict:
+        raise ValueError(f"FINRA headers not recognized (layout drift?): {list(df.columns)}")
     else:
         out = df.iloc[:, :4].copy()                      # positional fallback
     out.columns = ["ym", "debit_M", "cash_credit_M", "margin_credit_M"]
@@ -300,15 +304,35 @@ def compute(df: pd.DataFrame) -> dict:
         debt_note = "史上最高（本月创新高）"
     else:
         debt_note = "高位"
+
+    # mom: distinguish acceleration (true 2nd derivative) from "still rising but
+    # decelerating" so the note can't claim 加速 when the pace is slowing.
+    mom = cur["gross_B"] / prev["gross_B"] - 1
+    rising = cur["gross_B"] > prev["gross_B"]
+    if len(df) >= 3:
+        pp = df.iloc[-3]
+        prev_mom = prev["gross_B"] / pp["gross_B"] - 1
+        accel = mom > prev_mom
+        mom_status = "red" if (rising and accel) else ("amber" if rising else "green")
+        mom_note = ("二阶导：仍在加速" if (rising and accel)
+                    else ("一阶为正但已减速" if rising else "环比转负"))
+    else:
+        mom_status = "amber" if rising else "green"
+        mom_note = "环比仍为正（历史不足，无法判断加/减速）" if rising else "环比转负"
+
+    if yoy is None:
+        yoy_status, yoy_note = "muted", "历史不足 13 个月，无法计算同比"
+    else:
+        yoy_status = "red" if yoy > 20 else "amber"
+        yoy_note = "vs 一年前"
     l1_items = [
         {"label": "Gross margin debt 绝对水平", "value": f"${cur['gross_B']:,.0f}B",
          "status": "red" if debt_at_high else "amber",
          "note": debt_note},
-        {"label": "净新增 (mom)", "value": f"{(cur['gross_B']/prev['gross_B']-1)*100:+.1f}%",
-         "status": "red" if (cur['gross_B'] > prev['gross_B']) else "green",
-         "note": "二阶导：仍在加速"},
+        {"label": "净新增 (mom)", "value": f"{mom*100:+.1f}%",
+         "status": mom_status, "note": mom_note},
         {"label": "同比 (yoy)", "value": f"{yoy:+.0f}%" if yoy is not None else "n/a",
-         "status": "red" if (yoy and yoy > 20) else "amber", "note": "vs 一年前"},
+         "status": yoy_status, "note": yoy_note},
         {"label": "net/gross 硬度", "value": f"{cur['net_gross']:.2f}",
          "status": "red" if cur['net_gross'] > 0.6 else ("amber" if cur['net_gross'] > net_med else "green"),
          "note": f"中位 {net_med:.2f}；越高=现金缓冲越少=越脆"},
@@ -357,12 +381,21 @@ def compute(df: pd.DataFrame) -> dict:
         {"name": "零售信用违约率", "current": "待接入", "threshold": "margin退潮+零售信用恶化=系统性", "status": "watch", "source": "FRED", "avail": "todo"},
     ]
 
+    # FINRA event is derived from the latest data month (consistent with the
+    # monitor above); macro/earnings are manual forward markers, filtered to
+    # those still in the future so re-runs don't show stale past events.
     events = [
-        {"date": "2026-07 下旬", "label": "FINRA 6月 margin debt 发布", "type": "data"},
+        {"date": f"{rel.year}-{rel.month:02d} 下旬",
+         "label": f"FINRA {pend.year}-{pend.month:02d} margin debt 发布", "type": "data"},
+    ]
+    for ev in [
         {"date": "2026-07", "label": "CPI / FOMC", "type": "macro"},
         {"date": "2026-08 下旬", "label": "NVDA FY27 Q2 财报（最高脆弱窗口）", "type": "earnings"},
         {"date": "2026-08", "label": "超大规模云厂商 capex 指引", "type": "earnings"},
-    ]
+    ]:
+        ev_month = pd.Period(ev["date"][:7], freq="M")
+        if ev_month >= today.to_period("M"):       # drop already-past markers
+            events.append(ev)
 
     # chart history (sample to ~ monthly, all points fine — ~350)
     hist = df.tail(360)

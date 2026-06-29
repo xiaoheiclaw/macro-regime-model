@@ -198,6 +198,37 @@ def test_build_series_rejects_missing_current_credit(monkeypatch):
         lm.build_series()
 
 
+def test_mom_decelerating_not_labeled_accelerating(signals):
+    # The fixture rises by a constant absolute amount → mom % is decelerating.
+    mom_item = [i for i in signals["layers"][0]["items"] if "mom" in i["label"]][0]
+    assert "加速" not in mom_item["note"]
+    assert mom_item["status"] != "red"
+
+
+def test_yoy_muted_when_insufficient_history(monkeypatch):
+    monkeypatch.setattr(lm, "fetch_finra", lambda: _fake_finra("ym").iloc[:6].copy())
+    monkeypatch.setattr(lm, "fetch_shiller_sp", _fake_shiller)
+    monkeypatch.setattr(lm, "fetch_sp500_monthly", _fake_yahoo_sp500)
+    sig = lm.compute(lm.build_series())
+    yoy_item = [i for i in sig["layers"][0]["items"] if "yoy" in i["label"]][0]
+    assert yoy_item["status"] == "muted" and sig["latest"]["yoy_pct"] is None
+
+
+def test_finra_event_is_dynamic_and_past_filtered(signals):
+    data_events = [e for e in signals["events"] if e["type"] == "data"]
+    assert data_events, "expected a derived FINRA data event"
+    pend = pd.Period(signals["latest"]["ym"], freq="M") + 1
+    assert f"{pend.year}-{pend.month:02d}" in data_events[0]["label"]
+
+
+def test_select_finra_columns_strict_vs_fallback():
+    df = pd.DataFrame({"a": [1], "b": [2], "c": [3], "d": [4]})  # no recognizable headers
+    with pytest.raises(ValueError):
+        lm._select_finra_columns(df, strict=True)
+    out = lm._select_finra_columns(df, strict=False)
+    assert list(out.columns) == ["ym", "debit_M", "cash_credit_M", "margin_credit_M"]
+
+
 def test_layer_status_aggregation():
     assert lm._layer_status([{"status": "green"}, {"status": "red"}, {"status": "muted"}]) == "red"
     assert lm._layer_status([{"status": "green"}, {"status": "amber"}]) == "amber"
