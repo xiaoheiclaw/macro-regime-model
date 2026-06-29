@@ -113,19 +113,29 @@ def test_cost_accounting_turnover():
     assert bt["net_ret"].loc[idx[2]] == pytest.approx(-10e-4)
 
 
-def test_turnover_survives_missing_intermediate_return():
-    # A real position change must still be charged even if an adjacent month's
-    # return is missing (regression: masking held first dropped the diff/cost).
+def test_missing_intermediate_return_raises():
+    # A return gap inside the invested span is a data hole a backtest cannot
+    # honestly model — it must raise, not silently drop the month (which would
+    # also drop that month's turnover/cost and under-count it).
     idx = _midx(5)
-    gold_ret = pd.Series([0.0, 0.0, np.nan, 0.0, 0.0], index=idx)  # idx[2] missing
+    gold_ret = pd.Series([0.0, 0.0, np.nan, 0.0, 0.0], index=idx)  # idx[2] gap
     tbill = pd.Series(0.0, index=idx)
     pos = pd.Series([0.0, 1.0, 0.0, 1.0, 0.0], index=idx)
-    bt = run_backtest(pos, gold_ret, tbill, cost_bps=10.0)
-    # idx[2] (held=1, return NaN) is dropped from output...
-    assert idx[2] not in bt.index
-    # ...but the trade into idx[3] (held 1→0) is still charged, not NaN-eaten.
-    assert bt["turnover"].loc[idx[3]] == pytest.approx(1.0)
-    assert bt["cost"].loc[idx[3]] == pytest.approx(10e-4)
+    with pytest.raises(ValueError, match="traded span"):
+        run_backtest(pos, gold_ret, tbill, cost_bps=10.0)
+
+
+def test_leading_warmup_nan_is_ok():
+    # A leading NaN return (e.g. month-0 pct_change) sits *before* the first
+    # position and must not trip the gap check.
+    idx = _midx(4)
+    gold_ret = pd.Series([np.nan, 0.01, 0.02, 0.03], index=idx)
+    tbill = pd.Series(0.0, index=idx)
+    pos = pd.Series([0.0, 1.0, 1.0, 1.0], index=idx)  # held = [nan,0,1,1]
+    bt = run_backtest(pos, gold_ret, tbill, cost_bps=0.0)
+    # span starts at idx[1] (first non-NaN held); month-0 excluded, no raise
+    assert bt.index[0] == idx[1]
+    assert not bt["net_ret"].isna().any()
 
 
 def test_cost_zero_bps_is_costless():
@@ -325,3 +335,21 @@ def test_splice_dollar_level_continuous():
     # monotonic index, no gaps/dups
     assert spliced.index.is_monotonic_increasing
     assert not spliced.index.has_duplicates
+
+
+def test_splice_dollar_no_overlap_is_union():
+    old_idx = pd.date_range("1990-01-31", periods=6, freq="ME")
+    new_idx = pd.date_range("1991-01-31", periods=6, freq="ME")  # disjoint
+    old = pd.Series(np.arange(6.0), index=old_idx)
+    new = pd.Series(np.arange(100.0, 106.0), index=new_idx)
+    spliced = _splice_dollar(old, new)
+    # disjoint → simple union, both segments preserved verbatim
+    assert len(spliced) == 12
+    assert spliced.loc[old_idx[0]] == pytest.approx(0.0)
+    assert spliced.loc[new_idx[0]] == pytest.approx(100.0)
+
+
+def test_trend_exposure_empty_lookbacks_raises():
+    price = pd.Series([100.0, 101.0], index=_midx(2))
+    with pytest.raises(ValueError, match="non-empty"):
+        trend_exposure(price, [])

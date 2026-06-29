@@ -109,6 +109,14 @@ def verdict(full: pd.DataFrame) -> str:
     s1 = full.loc["S1_blend"]
     s2 = full.loc["S2_blend"]
 
+    # Guard: short/constant/empty samples produce NaN Sharpe/Calmar; a NaN
+    # comparison is silently False and would masquerade as a "killed" verdict.
+    for name, row in (("S0", s0), ("S1_blend", s1), ("S2_blend", s2)):
+        if not (pd.notna(row["sharpe"]) and pd.notna(row["calmar"])):
+            return ("## Verdict\n\n**Insufficient sample / invalid metrics "
+                    f"({name} has NaN Sharpe or Calmar) — cannot adjudicate the "
+                    "kill conditions. Widen the sample window.**")
+
     def better(a, b):  # risk-adjusted = Sharpe AND Calmar
         return (a["sharpe"] > b["sharpe"]) and (a["calmar"] > b["calmar"])
 
@@ -190,8 +198,20 @@ def main() -> None:
     parts.append("")
 
     parts.append("## Sub-segments (net of cost)\n")
+    pmin, pmax = panel.index.min(), panel.index.max()
+    min_seg_months = 12
     for name, s, e in DEFAULT_SEGMENTS:
-        parts.append(f"### {name}\n")
+        lo, hi = max(pd.Timestamp(s), pmin), min(pd.Timestamp(e), pmax)
+        if lo > hi:
+            parts.append(f"### {name}\n_(skipped: no overlap with sample "
+                         f"{pmin:%Y-%m}–{pmax:%Y-%m})_\n")
+            continue
+        n_in = int(((panel.index >= lo) & (panel.index <= hi)).sum())
+        if n_in < min_seg_months:
+            parts.append(f"### {name}\n_(skipped: only {n_in} months in sample, "
+                         f"<{min_seg_months})_\n")
+            continue
+        parts.append(f"### {name} ({lo:%Y-%m}–{hi:%Y-%m})\n")
         parts.append(_fmt(metrics_table(backtests, s, e)))
         parts.append("")
 

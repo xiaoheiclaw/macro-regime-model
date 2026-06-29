@@ -65,8 +65,10 @@ def _splice_dollar(twex_monthly: pd.Series, dtwex_monthly: pd.Series) -> pd.Seri
         return twex_monthly
     overlap = twex_monthly.dropna().index.intersection(dtwex_monthly.dropna().index)
     if len(overlap) == 0:
-        # No overlap: concatenate, newer series wins where both somehow exist.
-        return twex_monthly.combine_first(dtwex_monthly)
+        # Disjoint indices: a level rebase is impossible (no common month), so
+        # just take the union. The newer (DTWEXBGS) series takes precedence on
+        # any month that somehow appears in both.
+        return dtwex_monthly.combine_first(twex_monthly)
     join = overlap.min()
     scale = twex_monthly.loc[join] / dtwex_monthly.loc[join]
     dtwex_scaled = dtwex_monthly * scale
@@ -94,6 +96,11 @@ def build_timing_panel(
     tbill_ret. Gold + real_rate_10y come straight from `build_anchor_panel`
     (reused, not re-derived); USD is the spliced trade-weighted index; the cash
     leg is the 3-month T-bill (TB3MS) converted to a monthly return.
+
+    Injection: `fetch_fn` covers the FRED pulls owned by *this* function (USD,
+    T-bill). Gold + real_rate_10y are owned by `anchor_fn` and use its own
+    fetchers — to inject them (e.g. in tests) replace `anchor_fn` with a stub
+    returning an object exposing `.data` (and optionally `.notes`).
     """
     panel = anchor_fn(start=start, end=end)
     base = panel.data  # type: ignore[attr-defined]
@@ -164,6 +171,8 @@ def trend_exposure(price: pd.Series, lookbacks: Sequence[int]) -> pd.Series:
     enough history — otherwise during warm-up the longest-history (shortest)
     lookback would drive the blend to a full 1.0 prematurely, which `s1_trend`
     would then take as full exposure on too little evidence."""
+    if len(lookbacks) == 0:
+        raise ValueError("lookbacks must be non-empty")
     sigs = [momentum_signal(price, L) for L in lookbacks]
     return pd.concat(sigs, axis=1).mean(axis=1, skipna=False)
 
@@ -230,41 +239,59 @@ def run_backtest(
 ) -> pd.DataFrame:
     """Apply `positions` (decided at t, held through t+1) with a cash leg and
     per-rebalance trading cost. Returns a frame with held weight, gross/net
-    monthly return, turnover and cost.
+    monthly return, turnover and cost — one row per *traded* month, with no NaN.
 
     No look-ahead: month-m return uses positions[m-1] (`positions.shift(1)`).
     Cost in month m is charged on |w_held[m] − w_held[m-1]| (the trade that set
     up month-m's weight), the first entry trading up from cash.
+
+    Contract: the traded span is trimmed to the first…last month with complete
+    (held, gold, tbill) data. Leading warm-up NaNs (before the first position)
+    and a trailing incomplete month (e.g. this month's gold price not in yet)
+    are trimmed away. But a missing return *strictly inside* that span is a data
+    hole through which a backtest cannot honestly model holding or trading, so
+    it raises ``ValueError`` rather than silently dropping the month (which
+    would also drop that month's turnover/cost and under-count it).
     """
     pos = positions.reindex(gold_ret.index)
     held = pos.shift(1)
-
-    # Turnover is computed on the *full* intended-weight path before any
-    # validity masking, so a real position change is never silently zeroed just
-    # because an adjacent month's return happens to be missing (which would
-    # under-count trading cost). The first held weight is a trade from 0 (cash).
-    turnover = held.diff().abs()
-    first = held.first_valid_index()
-    if first is not None:
-        turnover.loc[first] = abs(held.loc[first])
-
     valid = held.notna() & gold_ret.notna() & tbill_ret.notna()
+    cols = ["held", "gold_ret", "tbill_ret", "turnover", "cost", "gross_ret", "net_ret"]
+    if not valid.any():  # never investable
+        return pd.DataFrame(columns=cols, index=pd.DatetimeIndex([], name=gold_ret.index.name))
+
+    first = valid.idxmax()              # first valid month
+    last = valid[::-1].idxmax()         # last valid month
+    core = valid.loc[first:last]
+    if not core.all():
+        where = list(core.index[~core][:5])
+        raise ValueError(
+            f"missing held/gold/tbill value inside the traded span "
+            f"[{first:%Y-%m}…{last:%Y-%m}] (first {len(where)} of "
+            f"{int((~core).sum())}): {where}. Supply gap-free returns."
+        )
+
+    held_s = held.loc[first:last]
+    gold_s = gold_ret.loc[first:last]
+    tbill_s = tbill_ret.loc[first:last]
+
+    turnover = held_s.diff().abs()
+    turnover.iloc[0] = abs(held_s.iloc[0])  # first entry: trade up from cash
     cost = turnover * (cost_bps / 1e4)
-    gross = held * gold_ret + (1.0 - held) * tbill_ret
+    gross = held_s * gold_s + (1.0 - held_s) * tbill_s
     net = gross - cost
 
-    out = pd.DataFrame(
+    return pd.DataFrame(
         {
-            "held": held,
-            "gold_ret": gold_ret,
-            "tbill_ret": tbill_ret,
+            "held": held_s,
+            "gold_ret": gold_s,
+            "tbill_ret": tbill_s,
             "turnover": turnover,
             "cost": cost,
             "gross_ret": gross,
             "net_ret": net,
         }
     )
-    return out.loc[valid]
 
 
 # ── Metrics ────────────────────────────────────────────────────────────
