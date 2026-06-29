@@ -162,6 +162,19 @@ def test_rank_all_nan_input_stays_nan():
     assert rank.isna().all()
 
 
+def test_rank_constant_window_is_neutral_not_zero():
+    """A degenerate window (all strength tied → max==min, no information) must NOT
+    rank to 0.0 (which `dedollar_factor` would read as the WEAKEST de-dollarization
+    and trim size); it blanks to NaN → the factor falls back to NEUTRAL."""
+    n, w = 50, 20
+    idx = pd.date_range("2003-01-31", periods=n, freq="ME")
+    flat = pd.Series(0.0, index=idx)  # every full window is degenerate
+    rank = dedollar_rank(flat, w)
+    assert rank.dropna().empty
+    f = dedollar_factor(rank, mode="soft", f_min=0.5, f_neutral=1.0, f_max=1.5)
+    assert (f == 1.0).all()  # neutral everywhere, never a phantom cut
+
+
 # ── 3. size factor ───────────────────────────────────────────────────────
 def test_factor_soft_is_linear_increasing():
     idx = pd.date_range("2003-01-31", periods=5, freq="ME")
@@ -169,6 +182,20 @@ def test_factor_soft_is_linear_increasing():
     f = dedollar_factor(rank, mode="soft", f_min=0.5, f_neutral=1.0, f_max=1.5)
     # linear 0.5 → 1.5; rank 0.5 → neutral 1.0 exactly
     np.testing.assert_allclose(f.to_numpy(), [0.5, 0.75, 1.0, 1.25, 1.5])
+
+
+def test_factor_soft_asymmetric_honors_neutral():
+    """Piecewise-soft honors f_neutral: rank=0.5 → f_neutral EXACTLY even when neutral
+    is NOT the midpoint of [f_min, f_max] (the P2 contract fix)."""
+    idx = pd.date_range("2003-01-31", periods=5, freq="ME")
+    rank = pd.Series([0.0, 0.25, 0.5, 0.75, 1.0], index=idx)
+    f = dedollar_factor(rank, mode="soft", f_min=0.4, f_neutral=0.9, f_max=2.0)
+    np.testing.assert_allclose(f.iloc[0], 0.4)   # rank 0 → f_min
+    np.testing.assert_allclose(f.iloc[2], 0.9)   # rank 0.5 → neutral exactly
+    np.testing.assert_allclose(f.iloc[4], 2.0)   # rank 1 → f_max
+    np.testing.assert_allclose(f.iloc[1], 0.4 + (0.9 - 0.4) * 0.5)  # lower-seg mid
+    np.testing.assert_allclose(f.iloc[3], 0.9 + (2.0 - 0.9) * 0.5)  # upper-seg mid
+    assert (f.diff().dropna() > 0).all()         # still strictly increasing
 
 
 def test_factor_hard_tiers():
@@ -300,8 +327,9 @@ def test_s5_identical_window_to_s1():
 
 # ── 6. build_dedollar_panel (injection) + same-track end-to-end ──────────
 def _anchor_and_fetch(n=240, seed=5, custody_missing=False):
-    """Synthetic anchor panel + a fetch_fn returning custody (weekly-ish) & debt
-    (quarterly). custody_missing emulates an unavailable proxy series."""
+    """Synthetic anchor panel + a fetch_fn returning custody (monthly) & debt
+    (quarterly, dated at quarter STARTS like the real GFDEBTN). custody_missing
+    emulates an unavailable proxy series."""
     idx = pd.date_range("2003-01-31", periods=n, freq="ME")
     rng = np.random.RandomState(seed)
     gold = pd.Series(np.exp(np.cumsum(rng.randn(n) * 0.02)), index=idx)
@@ -311,33 +339,59 @@ def _anchor_and_fetch(n=240, seed=5, custody_missing=False):
     custody = pd.Series(3.0e6 - np.linspace(0, 0.5e6, n) + rng.randn(n) * 1e4, index=idx)
     if custody_missing:
         custody = pd.Series(np.nan, index=idx)
-    # quarterly debt: only quarter-end months observed (rest NaN → tests ffill)
-    debt_full = pd.Series(6.0e6 + np.linspace(0, 4.0e6, n), index=idx)
-    debt = debt_full.copy()
-    keep = (debt.index.month % 3 == 0)
-    debt[~keep] = np.nan
+    # quarterly debt dated at quarter STARTS (GFDEBTN convention; the value is the
+    # END-of-quarter level), strictly increasing.
+    q_idx = pd.date_range("2003-01-01", periods=n // 3 + 4, freq="QS")
+    debt_q = pd.Series(6.0e6 + np.arange(len(q_idx)) * 1.0e5, index=q_idx)
 
     def fetch_fn(series_id, start="1968-01-01"):
-        return {"WMTSECL1": custody, "GFDEBTN": debt}.get(
+        return {"WMTSECL1": custody, "GFDEBTN": debt_q}.get(
             series_id, pd.Series(np.nan, index=idx))
-    return anchor, fetch_fn, idx, debt_full
+    return anchor, fetch_fn, idx, debt_q
 
 
-def test_build_panel_columns_and_debt_ffill():
-    anchor, fetch_fn, idx, debt_full = _anchor_and_fetch(n=120)
+def test_build_panel_columns_and_debt_ex_ante_ffill():
+    anchor, fetch_fn, idx, debt_q = _anchor_and_fetch(n=120)
     dp = build_dedollar_panel(
         start="2003-01-01", fetch_fn=fetch_fn, anchor_fn=lambda *a, **k: anchor
     )
     df = dp.data
     for col in ("gold_nominal", "foreign_official_custody", "total_public_debt", "custody_share"):
         assert col in df.columns
-    # debt was quarterly-with-NaN; the panel ffills it → no interior NaN after the
-    # first quarter-end, and the level matches the carried-forward quarter value.
     debt = df["total_public_debt"]
-    assert debt.notna().sum() > debt_full.index.month.isin([3, 6, 9, 12]).sum() - 4
-    # ffill never invents a value before the first observation
-    first_obs = debt_full[debt_full.index.month % 3 == 0].index.min()
-    assert debt.loc[:first_obs].dropna().index.min() >= first_obs
+    # the Q1 obs (2003-01-01 = end-of-Q1 level ≈Mar 31, +1m publish lag) must NOT
+    # appear in Jan/Feb/Mar — no within-quarter look-ahead — first usable 2003-04-30.
+    assert debt.loc[:"2003-03-31"].dropna().empty
+    assert debt.loc["2003-04-30"] == debt_q.iloc[0]
+    # ffilled forward from first availability → no interior NaN afterwards
+    assert debt.loc["2003-04-30":].isna().sum() == 0
+
+
+def test_debt_and_signal_truncation_consistent():
+    """No look-ahead at the panel level (the P1 regression): building on the full
+    sample vs a sample truncated MID-QUARTER leaves every PAST month's debt /
+    custody_share / rank identical (the strict ex-ante contract)."""
+    anchor_f, fetch_f, idx, _ = _anchor_and_fetch(n=160)
+    dp_full = build_dedollar_panel(
+        start="2003-01-01", fetch_fn=fetch_f, anchor_fn=lambda *a, **k: anchor_f
+    )
+    cut = pd.Timestamp("2014-02-28")  # mid-Q1 2014
+    anchor_t = SimpleNamespace(data=anchor_f.data.loc[:cut])
+
+    def fetch_t(series_id, start="1968-01-01"):
+        return fetch_f(series_id, start).loc[:cut]
+
+    dp_trunc = build_dedollar_panel(
+        start="2003-01-01", fetch_fn=fetch_t, anchor_fn=lambda *a, **k: anchor_t
+    )
+    for col in ("total_public_debt", "custody_share"):
+        _close_equal_nan(dp_full.data[col].loc[:cut], dp_trunc.data[col].loc[:cut])
+
+    def mk_rank(df):
+        sh = custody_share(df["foreign_official_custody"], df["total_public_debt"])
+        return dedollar_rank(dedollar_strength(sh, CHG), RANK)
+
+    _close_equal_nan(mk_rank(dp_full.data).loc[:cut], mk_rank(dp_trunc.data).loc[:cut])
 
 
 def test_build_panel_custody_missing_is_nan_share():

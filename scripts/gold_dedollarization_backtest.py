@@ -183,7 +183,7 @@ def check_2022(rank: pd.Series) -> str:
             f"de-dollarization signal is **{verdict_word}** post-2022.")
 
 
-def verdict(full: pd.DataFrame, tl: pd.DataFrame, rank: pd.Series) -> str:
+def verdict(full: pd.DataFrame, rank: pd.Series) -> str:
     """Honest kill-condition adjudication. Decisive test: S5 (either variant) vs S1
     (the PR #5 standard). If modulating trend SIZE by a de-dollarization proxy does
     not beat pure trend on BOTH Sharpe and Calmar net of cost, the proxy lags the
@@ -264,6 +264,15 @@ def _pos_int(x: str) -> int:
     return v
 
 
+def _int_ge2(x: str) -> int:
+    # the rank window must be >= 2 (dedollar_rank rejects 1); fail at the argparse
+    # stage so the user gets the error immediately, not mid-run.
+    v = int(x)
+    if v < 2:
+        raise argparse.ArgumentTypeError("must be an integer >= 2")
+    return v
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--start", default="1968-01-01")
@@ -272,8 +281,8 @@ def main() -> None:
                     help="per-rebalance trading cost in bps (non-negative)")
     ap.add_argument("--change-window", type=_pos_int, default=DEFAULT_CHANGE_WINDOW,
                     help="months for the trailing custody-share change (default 12)")
-    ap.add_argument("--rank-window", type=_pos_int, default=DEFAULT_RANK_WINDOW,
-                    help="months for the de-dollarization rank window (default 48)")
+    ap.add_argument("--rank-window", type=_int_ge2, default=DEFAULT_RANK_WINDOW,
+                    help="months for the de-dollarization rank window (>=2, default 48)")
     ap.add_argument("--out-dir", default=ANALYSIS_DIR)
     args = ap.parse_args()
 
@@ -398,7 +407,7 @@ def main() -> None:
                  "2022+ sanctions era where de-dollarization is strongest._\n")
     parts.append(_fmt(full))
     parts.append("")
-    parts.append(verdict(full, tl, rank))
+    parts.append(verdict(full, rank))
     parts.append("")
 
     # ── sub-segments ──
@@ -497,7 +506,7 @@ def main() -> None:
     print(f"  signal series → {sig_path}")
 
     print("\n" + _fmt(full))
-    print("\n" + verdict(full, tl, rank))
+    print("\n" + verdict(full, rank))
 
 
 if __name__ == "__main__":

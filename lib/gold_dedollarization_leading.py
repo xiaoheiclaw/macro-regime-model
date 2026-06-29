@@ -106,15 +106,35 @@ def _to_monthly_mean(s: pd.Series) -> pd.Series:
     return s.resample("ME").mean()
 
 
-def _to_monthly_ffill(s: pd.Series) -> pd.Series:
-    """Resample a quarterly stock (total public debt) to month-end, forward-filling
-    the level within the quarter — the same alignment `gold_anchor` uses for the
-    quarterly debt stock. ffill never reads the future (it carries the last KNOWN
-    quarter-end level forward), so it is leak-free."""
-    s = s.sort_index()
-    if s.dropna().empty:
+DEFAULT_DEBT_PUBLISH_LAG_M = 1  # months after quarter-end the level is treated as known
+
+
+def _to_monthly_ffill(
+    s: pd.Series, publish_lag_months: int = DEFAULT_DEBT_PUBLISH_LAG_M
+) -> pd.Series:
+    """Resample a quarterly stock (total public debt) to a strictly ex-ante monthly
+    series. GFDEBTN is dated at the quarter START (e.g. 2018-01-01) but its value is
+    the END-of-quarter level (≈2018-03-31), published shortly after. A naive
+    ``resample("ME").last().ffill()`` would stamp that end-of-Q1 level on JANUARY —
+    a within-quarter look-ahead (using March-31 data in January) that would taint
+    the no-look-ahead backtest.
+
+    Fix: map each observation to its quarter-END month, add a conservative
+    `publish_lag_months` publication lag (the level is only *used* once observable),
+    then put it on the month-end grid and forward-fill. ffill carries the last KNOWN
+    level forward only, and the calendar-based ME grid is independent of where the
+    sample ends, so truncating the future leaves every past month unchanged."""
+    s = s.sort_index().dropna()
+    if s.empty:
         return pd.Series(dtype="float64")
-    return s.resample("ME").last().ffill()
+    # quarter-start stamp → quarter-END (the date the level refers to), then lag for
+    # publication, then snap to month-end.
+    avail = (s.index + pd.offsets.QuarterEnd(0)
+             + pd.offsets.DateOffset(months=publish_lag_months)
+             + pd.offsets.MonthEnd(0))
+    q = pd.Series(s.to_numpy(), index=avail).sort_index()
+    q = q[~q.index.duplicated(keep="last")]
+    return q.resample("ME").last().ffill()
 
 
 @dataclass
@@ -137,14 +157,16 @@ def build_dedollar_panel(
     Reuses `build_anchor_panel` for gold_nominal (PR #1/#2, not re-derived), then
     adds the two FRED pulls this module owns: foreign official custody of UST
     (weekly→ME mean) and total public debt (quarterly→ME ffill). Injection:
-    `fetch_fn` covers both FRED pulls; `anchor_fn` is the panel builder (stub it in
-    tests with an object exposing `.data`).
+    `fetch_fn` covers ONLY this module's two FRED pulls (custody, debt); it is NOT
+    forwarded to the anchor, which owns its own (GDP/M2/CPI/TIPS/…) fetchers — so a
+    caller stubbing just custody/debt cannot corrupt the anchor's base panel. To
+    inject anchor data (e.g. in tests), pass `anchor_fn` (an object exposing `.data`).
 
     The custody series only starts ~2002-12, so this is structurally a post-2002
     backtest — documented honestly in `notes`. If the custody series is entirely
     unavailable, `custody_share` is all-NaN and the strategy gracefully degrades to
     S1 (see `dedollar_factor`'s NaN→neutral fallback)."""
-    base = anchor_fn(start=start, end=end, fetch_fn=fetch_fn).data  # type: ignore[attr-defined]
+    base = anchor_fn(start=start, end=end).data  # type: ignore[attr-defined]
     df = base[["gold_nominal"]].copy()
     idx = df.index
 
@@ -224,8 +246,17 @@ def dedollar_rank(
         # window=1 makes (raw-1)/(window-1) a div-by-0 and is a degenerate rank
         # (the lone point is both min and max → no information).
         raise ValueError(f"window must be >= 2, got {window}")
-    raw = strength.rolling(window, min_periods=window).rank(method="min")
-    return ((raw - 1.0) / (window - 1.0)).clip(lower=0.0, upper=1.0)
+    roll = strength.rolling(window, min_periods=window)
+    raw = roll.rank(method="min")
+    rank = ((raw - 1.0) / (window - 1.0)).clip(lower=0.0, upper=1.0)
+    # A degenerate window (all values tied → max == min, e.g. a flat custody share)
+    # has NO information, yet method="min" would force rank → 0.0 and the factor
+    # would read that as the WEAKEST de-dollarization and trim size. Blank it to NaN
+    # so `dedollar_factor` falls back to NEUTRAL (no signal → don't modulate).
+    rmin = roll.min()
+    rmax = roll.max()
+    rank[rmax == rmin] = np.nan
+    return rank
 
 
 def signal_available(rank: pd.Series) -> bool:
@@ -253,8 +284,10 @@ def dedollar_factor(
     trend unchanged. This single rule serves both warm-up (S5/S1 share an identical
     investable window — fair same-track comparison) and the missing-data fallback.
 
-    soft: linear f = f_min + (f_max − f_min)·rank (rank 0.5 → f_neutral exactly when
-          neutral is the midpoint of [f_min, f_max]).
+    soft: PIECEWISE-linear through the neutral knee, so rank=0.5 → f_neutral ALWAYS
+          (even for an asymmetric tier set): rank∈[0,0.5] interpolates f_min→f_neutral,
+          rank∈[0.5,1] interpolates f_neutral→f_max. Reduces to a plain line when
+          f_neutral is the midpoint of [f_min, f_max].
     hard: tercile steps — rank<1/3 → f_min, [1/3,2/3) → f_neutral, ≥2/3 → f_max."""
     if not (f_min <= f_neutral <= f_max):
         # a non-monotone tier set would make "stronger de-dollarization" sometimes
@@ -264,7 +297,11 @@ def dedollar_factor(
             f"({f_min}, {f_neutral}, {f_max})"
         )
     if mode == "soft":
-        f = f_min + (f_max - f_min) * rank
+        # two linear segments meeting at (0.5, f_neutral) so the documented
+        # "rank 0.5 = neutral" contract holds for any (f_min, f_neutral, f_max).
+        lower = f_min + (f_neutral - f_min) * (rank / 0.5)
+        upper = f_neutral + (f_max - f_neutral) * ((rank - 0.5) / 0.5)
+        f = lower.where(rank <= 0.5, upper)  # NaN rank → NaN here → neutral below
     elif mode == "hard":
         f = pd.Series(np.nan, index=rank.index, dtype="float64")
         r = rank
