@@ -312,3 +312,164 @@ def test_segments_cover_post2000_window():
     names = {n for n, _, _ in SUBPERIOD_SEGMENTS}
     assert POST2000_SEGMENT in names
     assert {"1968-1980", "1980-2000", "2000-2011", "2011-2015", "2016-2026"} <= names
+
+
+# ── trade_count boundary (prev_held) — codex P2a ─────────────────────────────
+def test_trade_count_prev_held_carried_position_is_zero():
+    # A position carried in from before the slice (prev_held invested) and held
+    # throughout did NOT trade inside the window → 0, not a spurious boundary 1.
+    idx = _midx(6)
+    bt = pd.DataFrame({"held": pd.Series(1.0, index=idx)})
+    assert trade_count(bt, prev_held=1.0) == 0
+    # no prior info (start of data, from cash) → the genuine opening entry counts
+    assert trade_count(bt, prev_held=None) == 1
+
+
+def test_trade_count_prev_held_exit_at_boundary_counts():
+    # Held cash through the slice but invested the month before → one exit at the
+    # boundary (the trade that flattened the carried position) counts.
+    idx = _midx(4)
+    bt = pd.DataFrame({"held": pd.Series(0.0, index=idx)})
+    assert trade_count(bt, prev_held=1.0) == 1
+    assert trade_count(bt, prev_held=0.0) == 0  # cash→cash, no trade
+
+
+def test_segment_metrics_s0_midsample_has_zero_trades():
+    # S0 (buy-and-hold) sliced to a mid-sample segment must show 0 trades — it
+    # entered once, before the segment, and never traded inside it.
+    idx = _midx(120, start="1990-01-31")
+    gold = pd.Series(np.linspace(0.01, 0.015, 120), index=idx)
+    tbill = pd.Series(0.001, index=idx)
+    s0 = run_backtest(s0_buy_hold(idx), gold, tbill, cost_bps=0.0)
+    bts = {S0_LABEL: s0}
+    common = common_window(bts)
+    # first segment (window start) → the genuine entry counts as 1
+    first = segment_metrics(bts, "1990-01-01", "1994-12-31", common=common)
+    assert first.loc[S0_LABEL, "n_trades"] == 1
+    # a later, mid-sample segment → carried in, 0 trades inside
+    later = segment_metrics(bts, "1996-01-01", "1999-12-31", common=common)
+    assert later.loc[S0_LABEL, "n_trades"] == 0
+
+
+# ── paired stats: HAC + moving-block bootstrap — codex P2b ────────────────────
+def test_paired_net_diff_reports_block_and_hac_params():
+    idx = _midx(64)
+    rng = np.random.default_rng(5)
+    a = _bt_from_net(pd.Series(rng.normal(0.01, 0.02, 64), index=idx))
+    b = _bt_from_net(pd.Series(rng.normal(0.005, 0.02, 64), index=idx))
+    st = paired_net_diff_stats(a, b, n_boot=400, seed=0)
+    assert st["block_len"] >= 1 and st["hac_lag"] >= 1
+    # default block ≈ √n, hac lag ≈ n^(1/3)
+    assert st["block_len"] == max(1, round(np.sqrt(64)))
+    assert st["hac_lag"] == max(1, round(64 ** (1.0 / 3.0)))
+
+
+def test_paired_hac_se_widens_with_positive_autocorrelation():
+    # A strongly positively-autocorrelated series has a larger HAC se (smaller
+    # |t|) than an IID-style se would give — verify the HAC variance exceeds the
+    # naive γ0/n by construction on an AR(1)-like path.
+    from lib.gold_s1_subperiod import _bartlett_hac_se_mean
+    n = 200
+    rng = np.random.default_rng(9)
+    e = rng.normal(0, 1, n)
+    x = np.zeros(n)
+    for i in range(1, n):
+        x[i] = 0.7 * x[i - 1] + e[i]  # AR(1), phi=0.7
+    se_iid = float(np.std(x, ddof=0) / np.sqrt(n))
+    se_hac = _bartlett_hac_se_mean(x, lag=max(1, round(n ** (1.0 / 3.0))))
+    assert se_hac > se_iid  # autocorrelation inflates the honest se
+
+
+# ── verdict() branch coverage — codex P1 ──────────────────────────────────────
+import importlib.util as _ilu  # noqa: E402
+
+_spec = _ilu.spec_from_file_location(
+    "gold_s1_subperiod_script",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                 "scripts", "gold_s1_subperiod.py"),
+)
+gss = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(gss)
+
+_SEG_COLS = ["sharpe", "calmar", "cagr", "max_dd", "longest_underwater_m",
+             "max_consec_loss_m", "ann_turnover", "n_trades", "hit_rate", "n_months"]
+
+
+def _seg_table(s0, s1):
+    """Build a POST2000 metrics table with S0, the primary S1, and every S1
+    variant (all variants mirror the primary so the robustness count is stable).
+    `s0`/`s1` are dicts with at least sharpe/calmar/cagr/max_dd."""
+    rows = {S0_LABEL: s0}
+    for lbl, _, _ in S1_VARIANTS:
+        rows[f"S1_{lbl}"] = dict(s1)
+    df = pd.DataFrame(rows).T
+    for c in _SEG_COLS:
+        if c not in df.columns:
+            df[c] = 0.0
+    return df[_SEG_COLS].astype(float)
+
+
+def _seg_by_cost(s0_10, s1_10, s0_25, s1_25):
+    return {
+        10.0: {POST2000_SEGMENT: _seg_table(s0_10, s1_10)},
+        25.0: {POST2000_SEGMENT: _seg_table(s0_25, s1_25)},
+    }
+
+
+def _paired(ann_mean, ci_lo, ci_hi):
+    excl = ci_lo > 0 or ci_hi < 0
+    return {10.0: {"ann_mean": ann_mean, "t_stat": 1.0, "ci_lo": ci_lo,
+                   "ci_hi": ci_hi, "ci_excludes_zero": excl,
+                   "block_len": 5, "hac_lag": 3}}
+
+
+def test_verdict_both_axes_significant():
+    s0 = {"sharpe": 0.5, "calmar": 0.3, "cagr": 0.05, "max_dd": -0.4}
+    s1 = {"sharpe": 0.9, "calmar": 0.7, "cagr": 0.09, "max_dd": -0.2}
+    out = gss.verdict(_seg_by_cost(s0, s1, s0, s1), _paired(0.04, 0.01, 0.07))
+    assert "on both axes" in out and "STILL HAS EDGE" in out
+
+
+def test_verdict_both_axes_but_not_significant():
+    # P1 regression: S1 higher CAGR (ret True) but CI includes zero must NOT say
+    # "GIVES UP raw CAGR" — it should land in the ①a 'leans positive' branch.
+    s0 = {"sharpe": 0.5, "calmar": 0.3, "cagr": 0.05, "max_dd": -0.4}
+    s1 = {"sharpe": 0.9, "calmar": 0.7, "cagr": 0.09, "max_dd": -0.2}
+    out = gss.verdict(_seg_by_cost(s0, s1, s0, s1), _paired(0.02, -0.01, 0.05))
+    assert "LEANS POSITIVE on both axes" in out
+    assert "GIVES UP" not in out  # must not contradict the data
+
+
+def test_verdict_risk_reducer_gives_up_return():
+    # S1 wins risk-adjusted but LOSES on CAGR → ①′ mixed risk-reducer.
+    s0 = {"sharpe": 0.74, "calmar": 0.28, "cagr": 0.111, "max_dd": -0.393}
+    s1 = {"sharpe": 0.86, "calmar": 0.51, "cagr": 0.095, "max_dd": -0.187}
+    out = gss.verdict(_seg_by_cost(s0, s1, s0, s1), _paired(-0.019, -0.045, 0.007))
+    assert "risk-reducer post-2000, NOT a return-enhancer" in out
+    assert "GIVES UP raw CAGR" in out
+
+
+def test_verdict_decayed_when_not_risk_adjusted_winner():
+    # S1 loses risk-adjusted (lower Sharpe) → ② decayed, regardless of CAGR.
+    s0 = {"sharpe": 0.9, "calmar": 0.6, "cagr": 0.10, "max_dd": -0.2}
+    s1 = {"sharpe": 0.6, "calmar": 0.3, "cagr": 0.12, "max_dd": -0.3}
+    out = gss.verdict(_seg_by_cost(s0, s1, s0, s1), _paired(-0.01, -0.05, 0.03))
+    assert "DECAYED" in out
+
+
+def test_verdict_requires_both_costs_for_risk_adjusted_win():
+    # Wins risk-adjusted @10bps but NOT @25bps → not a clean ra win → ② decayed.
+    s0_10 = {"sharpe": 0.5, "calmar": 0.3, "cagr": 0.05, "max_dd": -0.4}
+    s1_10 = {"sharpe": 0.9, "calmar": 0.7, "cagr": 0.09, "max_dd": -0.2}
+    s0_25 = {"sharpe": 0.9, "calmar": 0.7, "cagr": 0.09, "max_dd": -0.2}  # S0 ahead @25
+    s1_25 = {"sharpe": 0.6, "calmar": 0.3, "cagr": 0.05, "max_dd": -0.3}
+    out = gss.verdict(_seg_by_cost(s0_10, s1_10, s0_25, s1_25),
+                      _paired(0.02, 0.005, 0.04))
+    assert "DECAYED" in out
+
+
+def test_verdict_guards_nan_metrics():
+    s0 = {"sharpe": float("nan"), "calmar": 0.3, "cagr": 0.05, "max_dd": -0.4}
+    s1 = {"sharpe": 0.9, "calmar": 0.7, "cagr": 0.09, "max_dd": -0.2}
+    out = gss.verdict(_seg_by_cost(s0, s1, s0, s1), _paired(0.04, 0.01, 0.07))
+    assert "cannot adjudicate" in out.lower()

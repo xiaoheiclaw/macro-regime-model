@@ -173,41 +173,48 @@ def verdict(
     lines.append(f"- Robustness: {n_beat}/{n_var} S1 variants beat S0 on Sharpe over {post} @10bps")
     lines.append("")
 
-    if ra_10 and ra_25 and ret_10 and ci_positive:
-        lines.append(
-            "**① S1 STILL HAS EDGE post-2000 — on both axes.** It beats buy-and-hold "
-            "risk-adjusted *and* on raw return at realistic and punitive costs, with "
-            "the paired excess distinguishable from zero in-sample. The S1 story is "
-            "not *only* 1968–2000 bear-avoidance. Worth hardening with a proper "
-            "walk-forward / out-of-sample test before trading.")
-    elif ra_10 and ra_25 and not ci_negative:
-        lines.append(
-            "**①′ MIXED — S1 is a risk-reducer post-2000, NOT a return-enhancer.** "
-            "It still wins risk-adjusted (higher Sharpe & Calmar, roughly half the "
-            "drawdown) net of cost at both 10 and 25bps, but it GIVES UP raw CAGR to "
-            "buy-and-hold and the paired return excess is negative-leaning yet "
-            "statistically indistinguishable from zero. This is the same 'stress "
-            "insurance, not uniform alpha' character the v2 SP-CVaR layer shows. "
-            "Read-through: the full-sample Sharpe 0.63 *return* edge was indeed "
-            "largely 1968–2000 bear-avoidance and has decayed — but the "
-            "*drawdown-control* edge persists. **For a drawdown-averse holder S1 is "
-            "still worth a walk-forward test; for a total-return maximiser, just "
-            "hold the metal.**")
-    else:
+    ra = ra_10 and ra_25         # risk-adjusted win at BOTH realistic & punitive cost
+    ret = ret_10 and ret_25       # raw-return win at BOTH costs
+    sig_phrase = ("distinguishable from zero" if ci_positive
+                  else "significantly NEGATIVE" if ci_negative
+                  else "statistically indistinguishable from zero")
+
+    if not ra:
         lines.append(
             "**② S1 edge has DECAYED.** After 2000 it does not even win risk-adjusted "
             "net of cost — its full-sample Sharpe is largely the 1968–2000 bear it "
             "sidestepped. For a trader operating today, 'use S1 to trade gold' is "
             "close to void: just hold GLD/physical, or don't single-bet gold. "
             "Honest kill.")
+    elif ra and ret and ci_positive:
+        lines.append(
+            "**① S1 STILL HAS EDGE post-2000 — on both axes.** It beats buy-and-hold "
+            "risk-adjusted *and* on raw return at realistic and punitive costs, with "
+            "the paired excess distinguishable from zero in-sample. The S1 story is "
+            "not *only* 1968–2000 bear-avoidance. Worth hardening with a proper "
+            "walk-forward / out-of-sample test before trading.")
+    elif ra and ret:  # both axes nominally, but the return excess is not significant
+        lines.append(
+            "**①a S1 LEANS POSITIVE on both axes post-2000, but the return edge is "
+            f"not significant.** It wins risk-adjusted (higher Sharpe & Calmar) net of "
+            "cost at 10 and 25bps and is nominally ahead on raw CAGR too — yet the "
+            f"paired monthly excess is {sig_phrase}, so the return advantage is not "
+            "reliably separable from luck on this single path. Promising, not proven: "
+            "the risk-adjusted edge is the solid part; a walk-forward test is needed "
+            "before leaning on the return premium.")
+    else:  # ra and not ret → risk-reducer, gives up raw return
+        lines.append(
+            "**①′ MIXED — S1 is a risk-reducer post-2000, NOT a return-enhancer.** "
+            "It still wins risk-adjusted (higher Sharpe & Calmar, roughly half the "
+            "drawdown) net of cost at both 10 and 25bps, but it GIVES UP raw CAGR to "
+            f"buy-and-hold and the paired return excess is {sig_phrase}. This is the "
+            "same 'stress insurance, not uniform alpha' character the v2 SP-CVaR layer "
+            "shows. Read-through: the full-sample Sharpe 0.63 *return* edge was indeed "
+            "largely 1968–2000 bear-avoidance and has decayed — but the "
+            "*drawdown-control* edge persists. **For a drawdown-averse holder S1 is "
+            "still worth a walk-forward test; for a total-return maximiser, just "
+            "hold the metal.**")
     return "\n".join(lines)
-
-
-def _nonneg_float(x: str) -> float:
-    v = float(x)
-    if v < 0:
-        raise argparse.ArgumentTypeError("must be non-negative")
-    return v
 
 
 def main() -> None:
@@ -340,9 +347,14 @@ def main() -> None:
 
     # Paired significance.
     parts.append("## Paired in-sample significance — S1 primary − S0, post-2000\n")
-    parts.append("Bootstrap 95% CI on the annualised monthly net-return difference "
-                 "(2000 paths, seed 0). CI excluding zero ⇒ the gap is reliable on this "
-                 "sample (NOT an out-of-sample claim).\n")
+    _pj0 = paired_by_cost[10.0]
+    parts.append(
+        "Monthly net-return difference treated as the time series it is (NOT IID): "
+        f"**Newey-West HAC** t-stat (Bartlett kernel, lag≈n^⅓={_pj0.get('hac_lag', 0)}) and a "
+        f"**moving-block bootstrap** 95% CI (block≈√n={_pj0.get('block_len', 0)}, 2000 paths, "
+        "seed 0) so autocorrelation / volatility clustering do not understate the "
+        "uncertainty. CI excluding zero ⇒ the gap is reliable on this sample (NOT an "
+        "out-of-sample claim).\n")
     psig = {}
     for c in COST_GRID:
         pj = paired_by_cost[c]
