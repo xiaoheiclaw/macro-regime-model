@@ -426,7 +426,10 @@ def verdict(
     def row(cost, label):
         return seg_by_cost[cost][post].loc[label]
 
-    # Guard: need valid metrics on the post-2000 window.
+    # Guard: need valid metrics on the post-2000 window. The verdict compares
+    # Sharpe & Calmar AND CAGR at BOTH 10 and 25bps, so all of those must be
+    # non-NaN — otherwise a missing 25bps row would make comparisons silently
+    # False and masquerade as a "DECAYED" kill rather than "cannot adjudicate".
     try:
         s1_10 = row(10.0, PRIMARY_LABEL)
         s0_10 = row(10.0, S0_LABEL)
@@ -434,10 +437,11 @@ def verdict(
         s0_25 = row(25.0, S0_LABEL)
     except KeyError:
         return "## Verdict\n\n**Cannot adjudicate: post-2000 window missing from results.**"
-    if not (pd.notna(s1_10["sharpe"]) and pd.notna(s0_10["sharpe"])
-            and pd.notna(s1_10["calmar"]) and pd.notna(s0_10["calmar"])):
+    needed = ("sharpe", "calmar", "cagr")
+    if not all(pd.notna(r[k]) for r in (s1_10, s0_10, s1_25, s0_25) for k in needed):
         return ("## Verdict\n\n**Insufficient sample on the post-2000 window "
-                "(NaN Sharpe/Calmar) — cannot adjudicate. Widen the data.**")
+                "(NaN Sharpe/Calmar/CAGR at 10 or 25bps) — cannot adjudicate. "
+                "Widen the data.**")
 
     def risk_adj_beats(s1, s0):  # PR#5 caliber: Sharpe AND Calmar
         return (s1["sharpe"] > s0["sharpe"]) and (s1["calmar"] > s0["calmar"])

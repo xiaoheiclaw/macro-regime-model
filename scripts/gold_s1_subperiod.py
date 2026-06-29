@@ -89,9 +89,11 @@ def _fmt_segment(df: pd.DataFrame) -> str:
     if "ann_turnover" in show:
         show["ann_turnover"] = show["ann_turnover"].map(
             lambda v: f"{v:.2f}x" if pd.notna(v) else "n/a")
+    # Integer count columns: NaN means "no sample / not computable" → show
+    # "n/a", never "0" (which would conflate an empty segment with a real zero).
     for c in ("longest_underwater_m", "max_consec_loss_m", "n_trades", "n_months"):
         if c in show:
-            show[c] = show[c].map(lambda v: f"{int(v):d}" if pd.notna(v) else "0")
+            show[c] = show[c].map(lambda v: f"{int(v):d}" if pd.notna(v) else "n/a")
     return _md_table(show)
 
 
@@ -114,7 +116,14 @@ def main() -> None:
     print(f"  panel: {panel.index.min():%Y-%m} → {panel.index.max():%Y-%m}, "
           f"{len(panel)} months")
 
-    # Backtest the whole strategy set at every cost level.
+    # Backtest the whole strategy set at every cost level. The headline cost is
+    # the verdict/segment-display cost, so it MUST be one of the grid points —
+    # guard the cross-module constant contract rather than KeyError downstream.
+    if DEFAULT_COST_BPS not in COST_GRID:
+        print(f"ERROR: DEFAULT_COST_BPS={DEFAULT_COST_BPS} (from lib.gold_trend_timing) "
+              f"is not in COST_GRID={COST_GRID}; the headline/verdict cost must be a "
+              "grid point. Add it to COST_GRID.", file=sys.stderr)
+        raise SystemExit(2)
     bt_by_cost: Dict[float, Dict[str, pd.DataFrame]] = {
         c: run_all(panel, c) for c in COST_GRID
     }
@@ -124,7 +133,7 @@ def main() -> None:
         print("ERROR: no common investable window across strategies "
               "(sample too short for the trend/vol warm-up).", file=sys.stderr)
         raise SystemExit(2)
-    print(f"  fair common window: {cstart:%Y-%m} → {cend:%Y-%m}")
+    print(f"  fair common window @{DEFAULT_COST_BPS:.0f}bps: {cstart:%Y-%m} → {cend:%Y-%m}")
 
     # Per-segment metrics at every cost (fair common window applied inside).
     seg_by_cost: Dict[float, Dict[str, pd.DataFrame]] = {}
@@ -138,11 +147,18 @@ def main() -> None:
     # Paired post-2000 significance (S1 primary vs S0) at every cost. Window
     # bounds come from SUBPERIOD_SEGMENTS via POST2000_SEGMENT — the SAME source
     # the segment tables and verdict use, so they can never silently desync.
+    # Each cost re-derives its OWN common window (cost can in principle change
+    # the investable rows), so paired stats stay aligned with that cost's table.
     post_start, post_end = segment_window(POST2000_SEGMENT)
     paired_by_cost: Dict[float, Dict[str, float]] = {}
     for c, bts in bt_by_cost.items():
-        lo = max(cstart, pd.Timestamp(post_start))
-        hi = min(cend, pd.Timestamp(post_end))
+        ccstart, ccend = common_window(bts)
+        if ccstart is None or ccend is None:
+            paired_by_cost[c] = paired_net_diff_stats(
+                bts[PRIMARY_LABEL].iloc[0:0], bts[S0_LABEL].iloc[0:0])
+            continue
+        lo = max(ccstart, pd.Timestamp(post_start))
+        hi = min(ccend, pd.Timestamp(post_end))
         a = slice_segment(bts[PRIMARY_LABEL], lo, hi)
         b = slice_segment(bts[S0_LABEL], lo, hi)
         paired_by_cost[c] = paired_net_diff_stats(a, b)

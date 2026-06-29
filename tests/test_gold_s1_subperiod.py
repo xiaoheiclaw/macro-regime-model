@@ -492,3 +492,25 @@ def test_verdict_guards_nan_metrics():
     s1 = {"sharpe": 0.9, "calmar": 0.7, "cagr": 0.09, "max_dd": -0.2}
     out = verdict(_seg_by_cost(s0, s1, s0, s1), _paired(0.04, 0.01, 0.07))
     assert "cannot adjudicate" in out.lower()
+
+
+def test_verdict_guards_nan_at_25bps_not_silent_decay():
+    # 25bps metrics drive the verdict too; a NaN there must yield "cannot
+    # adjudicate", NOT a silent False→DECAYED (codex P2).
+    good = {"sharpe": 0.9, "calmar": 0.7, "cagr": 0.09, "max_dd": -0.2}
+    s0 = {"sharpe": 0.5, "calmar": 0.3, "cagr": 0.05, "max_dd": -0.4}
+    bad25 = {"sharpe": float("nan"), "calmar": 0.7, "cagr": 0.09, "max_dd": -0.2}
+    out = verdict(_seg_by_cost(s0, good, s0, bad25), _paired(0.02, 0.005, 0.04))
+    assert "cannot adjudicate" in out.lower()
+    # also guard a NaN CAGR at 25bps (used by the raw-return axis)
+    bad25c = {"sharpe": 0.9, "calmar": 0.7, "cagr": float("nan"), "max_dd": -0.2}
+    out2 = verdict(_seg_by_cost(s0, good, s0, bad25c), _paired(0.02, 0.005, 0.04))
+    assert "cannot adjudicate" in out2.lower()
+
+
+def test_default_cost_is_a_grid_point():
+    # The headline/verdict cost must be one of the cost-grid points (the script
+    # indexes bt_by_cost[DEFAULT_COST_BPS]); guard the cross-module contract.
+    from lib.gold_trend_timing import DEFAULT_COST_BPS
+    assert DEFAULT_COST_BPS in COST_GRID
+    assert 10.0 in COST_GRID and 25.0 in COST_GRID  # verdict reads both explicitly
