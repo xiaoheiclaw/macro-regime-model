@@ -21,6 +21,7 @@ import pytest
 
 from lib.gold_trend_timing import (
     ANNUAL,
+    build_timing_panel,
     compute_metrics,
     momentum_signal,
     regime_gate,
@@ -152,6 +153,25 @@ def test_run_backtest_rejects_out_of_range_weights():
     short = pd.Series([0.0, -0.3, -0.3, -0.3], index=idx)
     with pytest.raises(ValueError, match=r"\[0, 1\]"):
         run_backtest(short, gold_ret, tbill, cost_bps=0.0)
+
+
+def test_run_backtest_rejects_negative_cost():
+    idx = _midx(4)
+    gold_ret = pd.Series([0.01, 0.02, 0.0, 0.01], index=idx)
+    tbill = pd.Series(0.0, index=idx)
+    pos = pd.Series([0.0, 1.0, 1.0, 1.0], index=idx)
+    with pytest.raises(ValueError, match="cost_bps must be non-negative"):
+        run_backtest(pos, gold_ret, tbill, cost_bps=-5.0)
+
+
+def test_momentum_signal_rejects_nonpositive_lookback():
+    price = pd.Series([100.0, 101.0, 102.0], index=_midx(3))
+    for bad in (0, -1):
+        with pytest.raises(ValueError, match="positive"):
+            momentum_signal(price, lookback=bad)
+    # trend_exposure propagates the check through its per-lookback signals
+    with pytest.raises(ValueError, match="positive"):
+        trend_exposure(price, [3, -2])
 
 
 def test_cost_zero_bps_is_costless():
@@ -410,6 +430,32 @@ def test_trend_exposure_empty_lookbacks_raises():
     price = pd.Series([100.0, 101.0], index=_midx(2))
     with pytest.raises(ValueError, match="non-empty"):
         trend_exposure(price, [])
+
+
+def test_build_timing_panel_gold_gap_is_nan_and_backtest_raises():
+    # An interior missing gold price must become a NaN return (not a fake 0%
+    # from forward-fill), which run_backtest then refuses as a data hole.
+    idx = _midx(8)
+    gold = pd.Series([100, 101, np.nan, 103, 104, 105, 106, 107.0], index=idx)
+
+    class _Anchor:
+        data = pd.DataFrame({
+            "gold_nominal": gold,
+            "real_rate_10y": pd.Series(np.linspace(1.0, 0.5, 8), index=idx),
+        })
+        notes: dict = {}
+
+    def anchor_fn(start=None, end=None):
+        return _Anchor()
+
+    def fetch_fn(series_id, start="1968-01-01"):
+        return pd.Series(np.linspace(100.0, 110.0, 8), index=idx)
+
+    tp = build_timing_panel(start="2000-01-01", fetch_fn=fetch_fn, anchor_fn=anchor_fn)
+    gr = tp.data["gold_ret"]
+    assert np.isnan(gr.iloc[2])  # gap → NaN, not 0% (would be 0.0 under ffill)
+    with pytest.raises(ValueError, match="traded span"):
+        run_backtest(s0_buy_hold(tp.data.index), tp.data["gold_ret"], tp.data["tbill_ret"])
 
 
 # ── script-level: common_span / metrics_table robustness ───────────────

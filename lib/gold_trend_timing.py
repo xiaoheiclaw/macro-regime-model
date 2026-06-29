@@ -131,7 +131,9 @@ def build_timing_panel(
     # annual-percent yield → monthly simple return
     df["tbill_ret"] = (1.0 + tb / 100.0) ** (1.0 / ANNUAL) - 1.0
 
-    df["gold_ret"] = df["gold_nominal"].pct_change()
+    # fill_method=None: a missing gold price must yield NaN (a data hole that
+    # run_backtest then refuses), never a forward-filled fake 0% return.
+    df["gold_ret"] = df["gold_nominal"].pct_change(fill_method=None)
 
     notes = {
         "frequency": "month-end (ME)",
@@ -152,6 +154,9 @@ def build_timing_panel(
 def momentum_signal(price: pd.Series, lookback: int) -> pd.Series:
     """1.0 when trailing `lookback`-month log return > 0, else 0.0. NaN until
     enough history. Uses price[t] vs price[t-lookback] — no future data."""
+    if lookback <= 0:
+        # a non-positive lookback makes shift() read the *future* → look-ahead
+        raise ValueError(f"lookback must be a positive integer, got {lookback}")
     logp = np.log(price)
     mom = logp - logp.shift(lookback)
     sig = (mom > 0).astype(float)
@@ -287,6 +292,9 @@ def run_backtest(
     it raises ``ValueError`` rather than silently dropping the month (which
     would also drop that month's turnover/cost and under-count it).
     """
+    if cost_bps < 0:
+        # a negative cost is a trading rebate that would flatter every strategy
+        raise ValueError(f"cost_bps must be non-negative, got {cost_bps}")
     pos = positions.reindex(gold_ret.index)
     held = pos.shift(1)
     valid = held.notna() & gold_ret.notna() & tbill_ret.notna()

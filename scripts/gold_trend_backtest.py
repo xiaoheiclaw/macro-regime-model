@@ -179,11 +179,19 @@ def verdict(full: pd.DataFrame) -> str:
     return "\n".join(lines)
 
 
+def _nonneg_float(x: str) -> float:
+    v = float(x)
+    if v < 0:
+        raise argparse.ArgumentTypeError("must be non-negative")
+    return v
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--start", default="1968-01-01")
     ap.add_argument("--end", default=None)
-    ap.add_argument("--cost-bps", type=float, default=DEFAULT_COST_BPS)
+    ap.add_argument("--cost-bps", type=_nonneg_float, default=DEFAULT_COST_BPS,
+                    help="per-rebalance trading cost in bps (non-negative)")
     ap.add_argument("--out-dir", default=ANALYSIS_DIR)
     args = ap.parse_args()
 
