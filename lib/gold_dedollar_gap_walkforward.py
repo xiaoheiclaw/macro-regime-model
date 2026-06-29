@@ -92,10 +92,10 @@ def _require_time_sorted(s: pd.Series) -> None:
     """The expanding calibrators iterate in positional order and treat earlier
     positions as 'history'. A non-time-sorted index would let a future month sit
     in an earlier position and leak into a past calibration — silently breaking the
-    no-look-ahead contract (codex PR#15 P2). A duplicate timestamp is just as bad:
+    no-look-ahead contract. A duplicate timestamp is just as bad:
     ``full_percentile_series`` would dict-collapse same-index rows and
     ``current_walk_forward_reading`` would crash on a non-scalar ``.loc[asof]``
-    (codex PR#15 R2 P2). Reject both loudly instead."""
+   . Reject both loudly instead."""
     if not s.index.is_monotonic_increasing:
         raise ValueError(
             "series index must be monotonic increasing for walk-forward "
@@ -111,7 +111,7 @@ def _finite_series(s: pd.Series) -> pd.Series:
     """Keep only finite values (drop NaN AND ±inf). Single source of truth for the
     'usable observation' filter so every口径 — full-sample percentile, the current
     reading's sample/degeneracy checks, the expanding calibrators, and the
-    forward-return summary — agrees on which residuals count (codex PR#15 R4 P2).
+    forward-return summary — agrees on which residuals count.
     Otherwise an inf in the residual would be ranked by one口径 and dropped by
     another, making the current verdict internally inconsistent."""
     return s[np.isfinite(s.astype(float))]
@@ -200,7 +200,7 @@ def full_percentile_series(s: pd.Series) -> pd.Series:
     measured against. Non-finite values (NaN AND ±inf) are excluded so this口径
     matches the expanding calibrators' ``np.isfinite`` filter — otherwise an inf in
     the residual would be ranked by full-sample but dropped by walk-forward, making
-    the two口径 inconsistent (codex PR#15 R3 P3)."""
+    the two口径 inconsistent."""
     _require_time_sorted(s)
     sv = _finite_series(s)
     if sv.empty:
@@ -231,7 +231,11 @@ def walk_forward_calibration(
 
     The frame is the data behind the report's "对照线" and the CSV for Show Page."""
     resid = resid.rename("resid")
-    z_full = full_zscore(resid).rename("z_full")
+    # z_full on the finite-only sample, so an inf residual cannot make z_full use a
+    # different sample than pct_full / z_wf / current_walk_forward_reading.z_full —
+    # the "同一残差同一口径对照" contract.
+    rv = _finite_series(resid)
+    z_full = full_zscore(rv).reindex(resid.index).rename("z_full")
     pct_full = full_percentile_series(resid)
     z_wf = expanding_zscore(resid, min_periods=warmup, exclude_current=exclude_current)
     pct_wf = expanding_percentile(
@@ -276,8 +280,9 @@ def current_walk_forward_reading(
     standardized against), so ``z_wf_excl`` is reported directly, not assumed small.
     A *large* percentile gap would be surprising — the look-ahead this PR really
     corrects lives in the historical episode reread, not in today's number."""
+    _validate_warmup(warmup)  # public-API contract even on empty/degenerate input
     _require_time_sorted(resid)
-    rv = _finite_series(resid)  # finite-only, matching the calibrators (codex R4 P2)
+    rv = _finite_series(resid)  # finite-only, matching the calibrators
     if rv.empty:
         return WalkForwardReading(
             asof=None, z_full=np.nan, pct_full=np.nan, z_wf_incl=np.nan,
@@ -301,7 +306,7 @@ def current_walk_forward_reading(
     return WalkForwardReading(
         asof=asof,
         # z_full on the finite-only sample (rv), so a non-finite residual cannot
-        # poison the headline z via full_zscore's dropna (codex PR#15 R4 P2).
+        # poison the headline z via full_zscore's dropna.
         z_full=float(full_zscore(rv).reindex([asof]).iloc[0]),
         pct_full=full_percentile(rv, latest),
         z_wf_incl=float(z_incl.reindex([asof]).iloc[0]),
@@ -423,7 +428,7 @@ def extreme_reclassification(
 
 def _summarize(x: pd.Series) -> Dict[str, float]:
     # finite-only: a 0-price or upstream glitch can make forward_log_return inf,
-    # which would poison mean/quantiles (codex PR#15 R4 P3).
+    # which would poison mean/quantiles.
     xv = _finite_series(x)
     if xv.empty:
         return {"n": 0, "mean": np.nan, "median": np.nan,
@@ -470,7 +475,10 @@ def walk_forward_conditional_table(
     rows = []
     for h in horizons:
         fwd = forward_log_return(price, h)
-        valid = flagged.index.intersection(fwd.dropna().index)
+        # finite-only observability, matching _summarize: an inf forward return
+        # (0-price / upstream glitch) must not be grouped-in then silently dropped,
+        # which would make the extreme/rest definition and the reported n disagree.
+        valid = flagged.index.intersection(_finite_series(fwd).index)
         fv = pct_wf.reindex(valid)
         ext_idx = fv[fv >= top_q].index
         rest_idx = fv[fv < top_q].index

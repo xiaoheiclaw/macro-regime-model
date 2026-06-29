@@ -185,7 +185,7 @@ def test_full_percentile_series_matches_pointwise_full_percentile():
 def test_full_percentile_series_excludes_nonfinite_like_expanding():
     """full_percentile_series and the expanding calibrator must filter non-finite
     values the same way (both drop ±inf), so the two口径 stay consistent on a
-    residual containing an inf (codex PR#15 R3 P3)."""
+    residual containing an inf."""
     n = 30
     rng = np.random.RandomState(77)
     s = pd.Series(rng.randn(n), index=_me_index(n))
@@ -202,7 +202,7 @@ def test_full_percentile_series_excludes_nonfinite_like_expanding():
 
 def test_current_reading_treats_inf_like_nan():
     """current_walk_forward_reading must filter ±inf the SAME way as the
-    calibrators (codex PR#15 R4 P2): an inf residual is a non-observation, so an
+    calibrators: an inf residual is a non-observation, so an
     inf-injected series gives an IDENTICAL reading to a NaN-injected one — the inf
     is never treated as a real (huge) observation that would distort the rank."""
     n = 60
@@ -221,9 +221,61 @@ def test_current_reading_treats_inf_like_nan():
     assert a.asof == b.asof
 
 
+def test_walk_forward_calibration_treats_inf_like_nan():
+    """walk_forward_calibration's z_full must use the finite-only sample, so an inf
+    residual yields the same frame as a NaN at that spot (same-口径-same-sample
+    contract across z_full / pct_full / z_wf)."""
+    n = 70
+    rng = np.random.RandomState(321)
+    resid = pd.Series(rng.randn(n), index=_me_index(n))
+    with_inf = resid.copy(); with_inf.iloc[25] = np.inf
+    with_nan = resid.copy(); with_nan.iloc[25] = np.nan
+    fa = walk_forward_calibration(with_inf, warmup=24)
+    fb = walk_forward_calibration(with_nan, warmup=24)
+    for col in ("z_full", "pct_full", "z_wf", "pct_wf", "pct_gap"):
+        _close_nan(fa[col], fb[col])
+
+
+def test_conditional_table_excludes_inf_forward_returns():
+    """An inf forward return (here from a 0 price) at a flagged+observable month
+    must be dropped BEFORE grouping, so the reported n is the finite count — not a
+    larger 'observable' set that then silently loses the inf in _summarize."""
+    n, warm, top_q, h = 60, 24, 0.9, 12
+    rng = np.random.RandomState(10)
+    resid = pd.Series(rng.randn(n), index=_me_index(n))
+    resid.iloc[30:40] = 4.0  # flagged extreme block, observable at 12m
+    price = pd.Series(np.exp(np.cumsum(rng.randn(n) * 0.02)), index=_me_index(n))
+    price.iloc[35] = 0.0      # → an inf forward log return (ln of/at a 0 price)
+    with np.errstate(divide="ignore"):  # the 0-price log is the point of the test
+        fwd = forward_log_return(price, h)
+        assert not np.isfinite(fwd.iloc[35])  # the inf we want excluded
+        tbl = walk_forward_conditional_table(
+            resid, price, horizons=(h,), top_q=top_q, warmup=warm)
+    prod_n = int(tbl["n"].sum())
+    pct = expanding_percentile(resid, min_periods=warm, exclude_current=False)
+    flagged = pct.dropna().index
+    finite_n = len(flagged.intersection(fwd[np.isfinite(fwd)].index))
+    dropna_n = len(flagged.intersection(fwd.dropna().index))  # would include the inf
+    # production groups on the FINITE set; a naive dropna would carry the inf
+    # month(s) into a group and then lose them in _summarize → inconsistent n.
+    assert prod_n == finite_n
+    assert dropna_n > finite_n
+
+
+def test_current_reading_validates_warmup_on_entry():
+    """warmup contract must hold at the public-API entry even for empty/constant
+    samples (not only on the non-degenerate path)."""
+    empty = pd.Series(dtype="float64")
+    const = pd.Series(np.full(30, 2.0), index=_me_index(30))
+    with pytest.raises(ValueError):
+        current_walk_forward_reading(empty, warmup=1)
+    with pytest.raises(ValueError):
+        current_walk_forward_reading(const, warmup=1)
+
+
 def test_summarize_excludes_inf_forward_returns():
     """_summarize must drop ±inf (e.g. a 0-price forward return) so mean/quantiles
-    are not poisoned (codex PR#15 R4 P3)."""
+    are not poisoned."""
     from lib.gold_dedollar_gap_walkforward import _summarize
     x = pd.Series([0.1, 0.2, np.inf, -np.inf, 0.3, np.nan])
     out = _summarize(x)
@@ -290,7 +342,7 @@ def test_extreme_reclassification_rejects_bad_q():
 def test_walk_forward_conditional_table_groups_match_independent_calibrator():
     """The extreme/rest split must match what the (independently-tested) expanding
     calibrator + forward-observability rule produce — not just 'a row exists'
-    (codex PR#15 P3). This catches an empty, miscounted, or leaking extreme set."""
+   . This catches an empty, miscounted, or leaking extreme set."""
     from lib.gold_dedollar_gap_walkforward import expanding_percentile
     n, warm, top_q, h = 90, 24, 0.9, 12
     rng = np.random.RandomState(10)
@@ -330,7 +382,7 @@ def test_walk_forward_conditional_table_rejects_bad_q():
 # ── 6. monotonic / unique index (no-lookahead) guard ─────────────────────
 def test_expanding_rejects_non_monotonic_index():
     """An out-of-order index would let a future month sit in an earlier position
-    and leak into a past calibration → must raise (codex PR#15 P2)."""
+    and leak into a past calibration → must raise."""
     idx = _me_index(10)
     shuffled = idx[[0, 1, 5, 2, 3, 4, 6, 7, 8, 9]]  # not increasing
     s = pd.Series(np.arange(10.0), index=shuffled)
@@ -342,7 +394,7 @@ def test_expanding_rejects_non_monotonic_index():
 
 def test_calibrators_reject_duplicate_index():
     """A duplicate timestamp collapses the percentile baseline and breaks the asof
-    read → every entry point must raise (codex PR#15 R2 P2)."""
+    read → every entry point must raise."""
     idx = _me_index(10)
     dup = idx[[0, 1, 2, 2, 3, 4, 5, 6, 7, 8]]  # sorted but index[3] duplicates [2]
     s = pd.Series(np.arange(10.0), index=dup)
@@ -385,7 +437,7 @@ def _load_script_module():
 
 def test_verdict_not_robust_without_evaluable_extreme():
     """No evaluable historical extreme (warm-up swallows them / warmup > history) ⇒
-    NO ex-ante evidence ⇒ must NOT return ROBUST (codex PR#15 P1)."""
+    NO ex-ante evidence ⇒ must NOT return ROBUST."""
     script = _load_script_module()
     n = 40
     rng = np.random.RandomState(99)
@@ -405,7 +457,7 @@ def test_verdict_not_robust_without_evaluable_extreme():
 def test_verdict_unknown_when_strict_excl_current_undefined():
     """If the verdict口径 (strict exclude-current) current pct is NaN — e.g.
     warmup == n_resid leaves include-current defined but exclude-current not — we
-    must NOT fall through to ROBUST even when agreement is high (codex PR#15 R2 P2)."""
+    must NOT fall through to ROBUST even when agreement is high."""
     from lib.gold_dedollar_gap_walkforward import (
         ExtremeReclassification, WalkForwardReading)
     script = _load_script_module()

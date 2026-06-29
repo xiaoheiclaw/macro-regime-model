@@ -92,10 +92,10 @@ def _cond_md(tbl: pd.DataFrame) -> str:
 
 def _wf_extreme_caveat(rc, cond_wf) -> str:
     """Dynamically describe how thin the ex-ante extreme sample is, from the actual
-    run (NOT hardcoded to a particular vintage; codex PR#15 P2).
+    run (NOT hardcoded to a particular vintage).
 
-    Two DISTINCT populations are reported and **labeled as such** (codex PR#15 R4
-    P2), not blended into one misleading clause:
+    Two DISTINCT populations are reported and **labeled as such**, not blended into
+    one misleading clause:
       * span — date range of the **full-sample-extreme months that are ALSO ex-ante
         extreme** (rc.episodes where wf_extreme; a subset of full-sample extremes).
       * ns — observable forward-return N per horizon for the **walk-forward extreme
@@ -132,8 +132,7 @@ def _verdict(rd, rc, cond_wf=None) -> tuple[str, str]:
     DOWNGRADE — current walk-forward pct drops materially below full-sample.
     UNKNOWN — no current reading, OR no evaluable historical extreme (e.g. warm-up
               swallows them all / warmup > evaluable history): then there is NO
-              ex-ante evidence to certify robustness, so we must NOT claim ROBUST
-              (codex PR#15 P1).
+              ex-ante evidence to certify robustness, so we must NOT claim ROBUST.
     """
     pct_full = rd.pct_full
     pct_wf = rd.pct_wf_excl  # strict ex-ante current read
@@ -144,7 +143,7 @@ def _verdict(rd, rc, cond_wf=None) -> tuple[str, str]:
     if not np.isfinite(pct_wf):
         # the verdict口径 is strict exclude-current; if it is undefined (e.g.
         # warmup == n_resid → include-current defined but exclude-current is not)
-        # we cannot certify on it. Don't fall through to ROBUST (codex PR#15 R2 P2).
+        # we cannot certify on it. Don't fall through to ROBUST.
         return ("UNKNOWN",
                 f"strict ex-ante 当前分位不可用(warm-up={rd.warmup} 相对残差样本 "
                 f"n={rd.n_resid} 过大,exclude-current baseline 不足),无法以该口径裁决;"
@@ -193,8 +192,8 @@ def main() -> None:
     ap.add_argument("--out-dir", default=ANALYSIS_DIR)
     args = ap.parse_args()
 
-    # fail fast on bad CLI args — BEFORE building the panel/DI/regression (codex
-    # PR#15 R3 P3). Mirrors the lib-level guards so the error is immediate.
+    # fail fast on bad CLI args — BEFORE building the panel/DI/regression.
+    # Mirrors the lib-level guards so the error is immediate.
     if args.warmup < 2:
         ap.error("--warmup must be >= 2")
     if not 0.0 < args.top_q < 1.0:
@@ -279,10 +278,26 @@ def main() -> None:
          ["walk-forward · exclude-current (strict ex-ante)",
           _fmt(rd.z_wf_excl), _fmt_pct(rd.pct_wf_excl)]]))
     P.append("")
-    P.append(f"**裁决数字:全样本 {_fmt_pct(rd.pct_full)} 分位在 walk-forward 下 = "
-             f"{_fmt_pct(rd.pct_wf_excl)}(strict ex-ante)/ {_fmt_pct(rd.pct_wf_incl)}"
-             "(include)。** include 与全样本恒等;exclude 仅去最新点,故二者均≈全样本"
-             "——当前读数对标定口径稳健。\n")
+    # branch the §1 takeaway on the ACTUAL reading so it never contradicts the
+    # verdict (strict ex-ante NaN / large drop / robust).
+    if not np.isfinite(rd.pct_wf_excl):
+        s1_take = ("**裁决数字:strict ex-ante(exclude-current)当前分位不可用**"
+                   f"(warm-up={rd.warmup} 相对残差 n={rd.n_resid} 过大);仅 "
+                   f"include-current = {_fmt_pct(rd.pct_wf_incl)}(与全样本恒等)。"
+                   "本节不以 strict 口径下结论,见裁决。")
+    else:
+        drop_pp = (rd.pct_full - rd.pct_wf_excl) * 100
+        if drop_pp > 15:
+            s1_take = (f"**裁决数字:全样本 {_fmt_pct(rd.pct_full)} 分位在 strict "
+                       f"ex-ante 下降到 {_fmt_pct(rd.pct_wf_excl)}(降 {drop_pp:.0f}pp)"
+                       "**——当前读数对标定口径**不**稳健,见降级裁决。")
+        else:
+            s1_take = (f"**裁决数字:全样本 {_fmt_pct(rd.pct_full)} 分位在 walk-forward "
+                       f"下 = {_fmt_pct(rd.pct_wf_excl)}(strict ex-ante)/ "
+                       f"{_fmt_pct(rd.pct_wf_incl)}(include)。** include 与全样本恒等;"
+                       f"exclude 仅去最新点(降 {drop_pp:.0f}pp),故二者均≈全样本——"
+                       "当前分位对标定口径稳健。")
+    P.append(s1_take + "\n")
 
     P.append("## 2. 全样本 vs walk-forward 标定:整段轨迹的分位差\n")
     P.append("对每个历史月,比较全样本分位(偷看未来)与 expanding 分位(ex-ante)。"
