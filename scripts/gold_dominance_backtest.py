@@ -334,7 +334,11 @@ def main() -> None:
 
     # ── write equity-curve CSV ──
     os.makedirs(DATA_DIR, exist_ok=True)
-    curves = {label_: equity_curve(bt) for label_, bt in backtests.items()}
+    # clip every curve to the common investable window [cstart, cend] before
+    # rebasing to $1, so S0 (invested from month 1) doesn't compound over extra
+    # early months that S1/SD spend in warm-up — the CSV curves are then
+    # same-track comparable, matching the metrics table.
+    curves = {label_: equity_curve(bt.loc[cstart:cend]) for label_, bt in backtests.items()}
     eq = pd.DataFrame(curves)
     eq_path = os.path.join(DATA_DIR, f"gold_regime_dominance_curves_{file_stamp}.csv")
     eq.to_csv(eq_path)

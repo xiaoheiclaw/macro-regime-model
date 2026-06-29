@@ -58,8 +58,6 @@ from lib.gold_trend_timing import (  # noqa: F401  (re-exported for convenience)
     vol_scale,
 )
 
-ANNUAL = 12
-
 # ── Standard parameters (NOT tuned — picked from conventional values; the
 #    sensitivity band over corr_window ∈ {24, 36, 48} is reported by the runner) ──
 DEFAULT_CORR_WINDOW = 36        # months for the rolling gold–real-rate relation
@@ -221,12 +219,17 @@ def dominance_probability(
     if cb_demand is not None:
         cb = cb_demand.reindex(gold_nominal.index)
         cb_mean = cb.rolling(window, min_periods=window).mean()
-        # sustained net buying (trailing mean > 0) → confirm at full strength.
-        # skip-na max so cb can only RAISE p (per contract): where cb_mean is NaN
-        # (pre-2010 / warm-up) p is preserved unchanged, never blanked to NaN.
         cb_pos = (cb_mean > 0).astype(float)
         cb_pos[cb_mean.isna()] = np.nan
-        p = pd.concat([p, cb_pos], axis=1).max(axis=1, skipna=True)
+        # CB demand can only CONFIRM a regime the gold-real-rate fingerprint
+        # already defines — it must never MANUFACTURE one where the base
+        # probability is NaN (no real rate / warm-up). Mask cb to NaN wherever
+        # base p is NaN, so a positive cb on a months with no base signal does
+        # NOT fabricate a 1.0 (preserves the "no real rate → no default
+        # classification" honesty contract). Where base exists, skip-na max
+        # lets cb raise p (never lower it).
+        confirm = cb_pos.where(p.notna())
+        p = pd.concat([p, confirm], axis=1).max(axis=1, skipna=True)
 
     return p
 
@@ -281,7 +284,16 @@ def s3_dominance(
     trend = trend_exposure(panel["gold_nominal"], lookbacks)  # NaN during warm-up
     vs = vol_scale(panel["gold_ret"], target_vol, vol_window)  # NaN during warm-up
 
-    raw = (1.0 - prob) * rr_falling + prob * trend
+    # weight-masked blend: a zero-weight branch must contribute exactly 0, even
+    # if its signal is NaN there (plain `0 * NaN` is NaN and would poison the
+    # result — e.g. at prob=1 SD must equal S1 trend even where rr_falling is
+    # NaN from a long rr_window or a missing real rate). Each branch keeps its
+    # signal only where its weight is non-zero, else 0; so the result is NaN
+    # ONLY when a *non-zero-weight* branch's signal is genuinely missing.
+    w_rr = 1.0 - prob
+    rr_part = rr_falling.where(w_rr != 0.0, 0.0) * w_rr
+    trend_part = trend.where(prob != 0.0, 0.0) * prob
+    raw = rr_part + trend_part
     return (raw * vs).clip(lower=0.0, upper=1.0)
 
 

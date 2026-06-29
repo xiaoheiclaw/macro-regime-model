@@ -152,8 +152,9 @@ def test_divergence_share_bounds_and_warmup():
     div = divergence_share(gold, rr, window=24)
     valid = div.dropna()
     assert (valid >= 0.0).all() and (valid <= 1.0).all()
-    # warm-up (first 24 months) is NaN, not a silently-wrong number
-    assert div.iloc[:23].isna().all()
+    # warm-up (first `window` months) is NaN, not a silently-wrong number — the
+    # first diff() NaN is masked so min_periods=window requires `window` real obs
+    assert div.iloc[:24].isna().all()
 
 
 def test_level_divergence_catches_2022_style_break():
@@ -333,6 +334,19 @@ def test_no_real_rate_yields_all_nan_no_default_label():
     # not a crash and not a fake cash stub
     bt = run_backtest(s3, panel["gold_ret"], panel["tbill_ret"])
     assert len(bt) == 0
+
+
+def test_cb_demand_cannot_manufacture_regime_without_base_fingerprint():
+    """P1 regression: CB demand only CONFIRMS a regime the gold-real-rate
+    fingerprint already defines — it must never MANUFACTURE one. With the real
+    rate entirely missing (base probability all-NaN), even a strongly positive
+    cb_demand must leave the probability all-NaN (the "no real rate → no default
+    classification" honesty contract)."""
+    panel = _panel()
+    rr_nan = pd.Series(np.nan, index=panel.index)
+    cb = pd.Series(10.0, index=panel.index)        # sustained heavy net buying
+    p = dominance_probability(panel["gold_nominal"], rr_nan, window=36, cb_demand=cb)
+    assert p.isna().all()                          # NOT fabricated to 1.0
 
 
 def test_cb_demand_none_is_default_and_positive_cb_only_raises_prob():
