@@ -30,9 +30,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from lib.gold_s1_subperiod import (  # noqa: E402
     COST_GRID,
-    METRIC_COLS,
     POST2000_SEGMENT,
-    PRIMARY_VARIANT,
+    PRIMARY_LABEL,
     S0_LABEL,
     S1_VARIANTS,
     SUBPERIOD_SEGMENTS,
@@ -40,6 +39,8 @@ from lib.gold_s1_subperiod import (  # noqa: E402
     common_window,
     paired_net_diff_stats,
     segment_metrics,
+    segment_window,
+    verdict,
 )
 from lib.gold_trend_timing import (  # noqa: E402
     DEFAULT_COST_BPS,
@@ -48,8 +49,6 @@ from lib.gold_trend_timing import (  # noqa: E402
     slice_segment,
 )
 from lib.paths import ANALYSIS_DIR, DATA_DIR  # noqa: E402
-
-PRIMARY_LABEL = f"S1_{PRIMARY_VARIANT}"
 
 
 def run_all(panel: pd.DataFrame, cost_bps: float) -> Dict[str, pd.DataFrame]:
@@ -62,13 +61,19 @@ def run_all(panel: pd.DataFrame, cost_bps: float) -> Dict[str, pd.DataFrame]:
 
 
 # ── markdown helpers ───────────────────────────────────────────────────────
+def _cell(x) -> str:
+    """Escape a value for a GitHub-flavoured markdown table cell: a literal `|`
+    would start a new column and a newline would break the row."""
+    return str(x).replace("|", "\\|").replace("\n", "<br>")
+
+
 def _md_table(df: pd.DataFrame, index_name: str = "strategy") -> str:
     cols = list(df.columns)
-    header = f"| {index_name} | " + " | ".join(cols) + " |"
+    header = f"| {_cell(index_name)} | " + " | ".join(_cell(c) for c in cols) + " |"
     sep = "| --- | " + " | ".join("---" for _ in cols) + " |"
     rows = [header, sep]
     for idx, row in df.iterrows():
-        rows.append(f"| {idx} | " + " | ".join(str(row[c]) for c in cols) + " |")
+        rows.append(f"| {_cell(idx)} | " + " | ".join(_cell(row[c]) for c in cols) + " |")
     return "\n".join(rows)
 
 
@@ -94,127 +99,6 @@ def _excess_sharpe(seg_tbl: pd.DataFrame, variant_label: str) -> float:
     if variant_label not in seg_tbl.index or S0_LABEL not in seg_tbl.index:
         return float("nan")
     return seg_tbl.loc[variant_label, "sharpe"] - seg_tbl.loc[S0_LABEL, "sharpe"]
-
-
-def verdict(
-    seg_by_cost: Dict[float, Dict[str, pd.DataFrame]],
-    paired_by_cost: Dict[float, Dict[str, float]],
-) -> str:
-    """Adjudicate the post-2000 kill condition on the PRIMARY (3/6/12 blend)
-    variant — along BOTH axes, because they disagree and the honest answer is
-    two-dimensional:
-
-      • risk-adjusted (Sharpe AND Calmar, the same caliber PR#5 used): does S1
-        beat S0 net of cost at the realistic 10bps and punitive 25bps?
-      • raw return (CAGR + the paired monthly net-return excess and its CI): is
-        the return excess positive and distinguishable from zero?
-
-    A timing overlay can win the first while losing the second — that *is* the
-    'stress insurance, not uniform alpha' pattern. Reporting only one axis would
-    be the cherry-pick. Robustness (how many variants beat S0 on Sharpe
-    post-2000 @10bps) is reported but does not flip the headline."""
-    lines = ["## Verdict — is S1 still alive after 2000? (in-sample, ex-post)\n"]
-
-    post = POST2000_SEGMENT
-
-    def row(cost, label):
-        return seg_by_cost[cost][post].loc[label]
-
-    # Guard: need valid metrics on the post-2000 window.
-    try:
-        s1_10 = row(10.0, PRIMARY_LABEL)
-        s0_10 = row(10.0, S0_LABEL)
-        s1_25 = row(25.0, PRIMARY_LABEL)
-        s0_25 = row(25.0, S0_LABEL)
-    except KeyError:
-        return "## Verdict\n\n**Cannot adjudicate: post-2000 window missing from results.**"
-    if not (pd.notna(s1_10["sharpe"]) and pd.notna(s0_10["sharpe"])
-            and pd.notna(s1_10["calmar"]) and pd.notna(s0_10["calmar"])):
-        return ("## Verdict\n\n**Insufficient sample on the post-2000 window "
-                "(NaN Sharpe/Calmar) — cannot adjudicate. Widen the data.**")
-
-    def risk_adj_beats(s1, s0):  # PR#5 caliber: Sharpe AND Calmar
-        return (s1["sharpe"] > s0["sharpe"]) and (s1["calmar"] > s0["calmar"])
-
-    ra_10 = risk_adj_beats(s1_10, s0_10)
-    ra_25 = risk_adj_beats(s1_25, s0_25)
-    ret_10 = s1_10["cagr"] > s0_10["cagr"]   # raw-return win @10bps
-    ret_25 = s1_25["cagr"] > s0_25["cagr"]
-
-    pj = paired_by_cost[10.0]
-    ci_positive = bool(pj["ci_excludes_zero"]) and pj["ann_mean"] > 0
-    ci_negative = bool(pj["ci_excludes_zero"]) and pj["ann_mean"] < 0
-
-    # robustness across variants @10bps (risk-adjusted)
-    tbl10 = seg_by_cost[10.0][post]
-    variant_labels = [f"S1_{lbl}" for lbl, _, _ in S1_VARIANTS]
-    n_beat = sum(
-        1 for v in variant_labels
-        if v in tbl10.index and pd.notna(tbl10.loc[v, "sharpe"])
-        and tbl10.loc[v, "sharpe"] > tbl10.loc[S0_LABEL, "sharpe"]
-    )
-    n_var = len(variant_labels)
-
-    lines.append(f"Post-2000 window **{post}**, primary variant **{PRIMARY_VARIANT}** "
-                 "(PR#5's 3/6/12 blend), net of cost. **Two axes, read both:**\n")
-    lines.append(f"- Risk-adjusted @10bps: S1 Sharpe {s1_10['sharpe']:.2f} vs S0 "
-                 f"{s0_10['sharpe']:.2f}, Calmar {s1_10['calmar']:.2f} vs {s0_10['calmar']:.2f}, "
-                 f"MaxDD {s1_10['max_dd']*100:.1f}% vs {s0_10['max_dd']*100:.1f}% → "
-                 f"{'S1 WINS' if ra_10 else 'S1 does not win'}")
-    lines.append(f"- Risk-adjusted @25bps: S1 Sharpe {s1_25['sharpe']:.2f} vs S0 "
-                 f"{s0_25['sharpe']:.2f}, Calmar {s1_25['calmar']:.2f} vs {s0_25['calmar']:.2f} → "
-                 f"{'S1 WINS' if ra_25 else 'S1 does not win'}")
-    lines.append(f"- Raw return @10bps: S1 CAGR {s1_10['cagr']*100:.1f}% vs S0 "
-                 f"{s0_10['cagr']*100:.1f}% → "
-                 f"{'S1 higher' if ret_10 else 'S1 GIVES UP return'}")
-    lines.append(f"- Paired monthly net excess (S1−S0) @10bps: ann {pj['ann_mean']*100:.1f}%, "
-                 f"t={pj['t_stat']:.2f}, 95% CI [{pj['ci_lo']*100:.1f}%, {pj['ci_hi']*100:.1f}%] "
-                 f"→ {'excludes zero' if pj['ci_excludes_zero'] else 'includes zero (NOT distinguishable from luck)'}")
-    lines.append(f"- Robustness: {n_beat}/{n_var} S1 variants beat S0 on Sharpe over {post} @10bps")
-    lines.append("")
-
-    ra = ra_10 and ra_25         # risk-adjusted win at BOTH realistic & punitive cost
-    ret = ret_10 and ret_25       # raw-return win at BOTH costs
-    sig_phrase = ("distinguishable from zero" if ci_positive
-                  else "significantly NEGATIVE" if ci_negative
-                  else "statistically indistinguishable from zero")
-
-    if not ra:
-        lines.append(
-            "**② S1 edge has DECAYED.** After 2000 it does not even win risk-adjusted "
-            "net of cost — its full-sample Sharpe is largely the 1968–2000 bear it "
-            "sidestepped. For a trader operating today, 'use S1 to trade gold' is "
-            "close to void: just hold GLD/physical, or don't single-bet gold. "
-            "Honest kill.")
-    elif ra and ret and ci_positive:
-        lines.append(
-            "**① S1 STILL HAS EDGE post-2000 — on both axes.** It beats buy-and-hold "
-            "risk-adjusted *and* on raw return at realistic and punitive costs, with "
-            "the paired excess distinguishable from zero in-sample. The S1 story is "
-            "not *only* 1968–2000 bear-avoidance. Worth hardening with a proper "
-            "walk-forward / out-of-sample test before trading.")
-    elif ra and ret:  # both axes nominally, but the return excess is not significant
-        lines.append(
-            "**①a S1 LEANS POSITIVE on both axes post-2000, but the return edge is "
-            f"not significant.** It wins risk-adjusted (higher Sharpe & Calmar) net of "
-            "cost at 10 and 25bps and is nominally ahead on raw CAGR too — yet the "
-            f"paired monthly excess is {sig_phrase}, so the return advantage is not "
-            "reliably separable from luck on this single path. Promising, not proven: "
-            "the risk-adjusted edge is the solid part; a walk-forward test is needed "
-            "before leaning on the return premium.")
-    else:  # ra and not ret → risk-reducer, gives up raw return
-        lines.append(
-            "**①′ MIXED — S1 is a risk-reducer post-2000, NOT a return-enhancer.** "
-            "It still wins risk-adjusted (higher Sharpe & Calmar, roughly half the "
-            "drawdown) net of cost at both 10 and 25bps, but it GIVES UP raw CAGR to "
-            f"buy-and-hold and the paired return excess is {sig_phrase}. This is the "
-            "same 'stress insurance, not uniform alpha' character the v2 SP-CVaR layer "
-            "shows. Read-through: the full-sample Sharpe 0.63 *return* edge was indeed "
-            "largely 1968–2000 bear-avoidance and has decayed — but the "
-            "*drawdown-control* edge persists. **For a drawdown-averse holder S1 is "
-            "still worth a walk-forward test; for a total-return maximiser, just "
-            "hold the metal.**")
-    return "\n".join(lines)
 
 
 def main() -> None:
@@ -251,11 +135,14 @@ def main() -> None:
             for name, s, e in SUBPERIOD_SEGMENTS
         }
 
-    # Paired post-2000 significance (S1 primary vs S0) at every cost.
+    # Paired post-2000 significance (S1 primary vs S0) at every cost. Window
+    # bounds come from SUBPERIOD_SEGMENTS via POST2000_SEGMENT — the SAME source
+    # the segment tables and verdict use, so they can never silently desync.
+    post_start, post_end = segment_window(POST2000_SEGMENT)
     paired_by_cost: Dict[float, Dict[str, float]] = {}
     for c, bts in bt_by_cost.items():
-        lo = max(cstart, pd.Timestamp("2000-01-01"))
-        hi = min(cend, pd.Timestamp("2026-12-31"))
+        lo = max(cstart, pd.Timestamp(post_start))
+        hi = min(cend, pd.Timestamp(post_end))
         a = slice_segment(bts[PRIMARY_LABEL], lo, hi)
         b = slice_segment(bts[S0_LABEL], lo, hi)
         paired_by_cost[c] = paired_net_diff_stats(a, b)

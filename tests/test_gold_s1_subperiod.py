@@ -38,8 +38,10 @@ from lib.gold_s1_subperiod import (
     paired_net_diff_stats,
     s1_majority_vote,
     segment_metrics,
+    segment_window,
     trade_count,
     variant_position,
+    verdict,
 )
 from lib.gold_trend_timing import run_backtest, s0_buy_hold
 
@@ -314,6 +316,15 @@ def test_segments_cover_post2000_window():
     assert {"1968-1980", "1980-2000", "2000-2011", "2011-2015", "2016-2026"} <= names
 
 
+def test_segment_window_is_single_source_of_truth():
+    # The paired-CI window and the report tables both resolve bounds here, so
+    # they cannot desync. Bounds must match the constant verbatim.
+    s, e = segment_window(POST2000_SEGMENT)
+    assert (POST2000_SEGMENT, s, e) in SUBPERIOD_SEGMENTS
+    with pytest.raises(KeyError, match="unknown segment"):
+        segment_window("not-a-segment")
+
+
 # ── trade_count boundary (prev_held) — codex P2a ─────────────────────────────
 def test_trade_count_prev_held_carried_position_is_zero():
     # A position carried in from before the slice (prev_held invested) and held
@@ -398,17 +409,7 @@ def test_paired_hac_se_widens_with_positive_autocorrelation():
     assert se_hac > se_iid  # autocorrelation inflates the honest se
 
 
-# ── verdict() branch coverage — codex P1 ──────────────────────────────────────
-import importlib.util as _ilu  # noqa: E402
-
-_spec = _ilu.spec_from_file_location(
-    "gold_s1_subperiod_script",
-    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                 "scripts", "gold_s1_subperiod.py"),
-)
-gss = _ilu.module_from_spec(_spec)
-_spec.loader.exec_module(gss)
-
+# ── verdict() branch coverage — codex P1 (verdict now lives in lib) ──────────
 _SEG_COLS = ["sharpe", "calmar", "cagr", "max_dd", "longest_underwater_m",
              "max_consec_loss_m", "ann_turnover", "n_trades", "hit_rate", "n_months"]
 
@@ -444,7 +445,7 @@ def _paired(ann_mean, ci_lo, ci_hi):
 def test_verdict_both_axes_significant():
     s0 = {"sharpe": 0.5, "calmar": 0.3, "cagr": 0.05, "max_dd": -0.4}
     s1 = {"sharpe": 0.9, "calmar": 0.7, "cagr": 0.09, "max_dd": -0.2}
-    out = gss.verdict(_seg_by_cost(s0, s1, s0, s1), _paired(0.04, 0.01, 0.07))
+    out = verdict(_seg_by_cost(s0, s1, s0, s1), _paired(0.04, 0.01, 0.07))
     assert "on both axes" in out and "STILL HAS EDGE" in out
 
 
@@ -453,7 +454,7 @@ def test_verdict_both_axes_but_not_significant():
     # "GIVES UP raw CAGR" — it should land in the ①a 'leans positive' branch.
     s0 = {"sharpe": 0.5, "calmar": 0.3, "cagr": 0.05, "max_dd": -0.4}
     s1 = {"sharpe": 0.9, "calmar": 0.7, "cagr": 0.09, "max_dd": -0.2}
-    out = gss.verdict(_seg_by_cost(s0, s1, s0, s1), _paired(0.02, -0.01, 0.05))
+    out = verdict(_seg_by_cost(s0, s1, s0, s1), _paired(0.02, -0.01, 0.05))
     assert "LEANS POSITIVE on both axes" in out
     assert "GIVES UP" not in out  # must not contradict the data
 
@@ -462,7 +463,7 @@ def test_verdict_risk_reducer_gives_up_return():
     # S1 wins risk-adjusted but LOSES on CAGR → ①′ mixed risk-reducer.
     s0 = {"sharpe": 0.74, "calmar": 0.28, "cagr": 0.111, "max_dd": -0.393}
     s1 = {"sharpe": 0.86, "calmar": 0.51, "cagr": 0.095, "max_dd": -0.187}
-    out = gss.verdict(_seg_by_cost(s0, s1, s0, s1), _paired(-0.019, -0.045, 0.007))
+    out = verdict(_seg_by_cost(s0, s1, s0, s1), _paired(-0.019, -0.045, 0.007))
     assert "risk-reducer post-2000, NOT a return-enhancer" in out
     assert "GIVES UP raw CAGR" in out
 
@@ -471,7 +472,7 @@ def test_verdict_decayed_when_not_risk_adjusted_winner():
     # S1 loses risk-adjusted (lower Sharpe) → ② decayed, regardless of CAGR.
     s0 = {"sharpe": 0.9, "calmar": 0.6, "cagr": 0.10, "max_dd": -0.2}
     s1 = {"sharpe": 0.6, "calmar": 0.3, "cagr": 0.12, "max_dd": -0.3}
-    out = gss.verdict(_seg_by_cost(s0, s1, s0, s1), _paired(-0.01, -0.05, 0.03))
+    out = verdict(_seg_by_cost(s0, s1, s0, s1), _paired(-0.01, -0.05, 0.03))
     assert "DECAYED" in out
 
 
@@ -481,7 +482,7 @@ def test_verdict_requires_both_costs_for_risk_adjusted_win():
     s1_10 = {"sharpe": 0.9, "calmar": 0.7, "cagr": 0.09, "max_dd": -0.2}
     s0_25 = {"sharpe": 0.9, "calmar": 0.7, "cagr": 0.09, "max_dd": -0.2}  # S0 ahead @25
     s1_25 = {"sharpe": 0.6, "calmar": 0.3, "cagr": 0.05, "max_dd": -0.3}
-    out = gss.verdict(_seg_by_cost(s0_10, s1_10, s0_25, s1_25),
+    out = verdict(_seg_by_cost(s0_10, s1_10, s0_25, s1_25),
                       _paired(0.02, 0.005, 0.04))
     assert "DECAYED" in out
 
@@ -489,5 +490,5 @@ def test_verdict_requires_both_costs_for_risk_adjusted_win():
 def test_verdict_guards_nan_metrics():
     s0 = {"sharpe": float("nan"), "calmar": 0.3, "cagr": 0.05, "max_dd": -0.4}
     s1 = {"sharpe": 0.9, "calmar": 0.7, "cagr": 0.09, "max_dd": -0.2}
-    out = gss.verdict(_seg_by_cost(s0, s1, s0, s1), _paired(0.04, 0.01, 0.07))
+    out = verdict(_seg_by_cost(s0, s1, s0, s1), _paired(0.04, 0.01, 0.07))
     assert "cannot adjudicate" in out.lower()
