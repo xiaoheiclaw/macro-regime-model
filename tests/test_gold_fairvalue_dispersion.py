@@ -455,4 +455,25 @@ def test_landmarks_snap_to_month_end():
     assert lm.loc["2011-09 nominal peak", "dispersion"] == disp.loc[pd.Timestamp("2011-09-30")]
     # '2020-03' → 2020-03-31, not 2020-02-29
     assert lm.loc["2020-03 COVID trough", "month"] == "2020-03"
+    # '1980-01' predates this 2007-start sample → out_of_sample, NOT the first
+    # sample month's reading masquerading as 1980's
+    assert lm.loc["1980-01 nominal peak", "month"] == "out_of_sample"
+    assert pd.isna(lm.loc["1980-01 nominal peak", "dispersion"])
+    assert lm.loc["1980-01 nominal peak", "n_lenses"] == 0
+
+
+def test_min_int_argparse_type_rejects_below_minimum():
+    """--disp-window 1 must fail at PARSE time (argparse type), not crash later
+    inside dispersion_rank's (raw-1)/(window-1) div-by-0."""
+    import argparse
+    from scripts.gold_dispersion_backtest import _min_int
+    check = _min_int(2)
+    assert check("2") == 2
+    assert check("120") == 120
+    with pytest.raises(argparse.ArgumentTypeError):
+        check("1")
+    with pytest.raises(argparse.ArgumentTypeError):
+        check("0")
+    with pytest.raises(argparse.ArgumentTypeError):
+        check("not-an-int")
 

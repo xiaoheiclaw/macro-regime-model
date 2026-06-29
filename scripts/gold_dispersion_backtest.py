@@ -167,7 +167,14 @@ def landmarks_table(
         # snap to MONTH-END so '2011-09' matches the 2011-09-30 row, not 2011-08-31
         ts = _month_end(ds)
         valid = panel_index[panel_index <= ts]
-        idx = valid[-1] if len(valid) else panel_index[0]
+        if len(valid) == 0:
+            # landmark predates the sample (e.g. --start 1990 vs the 1980 peak) —
+            # do NOT substitute the first sample month, which would mis-label ITS
+            # reading as the landmark's. Report the landmark honestly as absent.
+            rows.append({"landmark": name, "month": "out_of_sample",
+                         "dispersion": np.nan, "rank": np.nan, "n_lenses": 0})
+            continue
+        idx = valid[-1]
         rows.append({
             "landmark": name,
             "month": f"{idx:%Y-%m}",
@@ -275,11 +282,21 @@ def _nonneg_float(x: str) -> float:
     return v
 
 
-def _pos_int(x: str) -> int:
-    v = int(x)
-    if v <= 0:
-        raise argparse.ArgumentTypeError("must be a positive integer")
-    return v
+def _min_int(minimum: int):
+    """argparse type factory: an integer >= `minimum`, else ArgumentTypeError at
+    PARSE time (not a downstream traceback). dispersion_rank requires window>=2
+    (a 1-month rank is degenerate — (raw-1)/(window-1) is a div-by-0), so
+    --disp-window uses _min_int(2); --calib-window too, since a 1-month OLS fit
+    has undefined variance (ddof=1)."""
+    def _check(x: str) -> int:
+        try:
+            v = int(x)
+        except ValueError:
+            raise argparse.ArgumentTypeError("must be an integer")
+        if v < minimum:
+            raise argparse.ArgumentTypeError(f"must be >= {minimum}, got {v}")
+        return v
+    return _check
 
 
 def main() -> None:
@@ -288,10 +305,10 @@ def main() -> None:
     ap.add_argument("--end", default=None)
     ap.add_argument("--cost-bps", type=_nonneg_float, default=DEFAULT_COST_BPS,
                     help="per-rebalance trading cost in bps (non-negative)")
-    ap.add_argument("--calib-window", type=_pos_int, default=DEFAULT_CALIB_WINDOW,
-                    help="months each estimator is calibrated on (default 120)")
-    ap.add_argument("--disp-window", type=_pos_int, default=DEFAULT_DISP_WINDOW,
-                    help="months for the dispersion rank rolling window (default 120)")
+    ap.add_argument("--calib-window", type=_min_int(2), default=DEFAULT_CALIB_WINDOW,
+                    help="months each estimator is calibrated on (>=2, default 120)")
+    ap.add_argument("--disp-window", type=_min_int(2), default=DEFAULT_DISP_WINDOW,
+                    help="months for the dispersion rank rolling window (>=2, default 120)")
     ap.add_argument("--out-dir", default=ANALYSIS_DIR)
     args = ap.parse_args()
 
@@ -476,15 +493,18 @@ def main() -> None:
                  "level CV would measure that offset, not turn disagreement. The gap "
                  "std is shift-invariant: a constant added to every gap leaves it "
                  "unchanged, so the signal can never trade a single lens's bias.\n")
-    parts.append("- **No look-ahead**: every estimator value at t uses a trailing "
-                 "rolling window only; the dispersion rank is a trailing percentile; "
-                 "the position decided at t is held t+1 via the shared engine's "
-                 "`.shift(1)`. Standard windows (calib 120m, rank 120m) — NOT tuned; "
-                 "the {60,120} rank band is reported.\n")
-    parts.append("- **Warm-up**: S4 needs estimator-calib (120m) AND dispersion-rank "
-                 "(120m) windows to fill, so it is investable only from the late 1980s; "
-                 "the 1980 peak is therefore a descriptive anchor, outside S4's traded "
-                 "window. The common investable window above makes this explicit.\n")
+    parts.append(f"- **No look-ahead**: every estimator value at t uses a trailing "
+                 "rolling window only; the dispersion rank is a trailing rank; the "
+                 "position decided at t is held t+1 via the shared engine's "
+                 f"`.shift(1)`. Standard windows (calib {args.calib_window}m, rank "
+                 f"{args.disp_window}m) — NOT tuned; the {{60,120}} rank band is "
+                 "reported.\n")
+    parts.append(f"- **Warm-up**: S4 needs estimator-calib ({args.calib_window}m) AND "
+                 f"dispersion-rank ({args.disp_window}m) windows to fill, so it is "
+                 "investable only once both fill — later than S1 (with the standard "
+                 "120m/120m defaults, the late 1980s). The 1980 peak is therefore a "
+                 "descriptive anchor, outside S4's traded window; the common investable "
+                 "window above makes this explicit.\n")
     parts.append("## Provenance\n")
     for k, v in dp.notes.items():
         parts.append(f"- **{k}**: {v}")
