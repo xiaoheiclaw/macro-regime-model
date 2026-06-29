@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Macro regime attribution and allocation research"
 requires-python = ">=3.12"
 dependencies = [
-    "pandas>=2.2",  # "ME" month-end freq alias (introduced in pandas 2.2)
+    "pandas>=2.2,<3.0",  # "ME" alias needs >=2.2; <3.0 avoids pandas 3.0.x resample SIGBUS w/ numpy 2.4
     "numpy>=1.26",
     "scipy>=1.12",
     "yfinance>=0.2",
