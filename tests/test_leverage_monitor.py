@@ -62,8 +62,8 @@ def _fake_shiller() -> pd.Series:
     return pd.Series(p, index=yms, name="P")
 
 
-def _fake_fred() -> pd.Series:
-    # Overlaps the tail of Shiller; chain_sp keeps a single level (identity here).
+def _fake_yahoo_sp500() -> pd.Series:
+    # Yahoo ^GSPC stand-in; overlaps the tail of Shiller so chain_sp anchors cleanly.
     yms = _yms()[-3:]
     return pd.Series(_fake_shiller().loc[yms].values, index=yms, name="close")
 
@@ -72,7 +72,7 @@ def _fake_fred() -> pd.Series:
 def signals(monkeypatch):
     monkeypatch.setattr(lm, "fetch_finra", _fake_finra)
     monkeypatch.setattr(lm, "fetch_shiller_sp", _fake_shiller)
-    monkeypatch.setattr(lm, "fetch_sp500_monthly", _fake_fred)
+    monkeypatch.setattr(lm, "fetch_sp500_monthly", _fake_yahoo_sp500)
     df = lm.build_series()
     return lm.compute(df)
 
@@ -107,7 +107,7 @@ def test_build_series_handles_excel_date_formats(monkeypatch, date_fmt):
     correct latest month)."""
     monkeypatch.setattr(lm, "fetch_finra", lambda: _fake_finra(date_fmt))
     monkeypatch.setattr(lm, "fetch_shiller_sp", _fake_shiller)
-    monkeypatch.setattr(lm, "fetch_sp500_monthly", _fake_fred)
+    monkeypatch.setattr(lm, "fetch_sp500_monthly", _fake_yahoo_sp500)
     df = lm.build_series()
     assert not df.empty
     assert df["ym"].iloc[-1] == _yms()[-1]
@@ -138,3 +138,55 @@ def test_chain_sp_requires_overlap():
     ext = pd.Series([200.0], index=["2021-06"])  # no overlap
     with pytest.raises(ValueError):
         lm.chain_sp(shiller, ext)
+
+
+def test_mark_stale_handles_missing_note():
+    old = lm._mark_stale({"status": "red", "asof": "2026-01-01"}, pd.Timestamp("2026-06-29"))
+    assert old["stale"] is True and old["status"] == "muted"
+    assert old["note"].startswith("⏳STALE")  # no KeyError, no trailing space
+
+
+def test_compute_rejects_short_frame():
+    df = pd.DataFrame({"ym": ["2020-01"], "dt": pd.to_datetime(["2020-01"]),
+                       "gross_B": [1.0], "net_gross": [0.5], "ratio": [0.1],
+                       "net_B": [0.5], "sp": [10.0]})
+    with pytest.raises(ValueError):
+        lm.compute(df)
+
+
+@pytest.mark.parametrize("payload", [
+    {"chart": {"error": {"code": "Not Found"}, "result": None}},
+    {"chart": {"error": None, "result": None}},
+    {"chart": {"error": None, "result": [
+        {"timestamp": [1, 2, 3], "indicators": {"quote": [{"close": [10.0, 11.0]}]}}]}},  # len mismatch
+])
+def test_fetch_sp500_validates_yahoo_response(monkeypatch, payload):
+    import json as _json
+    monkeypatch.setattr(lm, "_get", lambda *a, **k: _json.dumps(payload).encode())
+    with pytest.raises(ValueError):
+        lm.fetch_sp500_monthly()
+
+
+def test_fetch_finra_rejects_layout_drift(monkeypatch):
+    import io as _io
+    # A sheet whose first 4 non-empty columns are NOT (date, debit, cash, margin):
+    # a text-blurb column has shifted the numeric columns out of place.
+    bad = pd.DataFrame({
+        "blurb": ["see note"] * 5,
+        "debit": [1, 2, 3, 4, 5],
+        "cash": [0, 0, 0, 0, 0],
+        "margin": [0, 0, 0, 0, 0],
+    })
+    buf = _io.BytesIO()
+    bad.to_excel(buf, index=False)
+    monkeypatch.setattr(lm, "_get", lambda *a, **k: buf.getvalue())
+    with pytest.raises(ValueError):
+        lm.fetch_finra()
+
+
+def test_write_signals_skips_non_directory_show_src(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(lm, "DATA_DIR", tmp_path / "data")
+    not_a_dir = tmp_path / "afile"
+    not_a_dir.write_text("x")
+    lm.write_signals({"ok": 1}, show_src=not_a_dir)  # must NOT raise
+    assert (tmp_path / "data" / "leverage_signals.json").exists()
