@@ -367,7 +367,10 @@ def paired_net_diff_stats(
     arr = d.to_numpy(dtype="float64")
     mean_m = float(arr.mean())
 
+    # clamp the (possibly user-supplied) HAC lag to [1, n-1] — a lag ≥ n has no
+    # usable autocovariance — and report the ACTUAL lag used, not the raw input.
     L = hac_lag if hac_lag is not None else max(1, int(round(n ** (1.0 / 3.0))))
+    L = max(1, min(L, n - 1))
     se = _bartlett_hac_se_mean(arr, L)
     t_stat = mean_m / se if (se == se and se > 0) else nan
 
@@ -435,13 +438,19 @@ def verdict(
         s0_10 = row(10.0, S0_LABEL)
         s1_25 = row(25.0, PRIMARY_LABEL)
         s0_25 = row(25.0, S0_LABEL)
+        pj = paired_by_cost[10.0]  # also required — guard it in the same try
     except KeyError:
-        return "## Verdict\n\n**Cannot adjudicate: post-2000 window missing from results.**"
+        return ("## Verdict\n\n**Cannot adjudicate: post-2000 window or paired "
+                "10bps stats missing from results.**")
     needed = ("sharpe", "calmar", "cagr")
+    pj_keys = ("ann_mean", "ci_excludes_zero")
     if not all(pd.notna(r[k]) for r in (s1_10, s0_10, s1_25, s0_25) for k in needed):
         return ("## Verdict\n\n**Insufficient sample on the post-2000 window "
                 "(NaN Sharpe/Calmar/CAGR at 10 or 25bps) — cannot adjudicate. "
                 "Widen the data.**")
+    if not all(k in pj for k in pj_keys):
+        return ("## Verdict\n\n**Cannot adjudicate: paired 10bps stats are missing "
+                f"required keys {pj_keys}.**")
 
     def risk_adj_beats(s1, s0):  # PR#5 caliber: Sharpe AND Calmar
         return (s1["sharpe"] > s0["sharpe"]) and (s1["calmar"] > s0["calmar"])
@@ -451,7 +460,6 @@ def verdict(
     ret_10 = s1_10["cagr"] > s0_10["cagr"]   # raw-return win @10bps
     ret_25 = s1_25["cagr"] > s0_25["cagr"]
 
-    pj = paired_by_cost[10.0]
     ci_positive = bool(pj["ci_excludes_zero"]) and pj["ann_mean"] > 0
     ci_negative = bool(pj["ci_excludes_zero"]) and pj["ann_mean"] < 0
 

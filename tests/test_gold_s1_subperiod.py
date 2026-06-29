@@ -393,20 +393,26 @@ def test_paired_net_diff_validates_and_clamps_params():
     assert pd.notna(st["ci_lo"]) and pd.notna(st["ci_hi"])
 
 
-def test_paired_hac_se_widens_with_positive_autocorrelation():
-    # A strongly positively-autocorrelated series has a larger HAC se (smaller
-    # |t|) than an IID-style se would give — verify the HAC variance exceeds the
-    # naive γ0/n by construction on an AR(1)-like path.
+def test_paired_hac_se_adds_positive_autocovariance():
+    # Deterministic (no RNG): a monotone ramp is strongly positively
+    # autocorrelated, so adding positive-lag Bartlett terms must strictly
+    # increase the HAC se over the γ0-only (lag-0 = IID) se. This tests the
+    # mechanism directly rather than relying on a single random AR(1) draw.
     from lib.gold_s1_subperiod import _bartlett_hac_se_mean
-    n = 200
-    rng = np.random.default_rng(9)
-    e = rng.normal(0, 1, n)
-    x = np.zeros(n)
-    for i in range(1, n):
-        x[i] = 0.7 * x[i - 1] + e[i]  # AR(1), phi=0.7
-    se_iid = float(np.std(x, ddof=0) / np.sqrt(n))
-    se_hac = _bartlett_hac_se_mean(x, lag=max(1, round(n ** (1.0 / 3.0))))
-    assert se_hac > se_iid  # autocorrelation inflates the honest se
+    x = np.arange(40, dtype="float64")          # strict positive autocorrelation
+    se_lag0 = _bartlett_hac_se_mean(x, lag=0)    # γ0 only ≡ IID se of the mean
+    se_lag6 = _bartlett_hac_se_mean(x, lag=6)    # + positive lagged autocovariances
+    assert se_lag6 > se_lag0
+
+
+def test_paired_hac_lag_clamped_and_reported():
+    # An over-large hac_lag is clamped to n-1 and the RETURNED hac_lag reflects
+    # the actual value used (codex P3), not the raw input.
+    idx = _midx(20)
+    a = _bt_from_net(pd.Series(0.01, index=idx))
+    b = _bt_from_net(pd.Series(0.004, index=idx))
+    st = paired_net_diff_stats(a, b, n_boot=200, hac_lag=999)
+    assert st["hac_lag"] == st["n"] - 1 == 19
 
 
 # ── verdict() branch coverage — codex P1 (verdict now lives in lib) ──────────

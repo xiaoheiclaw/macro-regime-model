@@ -153,14 +153,16 @@ def main() -> None:
     paired_by_cost: Dict[float, Dict[str, float]] = {}
     for c, bts in bt_by_cost.items():
         ccstart, ccend = common_window(bts)
-        if ccstart is None or ccend is None:
-            paired_by_cost[c] = paired_net_diff_stats(
-                bts[PRIMARY_LABEL].iloc[0:0], bts[S0_LABEL].iloc[0:0])
-            continue
-        lo = max(ccstart, pd.Timestamp(post_start))
-        hi = min(ccend, pd.Timestamp(post_end))
-        a = slice_segment(bts[PRIMARY_LABEL], lo, hi)
-        b = slice_segment(bts[S0_LABEL], lo, hi)
+        lo = None if ccstart is None else max(ccstart, pd.Timestamp(post_start))
+        hi = None if ccend is None else min(ccend, pd.Timestamp(post_end))
+        # explicit empty-window handling (don't rely on slice_segment's behaviour
+        # for a reversed lo>hi range, which is fragile on a DatetimeIndex)
+        if lo is None or hi is None or lo > hi:
+            a = bts[PRIMARY_LABEL].iloc[0:0]
+            b = bts[S0_LABEL].iloc[0:0]
+        else:
+            a = slice_segment(bts[PRIMARY_LABEL], lo, hi)
+            b = slice_segment(bts[S0_LABEL], lo, hi)
         paired_by_cost[c] = paired_net_diff_stats(a, b)
 
     # ── write report ──
