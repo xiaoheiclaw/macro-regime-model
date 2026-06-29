@@ -29,7 +29,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -80,7 +80,7 @@ def main() -> None:
     stacked = stacked_contribution_path(res_id, t0=args.t0, t1=args.t1)
 
     # ── persist CSVs ────────────────────────────────────────────────────
-    date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    date = datetime.now().strftime("%Y-%m-%d")  # local date (report read locally)
     decomp_csv = os.path.join(DATA_DIR, f"gold_attribution_decomposition_{date}.csv")
     coefs_csv = os.path.join(DATA_DIR, f"gold_attribution_coefs_{date}.csv")
     roll_csv = os.path.join(DATA_DIR, f"gold_attribution_rolling_{date}.csv")
@@ -172,22 +172,22 @@ def _write_report(path, panel, res_id, res_free, decomp, decomp_free, v, v_free,
         )
     elif v["sovereign_took_over"]:
         ruling = (
-            f"在 {t0}→{t1} 的金价涨幅中,**主权信用层(③)是最大正贡献项** "
-            f"(Δln={v['sov_contribution_ln']:+.4f}),定量支持「2022 起主权信用 regime 接管」假说。"
+            f"在 {t0}→{t1} 的金价涨幅中,**主权信用层(③)是最大正贡献项**(事实) "
+            f"(Δln={v['sov_contribution_ln']:+.4f}),定量支持「2022 起主权信用 regime 接管」假说(推理)。"
         )
     elif v["top_layer"] == "flow_resid":
         ruling = (
             f"最大「贡献」来自 **ε_flow 残差**(Δln={resid_c:+.4f},占总涨幅 "
             f"{_fmt_pct(resid_c / decomp.loc[decomp['layer']=='TOTAL','contribution_ln'].iloc[0] * 100)}"
-            "),即四个可测宏观层(①通胀/②实利率/③主权/④尾部)**合起来也解释不了这段涨幅的主体**。\n\n"
-            f"关键证据:**②实利率层贡献为负**(Δln={real_c:+.4f}) —— 2022-23 实利率大幅*上行*,"
-            "按传统「金价≈−实利率」模型本应**压制**金价,但金价反而创新高。这说明传统实利率 regime "
-            "**确实失效了**(假说的*前半句*成立);但失效后的解释力**并未落到我们构造的 ③主权信用代理上**"
-            f"(③仅贡献 {sov_c:+.4f}),而是落在**无法用 ①–④ 线性代理捕捉的残差**里。\n\n"
-            "**裁决:严格口径下「③主权信用层接管」未被证实**——③的 *可测代理*(debt/GDP+外官托管)"
-            "没有定量接管。但残差的主体最可能由**我们缺数据的⑤央行购金/去美元化流量**承载(WGC 季度数据无 "
-            "FRED 源,见 §1);也可能是本归因的多重共线(§2 条件数高、③系数在 free 口径变号)使逐层拆分"
-            "本身不可靠。换言之:**「旧实利率锚已断」有据,「新锚=主权信用」尚无可测证据**——需要 WGC 流量"
+            "),即四个可测宏观层(①通胀/②实利率/③主权/④尾部)**合起来也解释不了这段涨幅的主体**(事实)。\n\n"
+            f"关键证据(事实):**②实利率层贡献为负**(Δln={real_c:+.4f}) —— 2022-23 实利率大幅*上行*,"
+            "按传统「金价≈−实利率」模型本应**压制**金价,但金价反而创新高。由此(推理)传统实利率 regime "
+            "**已失效**(假说的*前半句*成立);但失效后的解释力**并未落到我们构造的 ③主权信用代理上**"
+            f"(③仅贡献 {sov_c:+.4f},事实),而是落在**无法用 ①–④ 线性代理捕捉的残差**里(事实)。\n\n"
+            "**裁决(推理):严格口径下「③主权信用层接管」未被证实**——③的 *可测代理*(debt/GDP+外官托管)"
+            "没有定量接管。残差的主体**最可能**由**我们缺数据的⑤央行购金/去美元化流量**承载(推测;WGC 季度数据无 "
+            "FRED 源,见 §1);也可能是本归因的多重共线(③系数在 free 口径变号,见 §2)使逐层拆分"
+            "本身不可靠(推理)。换言之:**「旧实利率锚已断」有据(推理),「新锚=主权信用」尚无可测证据(推理)**——需要 WGC 流量"
             "数据(补⑤)才能在③/⑤之间做出裁断。"
         )
     else:
@@ -210,10 +210,28 @@ def _write_report(path, panel, res_id, res_free, decomp, decomp_free, v, v_free,
                 f"{'是' if (s.min() < 0 < s.max()) else '否'} |"
             )
 
+    # dynamic collinearity description (codex P2: don't hardcode "不高")
+    cond = res_id.cond_number
+    sov_id = res_id.coefs.get("sov", float("nan"))
+    sov_free = res_free.coefs.get("sov", float("nan"))
+    sov_flips = np.isfinite(sov_id) and np.isfinite(sov_free) and (sov_id * sov_free < 0)
+    if np.isfinite(cond) and cond < 30:
+        cond_desc = f"条件数={cond:.1f}(<30,identity 块本身**不算**高度共线)"
+    elif np.isfinite(cond):
+        cond_desc = f"条件数={cond:.1f}(≥30,**存在共线风险**,单层系数不稳健)"
+    else:
+        cond_desc = "条件数 n/a"
+    flip_desc = (
+        f"identity {sov_id:+.3f} → free {sov_free:+.3f}(**符号翻转** ⇒ 一旦把强趋势的 "
+        "ln(CPI) 放进自由回归,debt/GDP 与之共线,③ 的符号被夺走)"
+        if sov_flips else
+        f"identity {sov_id:+.3f} → free {sov_free:+.3f}(未变号)"
+    )
+
     lines = [
-        f"# 黄金「法币信用利差」逐层归因 — 2022→2026 (PR #9)",
+        f"# 黄金「法币信用利差」逐层归因 — {t0}→{t1} (PR #9)",
         "",
-        f"_生成于 {date} · 数据起点 {args.start} · 归因窗口 {t0}→{t1}_",
+        f"_生成于 {date}(本地日期)· 数据起点 {args.start} · 归因窗口 {t0}→{t1}_",
         "",
         "## 0. 这是什么 / 不是什么 (ex-post vs ex-ante 边界)",
         "",
@@ -223,6 +241,8 @@ def _write_report(path, panel, res_id, res_free, decomp, decomp_free, v, v_free,
         "金价↔宏观各锚关系 **regime 依赖、不可外推**;本 PR 不碰 S1、不做预测。",
         "- 全样本 OLS 拟合系数被**允许**使用全样本(这是解释而非预测);滚动系数报出来"
         "正是为了**暴露不稳定性**,而非用来择时。",
+        "- 关键断言按项目规范标注 **(事实)**=直接来自数据/分解 / **(推理)**=基于事实+框架的"
+        "推断 / **(推测)**=机制故事/未来路径(谨慎)。",
         "",
         "## 1. 五层代理覆盖",
         "",
@@ -247,7 +267,7 @@ def _write_report(path, panel, res_id, res_free, decomp, decomp_free, v, v_free,
         "## 2. 全样本归因系数",
         "",
         f"样本 n={res_id.n} · R²(identity)={res_id.r2:.3f} · R²(free)={res_free.r2:.3f} · "
-        f"回归块条件数(共线性诊断)={res_id.cond_number:.1f}",
+        f"回归块{cond_desc}",
         "",
         "**identity 口径**(强加购买力恒等式 b_CPI≡1,回归 ln(gold)−ln(CPI) 对 ②–⑤):",
         "",
@@ -257,17 +277,15 @@ def _write_report(path, panel, res_id, res_free, decomp, decomp_free, v, v_free,
         "",
         _coef_table_md(res_free),
         "",
-        "> std-coef = 标准化贝塔(可跨层比较量纲)。identity 块条件数="
-        f"{res_id.cond_number:.1f}(此处不大,实利率/主权/尾部三层本身不算共线);"
-        f"**真正的共线信号是 ③sov 系数跨口径变号**:identity {res_id.coefs.get('sov', float('nan')):+.3f} → "
-        f"free {res_free.coefs.get('sov', float('nan')):+.3f} —— 一旦把强趋势的 ln(CPI) 放进自由回归,"
-        "debt/GDP 与之共线,③ 的符号被夺走。这说明逐层系数对口径敏感(与 PR#1–#4「无稳定锚」一致),"
-        "逐层拆分应视作*提示性*而非*定论*。",
+        f"> std-coef = 标准化贝塔(可跨层比较量纲)。identity 回归块{cond_desc}(事实);"
+        f"③sov 系数跨口径:{flip_desc}(事实)。"
+        + ("**符号翻转是本归因的核心共线信号**(推理):" if sov_flips else "")
+        + "逐层系数对口径敏感(与 PR#1–#4「无稳定锚」一致,推理),逐层拆分应视作*提示性*而非*定论*。",
         "",
         f"## 3. {t0}→{t1} 涨幅逐层归因(核心)",
         "",
-        f"金价总涨幅 {_fmt_pct(tot_ret)} (Δln={decomp.loc[decomp['layer']=='TOTAL','contribution_ln'].iloc[0]:+.4f})。"
-        "下表各层贡献 + ε_flow 残差 **精确加总 = 总 Δln**(OLS 恒等式,零松弛)。",
+        f"金价总涨幅 {_fmt_pct(tot_ret)} (Δln={decomp.loc[decomp['layer']=='TOTAL','contribution_ln'].iloc[0]:+.4f})(事实)。"
+        "下表各层贡献 + ε_flow 残差 **精确加总 = 总 Δln**(OLS 恒等式,零松弛;事实)。",
         "",
         "**identity 口径:**",
         "",
@@ -310,7 +328,7 @@ def _write_report(path, panel, res_id, res_free, decomp, decomp_free, v, v_free,
         "## 6. 诚实标注与边界",
         "",
         "- 样本内归因(解释历史),**非**预测;系数 regime 依赖(见 §5 滚动)。",
-        "- 各层代理高度共线(§2 条件数),逐层系数对口径敏感 —— identity vs free 两套并报。",
+        f"- 逐层系数对口径敏感(§2:{cond_desc};③sov {flip_desc})—— identity vs free 两套并报(推理)。",
         f"- ⑤ 流量层在无 WGC 注入时并入 ε_flow 残差({notes.get('wgc_flow','')[:60]}…)。",
         "- ③ 主权信用层为 debt/GDP 与外官托管份额(WMTSECL1,始于 2002-12)的等权 z-composite,"
         "要求**两分量同时非空**;因此整个回归拟合样本自 2003 年起(2003 前无托管数据的行被整体丢弃,"

@@ -279,3 +279,25 @@ def test_invalid_cpi_mode_raises():
     panel, _ = _panel()
     with pytest.raises(ValueError):
         fit_attribution(panel, cpi_mode="bogus")
+    # rolling_coefs validates cpi_mode too (codex P3)
+    with pytest.raises(ValueError):
+        rolling_coefs(panel, cpi_mode="bogus")
+
+
+def test_dependency_import_smoke():
+    """The module depends on lib.gold_anchor (PR#1, already on main). Assert the
+    reused symbols import cleanly so a missing base-repo file fails loudly here
+    rather than at script runtime (codex P1 — gold_anchor is a base-repo file,
+    not part of this PR's diff)."""
+    from lib.gold_anchor import build_anchor_panel, fetch_fred_series
+    assert callable(build_anchor_panel) and callable(fetch_fred_series)
+
+
+def test_missing_cpi_always_raises_even_when_degraded():
+    """① CPI is structurally non-degradable: missing ln_cpi raises even with
+    allow_missing_required=True (codex P2)."""
+    panel, _ = _panel()
+    df = panel.data.copy()
+    df["ln_cpi"] = np.nan
+    with pytest.raises(ValueError, match="ln_cpi"):
+        build_design(df, allow_missing_required=True)

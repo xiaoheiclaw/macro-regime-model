@@ -269,12 +269,24 @@ def build_design(
         partial run is never silently mistaken for a complete five-layer
         attribution — unless `allow_missing_required=True`, in which case it is
         dropped, recorded, AND flagged in `incomplete` so callers/reports can
-        mark the result invalid/incomplete.
+        mark the result invalid/incomplete. EXCEPTION: layer ① (`ln_cpi`) is
+        structurally non-degradable (both cpi_modes consume it) and always raises
+        when missing, even with `allow_missing_required=True`.
 
     After the common `dropna()` the retained sample must have `>= min_obs` rows
     and strictly more rows than the maximum regressor count (all layers + const);
     otherwise `ValueError` (prevents a silent empty/degenerate lstsq when layers
     have data individually but no overlapping window)."""
+    # CPI is structurally non-degradable: BOTH cpi_modes need ln_cpi (identity
+    # regresses ln_gold−ln_cpi; free uses ln_cpi as a regressor) and it is always
+    # in the common dropna. So a missing ln_cpi can never be "degraded" — it would
+    # silently empty the sample. Raise up-front regardless of allow_missing_required.
+    if "ln_cpi" not in df.columns or df["ln_cpi"].notna().sum() == 0:
+        raise ValueError(
+            "ln_cpi (① inflation baseline) is missing/empty — it is structurally "
+            "required by both cpi_modes and cannot be degraded."
+        )
+
     used: List[Layer] = []
     skipped: Dict[str, str] = {}
     incomplete: List[str] = []
@@ -566,6 +578,8 @@ def rolling_coefs(
     """Rolling-window OLS coefficients per layer, to *show* the regime-dependence
     (PR #1–#4: no stable anchor). Each row t is the fit on the trailing `window`
     months ending at t. NOT used for prediction — instability is the point."""
+    if cpi_mode not in ("identity", "free"):
+        raise ValueError(f"cpi_mode must be 'identity' or 'free', got {cpi_mode!r}")
     df = panel.data if isinstance(panel, AttributionPanel) else panel
     design = build_design(df, layers, allow_missing_required=allow_missing_required)
     if cpi_mode == "identity":
