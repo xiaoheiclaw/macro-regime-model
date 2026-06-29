@@ -174,6 +174,26 @@ def test_momentum_signal_rejects_nonpositive_lookback():
         trend_exposure(price, [3, -2])
 
 
+def test_regime_gate_rejects_nonpositive_window():
+    idx = _midx(6)
+    rr = pd.Series(np.linspace(2.0, 0.0, 6), index=idx)
+    usd = pd.Series(np.linspace(110.0, 100.0, 6), index=idx)
+    for bad in (0, -3):
+        with pytest.raises(ValueError, match="positive"):
+            regime_gate(rr, usd, window=bad)
+
+
+def test_realized_vol_and_vol_scale_reject_bad_params():
+    ret = pd.Series(np.full(8, 0.01), index=_midx(8))
+    from lib.gold_trend_timing import realized_vol
+    for bad in (0, -2):
+        with pytest.raises(ValueError, match="positive"):
+            realized_vol(ret, window=bad)
+    for bad in (0.0, -0.05):
+        with pytest.raises(ValueError, match="positive"):
+            vol_scale(ret, target_vol=bad)
+
+
 def test_cost_zero_bps_is_costless():
     idx = _midx(5)
     gold_ret = pd.Series([0.01, 0.02, -0.01, 0.03, 0.0], index=idx)

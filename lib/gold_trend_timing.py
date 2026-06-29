@@ -166,6 +166,8 @@ def momentum_signal(price: pd.Series, lookback: int) -> pd.Series:
 
 def realized_vol(ret: pd.Series, window: int = DEFAULT_VOL_WINDOW) -> pd.Series:
     """Annualised trailing realised vol of monthly returns."""
+    if window <= 0:
+        raise ValueError(f"window must be a positive integer, got {window}")
     return ret.rolling(window).std() * np.sqrt(ANNUAL)
 
 
@@ -176,6 +178,9 @@ def vol_scale(
 ) -> pd.Series:
     """Long-only vol-targeting multiplier in [0, 1]: target/realised, capped at
     1 (no leverage). NaN where realised vol is undefined."""
+    if target_vol <= 0:
+        # target_vol<=0 would silently clip to all-cash, masking a caller error
+        raise ValueError(f"target_vol must be positive, got {target_vol}")
     rv = realized_vol(ret, window)
     scale = target_vol / rv
     return scale.clip(lower=0.0, upper=1.0)
@@ -213,6 +218,11 @@ def regime_gate(
         window's own warm-up) fails **closed** (not favourable → exit), so the
         gate never holds on stale/unknown macro state. A fully-absent leg fails
         open everywhere (pure real-rate-only fallback)."""
+    if window <= 0:
+        # window<0 makes shift() read future macro data (look-ahead); window==0
+        # makes the change identically 0 → a degenerate always-favourable gate.
+        raise ValueError(f"window must be a positive integer, got {window}")
+
     def _not_rising(series: pd.Series) -> pd.Series:
         first = series.first_valid_index()
         if first is None:  # leg entirely absent → fail open (favourable) everywhere

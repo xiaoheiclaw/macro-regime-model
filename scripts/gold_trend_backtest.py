@@ -222,8 +222,8 @@ def main() -> None:
     os.makedirs(args.out_dir, exist_ok=True)
     now = datetime.now(timezone.utc)
     stamp = now.strftime("%Y-%m-%d")
-    # filename carries the time so repeated same-day runs don't silently overwrite
-    file_stamp = now.strftime("%Y-%m-%d_%H%M%S")
+    # filename carries time + microseconds so repeated runs don't silently overwrite
+    file_stamp = now.strftime("%Y-%m-%d_%H%M%S_%f")
     report_path = os.path.join(args.out_dir, f"gold_trend_timing_{file_stamp}.md")
 
     parts: List[str] = []
