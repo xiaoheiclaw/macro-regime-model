@@ -429,6 +429,47 @@ def test_cb_buying_is_coequal_fingerprint_raises_real_rate_dominant_month():
     assert (late >= 0.99).all()
 
 
+def test_cb_single_spike_does_not_stamp_full_strength_regime():
+    """P2 robustness: a single large positive CB reading surrounded by zeros
+    must NOT flip the whole rolling window to full-strength de-dollarization.
+    With cb_min_share=0.5 (default), one positive in a 24-month window (share
+    ~1/24) is far below the majority bar → no cb-driven raise anywhere."""
+    n = 120
+    idx = pd.date_range("1985-01-31", periods=n, freq="ME")
+    dg = np.linspace(0.005, 0.02, n)
+    gold = pd.Series(np.exp(np.cumsum(dg)), index=idx)
+    rr = pd.Series(np.cumsum(-dg * 10.0), index=idx)        # real-rate-dominant
+    base = dominance_probability(gold, rr, window=24)
+    cb = pd.Series(0.0, index=idx)
+    cb.iloc[60] = 1e9                                       # one huge spike, rest zero
+    with_cb = dominance_probability(gold, rr, window=24, cb_demand=cb, cb_lag_months=0)
+    common = base.dropna().index
+    # the spike must not raise any month above the base (real-rate-dominant) call
+    np.testing.assert_array_less(
+        with_cb.loc[common].to_numpy(), base.loc[common].to_numpy() + 0.01 + 1e-9)
+
+
+def test_cb_quarterly_sparse_feed_is_forward_filled_and_fires():
+    """P2 contract: a sparse (quarterly) CB feed reindexed onto the monthly
+    panel is forward-filled so the rolling window can actually fill, and a
+    sustained majority-positive quarterly pattern DOES fire de-dollarization
+    (the feed is usable, not silently never-triggering)."""
+    n = 120
+    idx = pd.date_range("1985-01-31", periods=n, freq="ME")
+    dg = np.linspace(0.005, 0.02, n)
+    gold = pd.Series(np.exp(np.cumsum(dg)), index=idx)
+    rr = pd.Series(np.cumsum(-dg * 10.0), index=idx)        # real-rate-dominant
+    base = dominance_probability(gold, rr, window=36)
+    # quarterly observations only (every 3rd month), all positive (sustained)
+    cb = pd.Series(np.nan, index=idx)
+    cb.iloc[::3] = 5.0
+    with_cb = dominance_probability(gold, rr, window=36, cb_demand=cb, cb_lag_months=0)
+    # the late window is lifted above the (real-rate-dominant) base by CB buying
+    late_base = base.iloc[-20:].dropna()
+    late_cb = with_cb.loc[late_base.index]
+    assert (late_cb >= late_base + 0.5).all()
+
+
 def test_regime_label_and_timeline():
     idx = pd.date_range("2000-01-31", periods=60, freq="ME")
     prob = pd.Series(np.nan, index=idx, dtype=float)

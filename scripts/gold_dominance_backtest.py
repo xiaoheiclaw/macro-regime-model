@@ -97,14 +97,19 @@ def segment_investable_months(m: pd.DataFrame) -> int:
     return int(n.min()) if len(n) else 0
 
 
-def verdict(full: pd.DataFrame) -> str:
+def verdict(full: pd.DataFrame, mean_prob: float = float("nan")) -> str:
     """Honest kill-condition adjudication. The decisive test is SD vs S1
     (the PR #5 standard): if explicit regime classification does not beat pure
     trend on BOTH Sharpe and Calmar net of cost, S1 already implicitly follows
-    the dominant factor through price and the classifier is redundant."""
+    the dominant factor through price and the classifier is redundant.
+
+    ``mean_prob`` is the mean regime probability over the traded window — used
+    only to describe the actual smooth blend in the mechanism note (a hard
+    switch claim would not match the (1-prob)/prob implementation)."""
     s0 = full.loc["S0_buyhold"]
     s1 = full.loc["S1_blend"]
     sd = full.loc["SD_blend"]
+    mean_p = mean_prob
 
     for name, row in (("S0", s0), ("S1_blend", s1), ("SD_blend", sd)):
         if not (pd.notna(row["sharpe"]) and pd.notna(row["calmar"])):
@@ -150,9 +155,11 @@ def verdict(full: pd.DataFrame) -> str:
             dd_clause = (f"with a comparable/shallower drawdown (SD max_dd {sd['max_dd']:.1%} "
                          f"vs S1 {s1['max_dd']:.1%}), so the shortfall is on risk-adjusted "
                          f"return, not tail risk")
-        lines.append("_Mechanism: in de-dollarization months SD switches to the trend "
-                     "signal, so it can at best tie S1 there; in real-rate-dominant "
-                     f"months SD trades the real-rate 'not rising' signal, which lags trend "
+        lines.append("_Mechanism: SD blends the real-rate signal (weight "
+                     f"{1 - mean_p:.0%}) and the trend signal (weight {mean_p:.0%}) by the "
+                     "regime probability — a SMOOTH handoff, not a hard switch. Because the "
+                     "blend is never fully trend (mean prob < 1), SD stays partly anchored to "
+                     "the real-rate 'not rising' signal, which lags pure price trend "
                      f"{dd_clause}. SD does not beat S1 on both decisive metrics (Sharpe "
                      "AND Calmar). The classifier can correctly flip to de-dollarization "
                      "post-2022 (see the timeline) yet still not help, precisely because "
@@ -229,21 +236,34 @@ def main() -> None:
     # a moving sample start, score every window on ONE shared window =
     # intersection of all per-window common spans (verified by equal n_months).
     sens_bts: Dict[int, Dict[str, pd.DataFrame]] = {}
-    sens_spans = []
+    sens_spans: Dict[int, tuple] = {}
+    sens_skipped: List[str] = []
     for w in (24, 36, 48):
         prob_w = dominance_probability(
             panel["gold_nominal"], panel["real_rate_10y"], window=w
         )
         bt_w = run_all(panel, prob_w, args.cost_bps)
-        sens_bts[w] = bt_w
         cs_w, ce_w = common_span(bt_w)
-        if cs_w is not None and ce_w is not None:
-            sens_spans.append((cs_w, ce_w))
+        if cs_w is None or ce_w is None:
+            sens_skipped.append(f"{w}m: no common investable span (warm-up eats the sample)")
+            continue
+        sens_bts[w] = bt_w
+        sens_spans[w] = (cs_w, ce_w)
     sens_windows: Dict[int, pd.DataFrame] = {}
     if sens_spans:
-        sens_start = max(s for s, _ in sens_spans)
-        sens_end = min(e for _, e in sens_spans)
+        # ONE shared window = intersection of every per-window span, so a longer
+        # window's later warm-up does not mix a moving sample start into the band.
+        sens_start = max(s for s, _ in sens_spans.values())
+        sens_end = min(e for _, e in sens_spans.values())
         for w, bt_w in sens_bts.items():
+            lo, hi = sens_spans[w]
+            # a window whose own span doesn't cover [sens_start, sens_end] can't
+            # be scored on the shared window — flag it skipped rather than emit a
+            # misleading all-NaN table (matters under a short sample / large window).
+            if lo > sens_start or hi < sens_end:
+                sens_skipped.append(f"{w}m: span {lo:%Y-%m}–{hi:%Y-%m} doesn't "
+                                    f"cover the shared band {sens_start:%Y-%m}–{sens_end:%Y-%m}")
+                continue
             m = metrics_table(bt_w, sens_start, sens_end).loc[["S1_blend", "SD_blend"]]
             sens_windows[w] = m[["sharpe", "calmar", "cagr", "max_dd", "n_months"]]
 
@@ -283,7 +303,10 @@ def main() -> None:
     parts.append("## Full sample (net of cost)\n")
     parts.append(_fmt(full))
     parts.append("")
-    parts.append(verdict(full))
+    # mean regime probability over the common investable window — describes the
+    # actual smooth blend in the mechanism note (the (1-prob)/prob weighting).
+    mean_prob = float(prob.loc[cstart:cend].dropna().mean())
+    parts.append(verdict(full, mean_prob))
     parts.append("")
 
     # ── regime timeline ──
@@ -326,10 +349,6 @@ def main() -> None:
         if lo > hi:
             parts.append(f"### {name}\n_(skipped: no overlap with sample)_\n")
             continue
-        # gate on *investable* months (after the common-window warm-up), not the
-        # raw panel count: a long --corr-window or a tight --start/--end can leave
-        # a segment with enough panel months but too few tradeable ones, which
-        # would otherwise print a near-empty / all-NaN table.
         m = metrics_table(backtests, s, e)
         # gate on *investable* months (after the common-window warm-up), not the
         # raw panel count: a long --corr-window or a tight --start/--end can leave
@@ -347,11 +366,15 @@ def main() -> None:
     # ── sensitivity bands ──
     parts.append("## corr-window sensitivity (S1 vs SD, blend)\n")
     parts.append("If SD's verdict vs S1 flips across {24,36,48}m the edge is a "
-                 "window artifact, not structure.\n")
+                 "window artifact, not structure. All rendered windows are scored "
+                 "on ONE shared investable window so the comparison isolates the "
+                 "corr-window parameter, not a moving sample start.\n")
     for w, m in sens_windows.items():
         parts.append(f"### corr window = {w}m\n")
         parts.append(_fmt_simple(m))
         parts.append("")
+    for note in sens_skipped:
+        parts.append(f"- _(skipped: {note})_")
 
     parts.append("## Cost sensitivity (S0 / S1_blend / SD_blend)\n")
     for c, m in sens_cost.items():
@@ -410,7 +433,7 @@ def main() -> None:
     print(f"  regime series → {reg_path}")
 
     print("\n" + _fmt(full))
-    print("\n" + verdict(full))
+    print("\n" + verdict(full, mean_prob))
 
 
 if __name__ == "__main__":

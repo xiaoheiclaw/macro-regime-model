@@ -18,10 +18,13 @@ data ≤ t only):
   real-rate-dominant     : rolling corr(Δlog gold, Δreal_rate) significantly < 0
   de-dollarization-dom.  : that corr → 0 / turns positive, OR a trailing-window
                            divergence (Δgold>0 ∧ Δreal_rate>0, the classic
-                           negative relation breaking down). An optional
-                           central-bank-demand proxy (cb_demand, e.g. net official
-                           gold buying / TIC foreign-official flows) confirms it
-                           where available (2010+, lagged).
+                           negative relation breaking down), OR sustained net
+                           central-bank buying. An optional cb_demand proxy
+                           (WGC net official purchases / TIC foreign-official
+                           flows) is a THIRD, co-equal disjunct (NOT a mere
+                           confirm): publication-lagged, sparse feeds forward-
+                           filled to monthly, and firing only when a majority of
+                           the window's available readings are positive.
 
 Trade:
   real-rate-dominant months → the real-rate signal drives exposure (hold when
@@ -165,6 +168,7 @@ def dominance_probability(
     div_hi: float = DEFAULT_DIV_HI,
     cb_demand: Optional[pd.Series] = None,
     cb_lag_months: int = 1,
+    cb_min_share: float = 0.5,
 ) -> pd.Series:
     """Ex-ante probability ∈ [0,1] that gold is in the **de-dollarization-
     dominant** regime at each month t (1 = de-dollarization, 0 = real-rate).
@@ -181,7 +185,8 @@ def dominance_probability(
                post-2022 break, which the change-based p_corr/p_div can miss
                because the monthly co-movement stayed negative even as the
                levels pulled apart.
-      cb_demand (optional): a monthly net-buying proxy treated as a THIRD,
+      cb_demand (optional): a net-buying proxy (WGC quarterly central-bank
+               purchases, TIC foreign-official flows, …) treated as a THIRD,
                co-equal de-dollarization fingerprint — the spec's third
                disjunct "central-bank net buying picking up" (the fingerprint is
                an OR: corr-breakdown ∨ divergence ∨ CB-buying). Sustained net
@@ -198,6 +203,12 @@ def dominance_probability(
                central-bank-buying data is released with a quarter+ delay, so the
                month-t figure is NOT known at decision time t. Pass already-
                lagged data with ``cb_lag_months=0`` if aligned to availability.
+               Sparse (e.g. quarterly) feeds are forward-filled to the monthly
+               panel before rolling. "Sustained" is decided by ``cb_min_share``
+               (default 0.5): the fingerprint fires only when at least that
+               share of the window's AVAILABLE readings are positive — so a
+               single large spike among zeros does NOT stamp a full-strength
+               regime over the whole window.
 
     All pieces are trailing rollings / forward shifts only → no look-ahead.
     NaN where the window has not yet filled (so warm-up trims cleanly)."""
@@ -206,6 +217,8 @@ def dominance_probability(
     if cb_lag_months < 0:
         # a negative lag would shift CB data BACKWARD → read future releases
         raise ValueError(f"cb_lag_months must be >= 0, got {cb_lag_months}")
+    if not (0.0 < cb_min_share <= 1.0):
+        raise ValueError(f"cb_min_share must be in (0, 1], got {cb_min_share}")
     if corr_break <= corr_neg:
         raise ValueError(
             f"corr_break ({corr_break}) must be > corr_neg ({corr_neg}) "
@@ -235,17 +248,27 @@ def dominance_probability(
     if cb_demand is not None:
         # shift forward by the publication lag so the month-t figure is only
         # used cb_lag_months later (WGC data is released with a quarter+ delay).
-        cb = cb_demand.reindex(gold_nominal.index).shift(cb_lag_months)
-        cb_mean = cb.rolling(window, min_periods=window).mean()
-        cb_pos = (cb_mean > 0).astype(float)
-        cb_pos[cb_mean.isna()] = np.nan
+        cb_raw = cb_demand.reindex(gold_nominal.index).shift(cb_lag_months)
+        # CB feeds (WGC quarterly) are sparse vs a monthly panel; forward-fill
+        # each observation to its next month so a quarterly reading carries
+        # through the inter-report months, then rolling over the (now gap-free)
+        # monthly signal. min_periods=window still requires `window` post-fill
+        # months, so coverage is auditable rather than silently never-firing.
+        cb = cb_raw.ffill()
+        n_avail = cb.rolling(window, min_periods=window).count()
+        n_pos = (cb > 0).astype(float).rolling(window, min_periods=window).sum()
+        # sustained net buying = a MAJORITY of the available readings in the
+        # window are positive (not a bare mean>0, which one large spike could
+        # satisfy alone). share = pos / available; fire when ≥ cb_min_share.
+        with np.errstate(invalid="ignore", divide="ignore"):
+            share = n_pos / n_avail
+        cb_pos = (share >= cb_min_share).astype(float)
+        cb_pos[n_avail.isna()] = np.nan
         # CB buying is a THIRD co-equal de-dollarization fingerprint (spec's ∨):
-        # combine by the same element-wise max, so it raises p even where the
-        # rate relation alone reads real-rate-dominant. It is masked to NaN
-        # wherever the base probability is NaN, so it never fabricates a regime
-        # on months with no underlying panel (warm-up / no real rate) — the
-        # "no real rate → no default classification" honesty contract. max never
-        # lowers p, so a non-buying month (cb_pos=0) leaves the base call intact.
+        # combined by the same element-wise max, so it raises p even where the
+        # rate relation alone reads real-rate-dominant. Masked to NaN wherever
+        # base p is NaN, so it never fabricates a regime with no underlying panel
+        # (warm-up / no real rate). max never lowers p.
         cb_signal = cb_pos.where(p.notna())
         p = pd.concat([p, cb_signal], axis=1).max(axis=1, skipna=True)
 
