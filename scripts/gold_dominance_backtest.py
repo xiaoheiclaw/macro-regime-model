@@ -50,7 +50,9 @@ from lib.gold_trend_timing import (  # noqa: E402
 )
 from lib.gold_regime_dominance import (  # noqa: E402
     DEFAULT_CORR_WINDOW,
+    divergence_share,
     dominance_probability,
+    level_divergence,
     regime_label,
     regime_timeline,
     rolling_gold_realrate_corr,
@@ -84,6 +86,15 @@ def run_all(panel: pd.DataFrame, prob: pd.Series, cost_bps: float) -> Dict[str, 
         label: run_backtest(p, panel["gold_ret"], panel["tbill_ret"], cost_bps=cost_bps)
         for label, p in positions.items()
     }
+
+
+def segment_investable_months(m: pd.DataFrame) -> int:
+    """Min investable months across strategies in a segment metrics table.
+    compute_metrics returns NaN n_months for an empty slice, so a plain
+    int(m['n_months'].min()) would crash on a segment that overlaps the panel
+    but has no tradeable months after warm-up — drop NaN first, treat as 0."""
+    n = m["n_months"].dropna()
+    return int(n.min()) if len(n) else 0
 
 
 def verdict(full: pd.DataFrame) -> str:
@@ -142,10 +153,11 @@ def verdict(full: pd.DataFrame) -> str:
         lines.append("_Mechanism: in de-dollarization months SD switches to the trend "
                      "signal, so it can at best tie S1 there; in real-rate-dominant "
                      f"months SD trades the real-rate 'not rising' signal, which lags trend "
-                     f"{dd_clause}. Net SD ≤ S1. The classifier can correctly flip to "
-                     "de-dollarization post-2022 (see the timeline) yet still not help, "
-                     "precisely because 'follow price when de-dollarization dominates' is "
-                     "what S1 already does everywhere._")
+                     f"{dd_clause}. SD does not beat S1 on both decisive metrics (Sharpe "
+                     "AND Calmar). The classifier can correctly flip to de-dollarization "
+                     "post-2022 (see the timeline) yet still not help, precisely because "
+                     "'follow price when de-dollarization dominates' is what S1 already "
+                     "does everywhere._")
     return "\n".join(lines)
 
 
@@ -189,6 +201,13 @@ def main() -> None:
     )
     label = regime_label(prob)
     corr = rolling_gold_realrate_corr(
+        panel["gold_nominal"], panel["real_rate_10y"], window=args.corr_window
+    )
+    # expose the other two sub-signals for the auditable regime CSV
+    div_share = divergence_share(
+        panel["gold_nominal"], panel["real_rate_10y"], window=args.corr_window
+    )
+    lvl_div = level_divergence(
         panel["gold_nominal"], panel["real_rate_10y"], window=args.corr_window
     )
 
@@ -312,7 +331,11 @@ def main() -> None:
         # a segment with enough panel months but too few tradeable ones, which
         # would otherwise print a near-empty / all-NaN table.
         m = metrics_table(backtests, s, e)
-        n_tradeable = int(m["n_months"].min()) if not m.empty else 0
+        # gate on *investable* months (after the common-window warm-up), not the
+        # raw panel count: a long --corr-window or a tight --start/--end can leave
+        # a segment with enough panel months but too few tradeable ones, which
+        # would otherwise print a near-empty / all-NaN table (and int(NaN) crash).
+        n_tradeable = segment_investable_months(m)
         if n_tradeable < min_seg_months:
             parts.append(f"### {name}\n_(skipped: only {n_tradeable} investable "
                          f"months after warm-up, <{min_seg_months})_\n")
@@ -337,11 +360,20 @@ def main() -> None:
         parts.append("")
 
     parts.append("## Data & method notes\n")
+    parts.append("- **De-dollarization fingerprint (3-way OR, combined by max)**: "
+                 "(a) rolling Δ(gold, real-rate) correlation → 0 / positive, "
+                 "(b) per-month divergence share (Δgold>0 ∧ Δreal_rate>0), and "
+                 "(c) **trailing-window level divergence** (gold higher AND real "
+                 "rate higher over the window) — (c) is the signal that actually "
+                 "fires in the post-2022 break and can on its own drive the "
+                 "probability to 1. An optional central-bank-buying proxy is a "
+                 "co-equal 4th disjunct when supplied.\n")
     parts.append("- **Central-bank gold demand**: WGC quarterly net-purchase data "
                  "is 2010+ and lagged, with no clean FRED series; `cb_demand` is an "
-                 "optional injectable proxy. This run uses **cb_demand=None**, so the "
-                 "gold–real-rate relationship (rolling corr + divergence share) is the "
-                 "**sole fingerprint** across the full sample — the documented fallback.\n")
+                 "optional injectable proxy (publication-lagged by `cb_lag_months`). "
+                 "This run uses **cb_demand=None**, so the three gold–real-rate "
+                 "fingerprints above are the **sole signals** across the full sample "
+                 "— the documented fallback.\n")
     parts.append("- **No look-ahead**: every classifier value at t uses a trailing "
                  "rolling window / forward shift only; the position decided at t is "
                  "held t+1 via the shared engine's `.shift(1)`. Standard parameter "
@@ -371,6 +403,7 @@ def main() -> None:
     reg = pd.DataFrame({
         "de_dollarization_prob": prob, "regime_label": label,
         "gold_realrate_corr": corr,
+        "divergence_share": div_share, "level_divergence": lvl_div,
     })
     reg_path = os.path.join(DATA_DIR, f"gold_regime_dominance_regime_{file_stamp}.csv")
     reg.to_csv(reg_path)

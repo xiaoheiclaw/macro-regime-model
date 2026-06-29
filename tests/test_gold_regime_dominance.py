@@ -409,6 +409,26 @@ def test_cb_demand_none_is_default_and_positive_cb_only_raises_prob():
     assert (late >= 0.99).all()
 
 
+def test_cb_buying_is_coequal_fingerprint_raises_real_rate_dominant_month():
+    """P2 contract: per the spec's OR fingerprint, sustained CB buying is itself
+    sufficient evidence of de-dollarization — it raises the probability even on
+    months the rate relation alone reads real-rate-dominant (classic negative
+    co-movement, base p≈0). It is a co-equal disjunct, not a mere 'confirm'."""
+    n = 120
+    idx = pd.date_range("1985-01-31", periods=n, freq="ME")
+    # classic negative: gold up while real rate falls → base prob ≈ 0
+    dg = np.linspace(0.005, 0.02, n)
+    gold = pd.Series(np.exp(np.cumsum(dg)), index=idx)
+    rr = pd.Series(np.cumsum(-dg * 10.0), index=idx)
+    base = dominance_probability(gold, rr, window=36)
+    assert base.dropna().max() < 0.3                   # real-rate-dominant
+    cb = pd.Series(5.0, index=idx)                     # sustained net buying
+    with_cb = dominance_probability(gold, rr, window=36, cb_demand=cb, cb_lag_months=1)
+    # CB buying lifts the (otherwise real-rate-dominant) late months to ~1
+    late = with_cb.iloc[-20:].dropna()
+    assert (late >= 0.99).all()
+
+
 def test_regime_label_and_timeline():
     idx = pd.date_range("2000-01-31", periods=60, freq="ME")
     prob = pd.Series(np.nan, index=idx, dtype=float)
@@ -421,3 +441,20 @@ def test_regime_label_and_timeline():
     tl = regime_timeline(label, freq="YE")
     assert "de-dollarization_share" in tl.columns
     assert tl["n_months"].sum() == (~prob.isna()).sum()
+
+
+def test_segment_investable_months_handles_empty_and_nan():
+    """P1 regression: a segment that overlaps the panel but has NO investable
+    months yields an all-NaN n_months column; segment_investable_months must
+    return 0 (→ the runner skips it) rather than crashing on int(NaN)."""
+    from scripts.gold_dominance_backtest import segment_investable_months
+
+    # all-NaN n_months (what metrics_table returns for an empty/no-overlap slice)
+    m_nan = pd.DataFrame({"n_months": [float("nan"), float("nan")]},
+                         index=["S1_blend", "SD_blend"])
+    assert segment_investable_months(m_nan) == 0
+    # empty frame
+    assert segment_investable_months(pd.DataFrame({"n_months": []})) == 0
+    # mixed: the min over the present (non-NaN) values
+    m_mixed = pd.DataFrame({"n_months": [40.0, float("nan"), 12.0]})
+    assert segment_investable_months(m_mixed) == 12

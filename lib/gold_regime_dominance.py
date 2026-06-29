@@ -181,16 +181,23 @@ def dominance_probability(
                post-2022 break, which the change-based p_corr/p_div can miss
                because the monthly co-movement stayed negative even as the
                levels pulled apart.
-      cb_demand (optional): a monthly net-buying proxy. A trailing-mean
-               positive reading (sustained official accumulation) confirms
-               de-dollarization at full strength; it can only *raise* the
-               probability, never manufacture it where the gold–real-rate
-               relation does not cooperate. The series is shifted forward by
-               ``cb_lag_months`` (default 1) before use to model publication
-               lag — WGC central-bank-buying data is released with a quarter+
-               delay, so the month-t figure is NOT known at decision time t.
-               Pass already-lagged data with ``cb_lag_months=0`` if the caller
-               has aligned it to availability dates itself.
+      cb_demand (optional): a monthly net-buying proxy treated as a THIRD,
+               co-equal de-dollarization fingerprint — the spec's third
+               disjunct "central-bank net buying picking up" (the fingerprint is
+               an OR: corr-breakdown ∨ divergence ∨ CB-buying). Sustained net
+               official buying is itself sufficient evidence of de-dollarization
+               (the thesis is structural reserve demand independent of rates),
+               so it is combined with the rate-relation signals by the SAME
+               element-wise max — it can raise the probability even where the
+               rate relation alone reads real-rate-dominant (p low). It is NOT a
+               mere "confirm" of an existing de-dollarization call. It is masked
+               to NaN wherever the base probability is NaN, so it never
+               fabricates a regime on months with no underlying panel (warm-up /
+               no real rate). The series is shifted forward by ``cb_lag_months``
+               (default 1) before use to model publication lag — WGC
+               central-bank-buying data is released with a quarter+ delay, so the
+               month-t figure is NOT known at decision time t. Pass already-
+               lagged data with ``cb_lag_months=0`` if aligned to availability.
 
     All pieces are trailing rollings / forward shifts only → no look-ahead.
     NaN where the window has not yet filled (so warm-up trims cleanly)."""
@@ -232,15 +239,15 @@ def dominance_probability(
         cb_mean = cb.rolling(window, min_periods=window).mean()
         cb_pos = (cb_mean > 0).astype(float)
         cb_pos[cb_mean.isna()] = np.nan
-        # CB demand can only CONFIRM a regime the gold-real-rate fingerprint
-        # already defines — it must never MANUFACTURE one where the base
-        # probability is NaN (no real rate / warm-up). Mask cb to NaN wherever
-        # base p is NaN, so a positive cb on a months with no base signal does
-        # NOT fabricate a 1.0 (preserves the "no real rate → no default
-        # classification" honesty contract). Where base exists, skip-na max
-        # lets cb raise p (never lower it).
-        confirm = cb_pos.where(p.notna())
-        p = pd.concat([p, confirm], axis=1).max(axis=1, skipna=True)
+        # CB buying is a THIRD co-equal de-dollarization fingerprint (spec's ∨):
+        # combine by the same element-wise max, so it raises p even where the
+        # rate relation alone reads real-rate-dominant. It is masked to NaN
+        # wherever the base probability is NaN, so it never fabricates a regime
+        # on months with no underlying panel (warm-up / no real rate) — the
+        # "no real rate → no default classification" honesty contract. max never
+        # lowers p, so a non-buying month (cb_pos=0) leaves the base call intact.
+        cb_signal = cb_pos.where(p.notna())
+        p = pd.concat([p, cb_signal], axis=1).max(axis=1, skipna=True)
 
     return p
 
