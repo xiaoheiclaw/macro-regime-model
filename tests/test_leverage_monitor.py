@@ -167,6 +167,38 @@ def test_fetch_sp500_validates_yahoo_response(monkeypatch, payload):
         lm.fetch_sp500_monthly()
 
 
+def test_fetch_sp500_parses_valid_yahoo_response(monkeypatch):
+    import json as _json
+    # 2020-01-15 and 2020-02-15 UTC midday timestamps → ym 2020-01 / 2020-02.
+    payload = {"chart": {"error": None, "result": [{
+        "timestamp": [1579089600, 1581768000],
+        "indicators": {"quote": [{"close": [3225.5, 3225.5 * 1.02]}]},
+    }]}}
+    monkeypatch.setattr(lm, "_get", lambda *a, **k: _json.dumps(payload).encode())
+    s = lm.fetch_sp500_monthly()
+    assert list(s.index) == ["2020-01", "2020-02"]
+    assert s.loc["2020-01"] == 3225.5
+
+
+def test_record_high_streak():
+    assert lm._record_high_streak(pd.Series([1.0, 2.0, 3.0, 4.0])) == 4
+    assert lm._record_high_streak(pd.Series([1.0, 5.0, 2.0, 3.0])) == 0  # latest not a record
+    assert lm._record_high_streak(pd.Series([5.0, 1.0, 2.0, 6.0])) == 1
+
+
+def test_build_series_rejects_missing_current_credit(monkeypatch):
+    def _finra_missing_current():
+        df = _fake_finra("ym")
+        df.loc[df.index[-1], "cash_credit_M"] = np.nan  # latest month incomplete
+        return df
+    monkeypatch.setattr(lm, "fetch_finra", _finra_missing_current)
+    monkeypatch.setattr(lm, "fetch_shiller_sp", _fake_shiller)
+    monkeypatch.setattr(lm, "fetch_sp500_monthly", _fake_yahoo_sp500)
+    with pytest.raises(ValueError):
+        lm.build_series()
+
+
+@pytest.mark.filterwarnings("ignore:Could not infer format")
 def test_fetch_finra_rejects_layout_drift(monkeypatch):
     import io as _io
     # A sheet whose first 4 non-empty columns are NOT (date, debit, cash, margin):

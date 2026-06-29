@@ -58,7 +58,9 @@ UA = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"}
 
 
 def _get(url: str, timeout: int = 60, retries: int = 3) -> bytes:
-    last = None
+    if retries < 1:
+        raise ValueError("retries must be ≥1")
+    last: Exception | None = None
     for i in range(retries):
         try:
             req = urllib.request.Request(url, headers=UA)
@@ -67,7 +69,7 @@ def _get(url: str, timeout: int = 60, retries: int = 3) -> bytes:
             last = e
             print(f"    (retry {i+1}/{retries} {type(e).__name__}: {url[:60]})")
             time.sleep(2 * (i + 1))
-    raise last
+    raise RuntimeError(f"GET failed after {retries} retries: {url}") from last
 
 
 def fetch_finra() -> pd.DataFrame:
@@ -91,7 +93,8 @@ def fetch_finra() -> pd.DataFrame:
         if num.notna().mean() < 0.5:
             raise ValueError(f"FINRA column {c!r} is mostly non-numeric — layout drift?")
         df[c] = num
-    df["ym"] = _to_ym(df["ym"])
+    # ym normalization (→ 'YYYY-MM') is the transform path's job (build_series);
+    # fetch_finra only validates schema/types and returns the raw-ish frame.
     return df
 
 
@@ -174,8 +177,11 @@ def build_series() -> pd.DataFrame:
     fin["sp"] = sp
     fin = fin.dropna(subset=["sp"]).reset_index().sort_values("ym")
     fin["gross_B"] = fin["debit_M"] / 1000.0
-    fin["net_B"] = (fin["debit_M"] - fin["cash_credit_M"].fillna(0)
-                    - fin["margin_credit_M"].fillna(0)) / 1000.0
+    # Do NOT fillna(0) the credit legs: a missing source value is not zero credit
+    # — that would systematically overstate net_B / net_gross (the "hardness"
+    # signal). Missing → NaN, which we forbid on the current row below.
+    fin["net_B"] = (fin["debit_M"] - fin["cash_credit_M"]
+                    - fin["margin_credit_M"]) / 1000.0
     fin["net_gross"] = fin["net_B"] / fin["gross_B"]
     fin["ratio"] = fin["gross_B"] / fin["sp"]            # debt ÷ S&P price-index proxy (NOT market cap; denominator-polluted — flagged)
     fin["dt"] = pd.to_datetime(fin["ym"], format="%Y-%m")
@@ -183,6 +189,12 @@ def build_series() -> pd.DataFrame:
         raise ValueError(
             f"build_series produced {len(fin)} rows after FINRA×SP merge — "
             "check source coverage overlap (need ≥2 months for mom/compute)")
+    cur = fin.iloc[-1]
+    missing = [c for c in ("debit_M", "cash_credit_M", "margin_credit_M", "sp")
+               if pd.isna(cur[c])]
+    if missing:
+        raise ValueError(f"Latest month {cur['ym']} is missing {missing} — refusing "
+                         "to emit NaN signals for the current snapshot")
     return fin.reset_index(drop=True)
 
 
@@ -190,6 +202,20 @@ def pct(df: pd.DataFrame, col: str, val: float) -> float:
     # "% of history at or below current" — use <= so an all-time high reads 100%,
     # matching the "percentile" label in the UI.
     return float((df[col] <= val).mean() * 100)
+
+
+def _record_high_streak(s: pd.Series) -> int:
+    """Number of most-recent consecutive months that each set a new all-time
+    high (strictly above every prior month). 0 if the latest is not a record."""
+    prev_max = s.cummax().shift(1)
+    is_new_high = (s > prev_max) | prev_max.isna()  # first obs counts as a high
+    streak = 0
+    for v in reversed(is_new_high.tolist()):
+        if v:
+            streak += 1
+        else:
+            break
+    return streak
 
 
 # Manual / research-grade snapshots have no live feed; flag them stale so a
@@ -228,13 +254,20 @@ def compute(df: pd.DataFrame) -> dict:
 
     # L1 fuel signals
     debt_at_high = bool(df["gross_B"].iloc[-1] >= df["gross_B"].max() - 1e-6)
+    streak = _record_high_streak(df["gross_B"])
+    if debt_at_high and streak >= 2:
+        debt_note = f"史上最高，连续 {streak} 月创新高"
+    elif debt_at_high:
+        debt_note = "史上最高（本月创新高）"
+    else:
+        debt_note = "高位"
     l1 = {
         "name": "燃料 (Fuel) — 干柴多干",
         "status": "red",
         "items": [
             {"label": "Gross margin debt 绝对水平", "value": f"${cur['gross_B']:,.0f}B",
              "status": "red" if debt_at_high else "amber",
-             "note": "史上最高，连续 6 月创新高" if debt_at_high else "高位"},
+             "note": debt_note},
             {"label": "净新增 (mom)", "value": f"{(cur['gross_B']/prev['gross_B']-1)*100:+.1f}%",
              "status": "red" if (cur['gross_B'] > prev['gross_B']) else "green",
              "note": "二阶导：仍在加速"},
@@ -341,10 +374,20 @@ def compute(df: pd.DataFrame) -> dict:
     }
 
 
+def _atomic_write(path: Path, text: str) -> None:
+    """Write via a temp file in the same dir + os.replace, so a crash mid-write
+    never leaves a half-written artifact for the Show Page to choke on."""
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def write_signals(sig: dict, show_src: Path | None = None) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    (DATA_DIR / "leverage_signals.json").write_text(
-        json.dumps(sig, indent=2, ensure_ascii=False), encoding="utf-8")
+    # allow_nan=False → fail fast rather than emit non-standard JSON (NaN/Infinity)
+    # that strict consumers reject.
+    payload = json.dumps(sig, indent=2, ensure_ascii=False, allow_nan=False)
+    _atomic_write(DATA_DIR / "leverage_signals.json", payload)
     # Show-Page sink is opt-in: explicit arg, else env LEVERAGE_SHOW_SRC, resolved
     # at call time (so importers can set it after import).
     if show_src is None:
@@ -354,8 +397,8 @@ def write_signals(sig: dict, show_src: Path | None = None) -> None:
         return
     if show_src.is_dir():
         ts = "// AUTO-GENERATED by scripts/leverage_monitor.py — do not edit by hand.\n"
-        ts += "export const SIGNALS = " + json.dumps(sig, ensure_ascii=False) + " as const;\n"
-        (show_src / "signals.ts").write_text(ts, encoding="utf-8")
+        ts += "export const SIGNALS = " + json.dumps(sig, ensure_ascii=False, allow_nan=False) + " as const;\n"
+        _atomic_write(show_src / "signals.ts", ts)
         print(f"  → wrote show page: {show_src/'signals.ts'}")
     else:
         print(f"  ({SHOW_SRC_ENV}={show_src} is not a directory, skipped ts)")
