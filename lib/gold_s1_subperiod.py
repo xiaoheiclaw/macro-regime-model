@@ -37,7 +37,7 @@ The module is pure/functional; the network only enters through
 
 from __future__ import annotations
 
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -339,13 +339,22 @@ def paired_net_diff_stats(
     arr = d.to_numpy(dtype="float64")
     mean_m = float(arr.mean())
 
+    if n_boot < 1:
+        raise ValueError(f"n_boot must be a positive integer, got {n_boot}")
+    if hac_lag is not None and hac_lag < 1:
+        raise ValueError(f"hac_lag must be ≥ 1 when given, got {hac_lag}")
+    if block_len is not None and block_len < 1:
+        raise ValueError(f"block_len must be ≥ 1 when given, got {block_len}")
+
     L = hac_lag if hac_lag is not None else max(1, int(round(n ** (1.0 / 3.0))))
     se = _bartlett_hac_se_mean(arr, L)
     t_stat = mean_m / se if (se == se and se > 0) else nan
 
-    b_len = block_len if block_len is not None else max(1, int(round(np.sqrt(n))))
+    b_default = max(1, int(round(np.sqrt(n))))
+    # clamp the (possibly user-supplied) block length to [1, n] so max_start ≥ 0
+    b_len = min(max(1, block_len if block_len is not None else b_default), n)
     n_blocks = int(np.ceil(n / b_len))
-    max_start = n - b_len  # inclusive; blocks wrap is avoided by clamping start
+    max_start = n - b_len  # ≥ 0 after the clamp; inclusive upper bound for a block start
     rng = np.random.default_rng(seed)
     # moving-block bootstrap: glue n_blocks contiguous length-b_len blocks, trim to n
     starts = rng.integers(0, max_start + 1, size=(n_boot, n_blocks))

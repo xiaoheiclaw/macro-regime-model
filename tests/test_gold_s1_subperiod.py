@@ -364,6 +364,24 @@ def test_paired_net_diff_reports_block_and_hac_params():
     assert st["hac_lag"] == max(1, round(64 ** (1.0 / 3.0)))
 
 
+def test_paired_net_diff_validates_and_clamps_params():
+    idx = _midx(40)
+    a = _bt_from_net(pd.Series(0.01, index=idx))
+    b = _bt_from_net(pd.Series(0.005, index=idx))
+    # n_boot must be positive
+    with pytest.raises(ValueError, match="n_boot"):
+        paired_net_diff_stats(a, b, n_boot=0)
+    # explicit non-positive block_len / hac_lag rejected
+    with pytest.raises(ValueError, match="block_len"):
+        paired_net_diff_stats(a, b, block_len=0)
+    with pytest.raises(ValueError, match="hac_lag"):
+        paired_net_diff_stats(a, b, hac_lag=0)
+    # block_len > n is clamped to n (no negative max_start / rng crash)
+    st = paired_net_diff_stats(a, b, n_boot=200, block_len=999)
+    assert st["block_len"] == st["n"] == 40
+    assert pd.notna(st["ci_lo"]) and pd.notna(st["ci_hi"])
+
+
 def test_paired_hac_se_widens_with_positive_autocorrelation():
     # A strongly positively-autocorrelated series has a larger HAC se (smaller
     # |t|) than an IID-style se would give — verify the HAC variance exceeds the

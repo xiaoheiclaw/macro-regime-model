@@ -22,7 +22,7 @@ import argparse
 import os
 import sys
 from datetime import datetime, timezone
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 import pandas as pd
 
@@ -292,8 +292,10 @@ def main() -> None:
         "Drawdown caliber is reported three ways: `max_dd` (month-end snapshot, "
         "understates pain), `longest_underwater_m` (months below the prior peak — the "
         "wait-to-even), `max_consec_loss_m` (longest losing streak — whipsaw burn). "
-        "`n_trades` counts discrete entries/exits (S0 = 1); `ann_turnover` is the "
-        "continuous vol-target rebalancing.\n")
+        "`n_trades` counts discrete entries/exits that occur *inside* the window: "
+        "buy-and-hold S0 shows 1 only in the window-opening segment (its single "
+        "entry) and **0 in later segments** (the position is carried in, not "
+        "re-traded); `ann_turnover` is the continuous vol-target rebalancing.\n")
     for name, s, e in SUBPERIOD_SEGMENTS:
         tag = " — **COMBINED POST-2000 (verdict window)**" if name == POST2000_SEGMENT else ""
         parts.append(f"### {name}{tag}\n")
