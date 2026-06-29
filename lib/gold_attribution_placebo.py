@@ -131,14 +131,18 @@ def make_placebos(
     * ``t`` linear time trend 1..N
     * ``log_t`` log time trend
     * ``rand_<seed>`` cumsum(|N(0,1)|) — random *monotone* walk, one per seed
-    * ``cum_cpi`` cumulative ln(CPI)   (needs ``cpi`` level series)
-    * ``cum_m2``  cumulative ln(M2)    (needs ``m2`` level series)
-    * ``cum_ip``  cumulative IP        (needs ``ip`` level series)
+    * ``cum_cpi`` cumulative log change of CPI = ln(CPI_t/CPI_0)  (needs ``cpi``)
+    * ``cum_m2``  cumulative log change of M2                      (needs ``m2``)
+    * ``cum_ip``  cumulative log change of IP                      (needs ``ip``)
     * ``kink_2022`` 0 until ``kink_date`` then a linear ramp — a *shape* control
       that mimics the WGC stock's flat→ramp profile WITHOUT any economic content.
 
-    cum_* placebos are skipped (omitted from the dict) when their source series
-    is None, so the caller can run offline without those FRED pulls.
+    The cum_* placebos are built as the **cumsum of monthly log changes** (not
+    cumsum of the log *level*). This keeps the level a rising I(1) trend (like the
+    WGC stock) while making its first difference the *stationary* growth rate —
+    so the difference-regression arbiter is not contaminated by a non-stationary
+    Δ (codex PR#12 P2). cum_* placebos are skipped (omitted from the dict) when
+    their source series is None, so the caller can run offline without those pulls.
     """
     n = len(idx)
     out: Dict[str, pd.Series] = {}
@@ -149,12 +153,20 @@ def make_placebos(
         out[f"rand_{sd}"] = pd.Series(
             np.cumsum(np.abs(rng.randn(n))), index=idx, dtype="float64"
         )
+
+    def _cum_log_change(s: Optional[pd.Series]) -> pd.Series:
+        # ln(level_t / level_first): cumulative log return. Level is a rising
+        # trend; Δ = monthly log change (stationary). Anchored at 0 on the first
+        # valid obs within idx.
+        x = np.log(s.reindex(idx).astype(float))
+        return x.diff().fillna(0.0).cumsum()
+
     if cpi is not None:
-        out["cum_cpi"] = np.log(cpi.reindex(idx).astype(float)).cumsum()
+        out["cum_cpi"] = _cum_log_change(cpi)
     if m2 is not None:
-        out["cum_m2"] = np.log(m2.reindex(idx).astype(float)).cumsum()
+        out["cum_m2"] = _cum_log_change(m2)
     if ip is not None:
-        out["cum_ip"] = ip.reindex(idx).astype(float).cumsum()
+        out["cum_ip"] = _cum_log_change(ip)
     post = idx >= pd.Timestamp(kink_date)
     kink = pd.Series(0.0, index=idx)
     kink.loc[post] = np.arange(1, int(post.sum()) + 1, dtype="float64")
@@ -166,9 +178,9 @@ PLACEBO_LABELS: Dict[str, str] = {
     "REAL_WGC": "真·WGC 累计超额购金存量",
     "t": "(a) 线性时间趋势 t",
     "log_t": "(b) log(t)",
-    "cum_cpi": "(d) 累计 ln(CPI)",
-    "cum_m2": "(e) 累计 ln(M2)",
-    "cum_ip": "(f) 累计工业产值 IP",
+    "cum_cpi": "(d) 累计通胀 (CPI 累计 log change)",
+    "cum_m2": "(e) 累计货币 (M2 累计 log change)",
+    "cum_ip": "(f) 累计工业产值 (IP 累计 log change)",
     "kink_2022": "(g) 2022 拐点 (先平后升, 形态对照)",
 }
 
@@ -233,10 +245,27 @@ def run_levels_fifth(
     min_obs: int = 24,
 ) -> FifthResult:
     """Fit the five-layer attribution with ⑤ = `fifth` on `window`, decompose
-    [t0,t1], and return the ⑤ / residual diagnostics. Pure reuse of PR #9."""
+    [t0,t1], and return the ⑤ / residual diagnostics. Pure reuse of PR #9.
+
+    Guards the identical-sample contract (codex PR#12 P2): the ⑤ candidate must
+    be fully present on `window`, else `fit_attribution`'s dropna would silently
+    shrink the sample and the cross-candidate R² comparison would be unfair."""
     df = panel_df.loc[window].copy()
-    df["wgc_flow"] = fifth.reindex(window).astype(float)
+    fifth_w = fifth.reindex(window).astype(float)
+    if not fifth_w.notna().all():
+        n_missing = int(fifth_w.isna().sum())
+        raise ValueError(
+            f"⑤ candidate {key!r} has {n_missing} NaN on the fixed window "
+            f"({window.min().date()}..{window.max().date()}); the identical-sample "
+            "comparison requires it fully present (use common_window across all "
+            "candidates, or drop this candidate)."
+        )
+    df["wgc_flow"] = fifth_w
     res = fit_attribution(df, cpi_mode=cpi_mode, min_obs=min_obs)
+    assert res.n == len(window), (
+        f"sample shrank from {len(window)} to {res.n} for {key!r} despite a "
+        "fully-present ⑤ — layers ①–④ have an internal NaN on this window."
+    )
     dec = decompose_period(res, t0=t0, t1=t1)
     fl = dec[dec["layer"] == "flow"]
     rd = dec[dec["layer"] == "flow_resid"]
@@ -305,6 +334,17 @@ def _zscore(s: pd.Series) -> pd.Series:
     return (s - s.mean()) / sd if (np.isfinite(sd) and sd > 0) else s * 0.0
 
 
+def _contiguous_monthly_diff(sub: pd.DataFrame) -> pd.DataFrame:
+    """First difference that only keeps rows where the two source observations are
+    adjacent month-ends. Differencing across a multi-month gap would mis-scale a
+    "monthly change" (codex PR#12 P2); such rows are dropped."""
+    dd = sub.diff()
+    gap = sub.index.to_series().diff()
+    # month-end step is 28–31 days; anything larger is a gap → drop that Δ row.
+    adjacent = (gap >= pd.Timedelta(days=27)) & (gap <= pd.Timedelta(days=32))
+    return dd[adjacent.values].dropna()
+
+
 def _diff_design(panel_df: pd.DataFrame, fifth: pd.Series,
                  window: pd.DatetimeIndex, cpi_mode: str) -> "tuple":
     """First-difference design matching the levels five-layer spec.
@@ -312,10 +352,12 @@ def _diff_design(panel_df: pd.DataFrame, fifth: pd.Series,
     Composites ③ (debt/GDP ⊕ −custody) and ④ (VIX ⊕ credit) are built as the
     equal-weight mean of z-scored *differences* (mirrors the levels z-composite,
     just on Δ). LHS for cpi_mode='identity' is Δln(gold) − Δln(cpi); 'free' adds
-    Δln(cpi) as a regressor. Returns (y, Xmat, names)."""
+    Δln(cpi) as a regressor. Differences are taken only across adjacent months
+    (gaps dropped). Returns (y, Xmat, names, idx, flow_identifiable)."""
     df = panel_df.loc[window].copy()
     df["wgc_flow"] = fifth.reindex(window).astype(float)
-    dd = df[ATTR_COLS].dropna().diff().dropna()
+    sub = df[ATTR_COLS].dropna()
+    dd = _contiguous_monthly_diff(sub)
     real = dd["neg_real_rate"]
     sov = (_zscore(dd["ln_debt_gdp"]) + _zscore(dd["neg_custody_share"])) / 2.0
     tail = (_zscore(dd["vix"]) + _zscore(dd["credit_spread"])) / 2.0
@@ -329,7 +371,21 @@ def _diff_design(panel_df: pd.DataFrame, fifth: pd.Series,
                 ("tail", tail), ("flow", flow)]
     names = ["const"] + [c[0] for c in cols]
     Xmat = np.column_stack([np.ones(len(y))] + [c[1].to_numpy() for c in cols])
-    return y, Xmat, names, dd.index
+    # ⑤ identifiability: a differenced trend that is constant (e.g. Δ of a linear
+    # time trend) is collinear with the intercept → its coefficient/t are not
+    # identified. Flag it so adjudicate() can exclude it from the diff verdict.
+    flow_var = float(np.var(flow.to_numpy()))
+    flow_identifiable = bool(flow_var > 1e-12 and _adds_rank(Xmat))
+    return y, Xmat, names, dd.index, flow_identifiable
+
+
+def _adds_rank(Xmat: np.ndarray) -> bool:
+    """True iff the last column adds rank to the matrix formed by the others
+    (i.e. the ⑤ regressor is not an exact linear combination of const + ①–④)."""
+    if Xmat.shape[1] < 2:
+        return False
+    without = Xmat[:, :-1]
+    return np.linalg.matrix_rank(Xmat) > np.linalg.matrix_rank(without)
 
 
 @dataclass
@@ -341,13 +397,20 @@ class DiffResult:
     coefs: pd.Series
     tstats: pd.Series
     pvals: pd.Series
+    flow_identifiable: bool = True
 
     @property
     def flow_t(self) -> float:
+        """⑤ t-stat, or NaN when ⑤ is not identified in the difference (e.g. the
+        Δ of a linear time trend is a constant, collinear with the intercept)."""
+        if not self.flow_identifiable:
+            return float("nan")
         return float(self.tstats.get("flow", np.nan))
 
     @property
     def flow_p(self) -> float:
+        if not self.flow_identifiable:
+            return float("nan")
         return float(self.pvals.get("flow", np.nan))
 
 
@@ -360,14 +423,20 @@ def run_diff_fifth(
     cpi_mode: str = "identity",
 ) -> DiffResult:
     """First-difference five-layer attribution. The arbiter: if ⑤ is real it
-    survives here (Δ is stationary); if it was a level-trend artefact it dies."""
-    y, Xmat, names, _ = _diff_design(panel_df, fifth, window, cpi_mode)
+    survives here (Δ is stationary); if it was a level-trend artefact it dies.
+
+    When the differenced ⑤ is constant / collinear with const + ①–④ (codex PR#12
+    P1 — e.g. Δ of a pure linear time trend), its coefficient is not identified;
+    `pinv` would still emit a meaningless t. We flag `flow_identifiable=False` so
+    `flow_t`/`flow_p` return NaN and the diff verdict excludes it."""
+    y, Xmat, names, _, flow_identifiable = _diff_design(panel_df, fifth, window, cpi_mode)
     beta, tstat, pval, r2, _ = _ols(y, Xmat)
     return DiffResult(
         key=key, label=placebo_label(key), r2=float(r2), n=int(len(y)),
         coefs=pd.Series(beta, index=names),
         tstats=pd.Series(tstat, index=names),
         pvals=pd.Series(pval, index=names),
+        flow_identifiable=flow_identifiable,
     )
 
 
@@ -511,11 +580,15 @@ def adjudicate(
 
     # does the difference single out WGC over the monotone placebos' own diff t?
     diff_singles_out = True
+    diff_top_key: Optional[str] = None
+    diff_top_t: float = np.nan
     if diff_placebos:
-        mono_diff_t = [abs(d.flow_t) for d in diff_placebos
-                       if d.key not in ("kink_2022", "REAL_WGC") and np.isfinite(d.flow_t)]
-        if mono_diff_t:
-            diff_singles_out = bool(abs(real_diff.flow_t) >= max(mono_diff_t) - 1e-9)
+        mono = [d for d in diff_placebos
+                if d.key not in ("kink_2022", "REAL_WGC") and np.isfinite(d.flow_t)]
+        if mono:
+            top = max(mono, key=lambda d: abs(d.flow_t))
+            diff_top_key, diff_top_t = top.key, top.flow_t
+            diff_singles_out = bool(abs(real_diff.flow_t) >= abs(top.flow_t) - 1e-9)
 
     if placebo_matches or not survives:
         verdict = "spurious"
@@ -536,10 +609,11 @@ def adjudicate(
         else:
             notes.append(f"形态对照(g)2022拐点 R²={kink.r2:.3f} < 真WGC R²={real.r2:.3f}。")
     if diff_placebos and not diff_singles_out:
+        who = placebo_label(diff_top_key) if diff_top_key else "某 placebo"
         notes.append(
-            f"差分口径下真WGC的⑤ t={real_diff.flow_t:+.2f} **并非**最高(累计CPI/M2 等 placebo 的差分 t 更大),"
-            "即平稳口径并未把真WGC从一众宏观趋势中单独挑出 —— 其差分显著性主要来自 2022-24 购金流量与金价"
-            "同期共振,而非独有结构(推理)。"
+            f"差分口径下真WGC的⑤ t={real_diff.flow_t:+.2f} **并非**最高(placebo「{who}」差分 |t|="
+            f"{abs(diff_top_t):.2f} 更大),即平稳口径并未把真WGC从一众宏观/趋势序列中单独挑出 —— "
+            "其差分显著性主要来自 2022-24 购金流量与金价同期共振,而非独有结构(推理)。"
         )
 
     if verdict == "spurious":
@@ -559,8 +633,9 @@ def adjudicate(
                 "典型伪回归特征,+121%认领是水平趋势拟合假象。"
             )
     elif verdict == "mixed":
+        best_txt = (f"最高 {best.r2:.3f}" if best else "无单调 placebo 可比(n/a)")
         reason = (
-            f"单调趋势 placebo 无一逼近真WGC水平 R²(最高 {best.r2:.3f} vs 真 {real.r2:.3f}),"
+            f"单调趋势 placebo 无一逼近真WGC水平 R²({best_txt} vs 真 {real.r2:.3f}),"
             f"且真WGC的⑤在差分口径存活(t={real_diff.flow_t:.2f}) —— **不是**纯单调趋势伪回归;"
             "**但**真WGC的水平优势主要由 2022 制度拐点形态驱动(见下注),且差分口径未把它从其它宏观趋势中"
             "单独挑出。**裁决:+121% 残差认领含真实的 2022-24 同期共振成分,但应从『央行购金顶价(因果)』"

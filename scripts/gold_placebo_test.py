@@ -73,8 +73,18 @@ def main() -> None:
     idx = df.index
 
     print("[2/6] fetching placebo source series (M2, IP) …", file=sys.stderr)
-    m2 = fetch_fred_series("M2SL", args.start).resample("ME").last().reindex(idx)
-    ip = fetch_fred_series("INDPRO", args.start).resample("ME").last().reindex(idx)
+
+    def _try_fetch(series_id):
+        try:
+            return fetch_fred_series(series_id, args.start).resample("ME").last().reindex(idx)
+        except Exception as e:  # noqa: BLE001 — placebo source is optional
+            print(f"      WARNING: {series_id} fetch failed ({type(e).__name__}: {e}); "
+                  "that placebo will be skipped (core WGC/t/log/rand/kink unaffected).",
+                  file=sys.stderr)
+            return None
+
+    m2 = _try_fetch("M2SL")
+    ip = _try_fetch("INDPRO")
 
     print("[3/6] building ⑤ candidates (real WGC + placebos) …", file=sys.stderr)
     wgc_annual = wgc_cumulative_excess_annual()
@@ -294,8 +304,8 @@ def _write_report(path, args, date, panel, window, base, levels, diffs, stat, ll
         "",
         "## 2. Placebo 电池 — 水平(levels)归因对照（核心表）",
         "",
-        "同一 2010-12→今 窗口、同一①–④,只换⑤。**核心问题:placebo 能否达到与真WGC相近的 "
-        "R²/残差塌缩?**",
+        f"同一窗口({window.min().date()}→{window.max().date()})、同一①–④,只换⑤。"
+        "**核心问题:placebo 能否达到与真WGC相近的 R²/残差塌缩?**",
         "",
         _levels_table_md(base, levels),
         "",
@@ -322,8 +332,11 @@ def _write_report(path, args, date, panel, window, base, levels, diffs, stat, ll
         "",
         f"**差分结论(事实/推理)**:真WGC 的⑤在差分口径 t={_fmt(diffs['REAL_WGC'].flow_t,'+.2f')}、"
         f"p={_fmt(diffs['REAL_WGC'].flow_p,'.3f')} —— "
-        + ("**仍显著(存活)**,说明 +121% 残差认领**不是纯水平伪回归**;但需注意差分口径下真WGC并"
-           "**不比** 2022 拐点/时间趋势更突出(见表),其差分显著性主要来自 2022-24 购金流量与金价同期共振。"
+        + ("**仍显著(存活)**,说明 +121% 残差认领**不是纯水平伪回归**;"
+           + ("但需注意差分口径**未把真WGC单独挑出**(见 §1 注:存在差分 |t| 更大的 placebo),"
+              if not v.diff_singles_out_real else
+              "且在差分口径下真WGC的 |t| 不低于单调 placebo,")
+           + "其差分显著性主要来自 2022-24 购金流量与金价同期共振。"
            if v.survives_in_diff else
            "**不显著(消失)**,levels 显著但差分消失 = 伪回归签名,+121% 认领是水平趋势拟合假象。"),
         "",
@@ -351,7 +364,7 @@ def _write_report(path, args, date, panel, window, base, levels, diffs, stat, ll
         "而是因为它恰好具备金价同期的『先平后升』形状。",
         f"3. **差分口径(事实)**:真WGC的⑤ "
         + ("存活" if v.survives_in_diff else "消失")
-        + (",但**不被单独挑出**(累计CPI/M2 差分 t 更大)" if v.survives_in_diff and not v.diff_singles_out_real else "")
+        + (",但**不被单独挑出**(存在差分 |t| 更大的趋势 placebo)" if v.survives_in_diff and not v.diff_singles_out_real else "")
         + f" —— {'有真实同期共振成分,但不强于其它宏观趋势' if v.survives_in_diff else '伪回归确证'}。",
         "4. **裁决(推理)**:" + {
             "spurious": (
@@ -361,7 +374,7 @@ def _write_report(path, args, date, panel, window, base, levels, diffs, stat, ll
             "mixed": (
                 "+121% 残差认领**含真实的 2022-24 购金↔金价同期共振成分,但远未达到 PR#11 叙事所暗示的"
                 "『央行购金顶价』因果强度**:其 levels 优势主要是 2022 制度拐点的**形态拟合**(零含义拐点对照即可复现),"
-                "差分口径也未将其从累计 CPI/M2 等宏观趋势中单独挑出,且方向存在内生性(金价可能领先购金)。"
+                "差分口径也未将其从其它趋势序列中单独挑出,且方向存在内生性(金价可能领先购金)。"
                 "**应将 PR#11 的⑤认领从『顶价归因』降级为『同期共振相关』** —— 怀疑论主线(『趋势/形态会冒充归因』)"
                 "在更细口径下依然成立。"
             ),
@@ -374,7 +387,7 @@ def _write_report(path, args, date, panel, window, base, levels, diffs, stat, ll
         "**边界/诚实标注**:",
         f"- {WGC_SOURCE_NOTE}",
         f"- 基线baseline=473t 影响累计存量的早段水平,不影响 2022→ 的斜率结论(推理)。",
-        "- 窗口短(2010-12+,WGC 起点);内生性仅做方差归属,非因果识别。",
+        f"- 窗口短({window.min().date()}→{window.max().date()},起点受 WGC 数据约束);内生性仅做方差归属,非因果识别。",
         "- 多分量层③④在差分口径按 Δ 的 z-composite 重建,与 levels 口径同构但非同一系数。",
         "",
         "## 附:产出文件",

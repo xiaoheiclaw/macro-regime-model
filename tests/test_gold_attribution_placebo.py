@@ -123,6 +123,22 @@ def test_random_placebos_are_seed_deterministic():
     pd.testing.assert_series_equal(a, b)
 
 
+def test_cum_placebos_are_cumulative_log_change_not_log_level():
+    """codex PR#12 P2: cum_* must be cumsum of monthly log *changes* (so Δ is the
+    stationary growth rate), NOT cumsum of the log level (whose Δ = log level,
+    non-stationary)."""
+    idx = pd.date_range("2010-12-31", periods=120, freq="ME")
+    cpi = pd.Series(np.linspace(200, 320, 120), index=idx)
+    p = make_placebos(idx, cpi=cpi)["cum_cpi"]
+    # first difference == monthly log change of CPI (anchored at 0 on first row)
+    expected_diff = np.log(cpi).diff().fillna(0.0)
+    pd.testing.assert_series_equal(p.diff().fillna(0.0), expected_diff,
+                                   check_names=False)
+    # and the Δ is bounded/stationary-looking, NOT the rising log level
+    assert p.diff().dropna().abs().max() < 0.1  # monthly inflation, small
+    assert p.iloc[-1] == pytest.approx(np.log(cpi.iloc[-1] / cpi.iloc[0]), abs=1e-9)
+
+
 # ── 3. levels attribution runs under each swapped ⑤ ──────────────────────
 def test_common_window_is_intersection():
     panel, idx = _panel()
@@ -197,6 +213,48 @@ def test_diff_fifth_free_mode_adds_cpi(mode):
         assert "cpi" in d.coefs.index
     else:
         assert "cpi" not in d.coefs.index
+
+
+def test_diff_linear_trend_is_unidentified():
+    """codex PR#12 P1: Δ of a linear time trend t is a constant, collinear with
+    the intercept → ⑤ not identified. flow_identifiable must be False and
+    flow_t/flow_p NaN (so the diff verdict excludes it)."""
+    panel, idx = _panel()
+    wgc = annual_to_monthly(wgc_cumulative_excess_annual(), idx)
+    win = common_window(panel.data, wgc)
+    t = make_placebos(win, rand_seeds=())["t"]
+    d = run_diff_fifth(panel.data, t, key="t", window=win)
+    assert d.flow_identifiable is False
+    assert np.isnan(d.flow_t) and np.isnan(d.flow_p)
+    # a genuinely varying ⑤ (real WGC) stays identified
+    dr = run_diff_fifth(panel.data, wgc, key="REAL_WGC", window=win)
+    assert dr.flow_identifiable is True and np.isfinite(dr.flow_t)
+
+
+def test_diff_drops_noncontiguous_month_gaps():
+    """codex PR#12 P2: differencing must not bridge a multi-month gap. A panel
+    with an internal month removed yields one fewer Δ row than naive diff()."""
+    from lib.gold_attribution_placebo import _contiguous_monthly_diff
+    idx = pd.date_range("2010-12-31", periods=24, freq="ME")
+    sub = pd.DataFrame({"x": np.arange(24.0)}, index=idx)
+    gapped = sub.drop(sub.index[10])  # remove one month → a 2-month gap appears
+    dd = _contiguous_monthly_diff(gapped)
+    # naive diff would give len-1 rows; the gap row (Δ across 2 months) is dropped
+    assert len(dd) == len(gapped) - 1 - 1
+    # every retained Δ corresponds to a 1-month step (value change == 1.0 here)
+    assert np.allclose(dd["x"].to_numpy(), 1.0)
+
+
+def test_levels_fifth_rejects_nan_in_window():
+    """codex PR#12 P2: a ⑤ candidate with NaN on the fixed window must raise, not
+    silently shrink the sample and break the identical-sample comparison."""
+    panel, idx = _panel()
+    wgc = annual_to_monthly(wgc_cumulative_excess_annual(), idx)
+    win = common_window(panel.data, wgc)
+    holed = wgc.copy()
+    holed.loc[win[5]] = np.nan
+    with pytest.raises(ValueError, match="NaN on the fixed window"):
+        run_levels_fifth(panel.data, holed, key="holed", window=win, t0="2022-01")
 
 
 # ── 5. stationarity + lead/lag tables ────────────────────────────────────
@@ -307,3 +365,26 @@ def test_verdict_kink_excluded_from_monotone_matching():
     v = adjudicate(real, placebos, _dr(3.5))
     assert v.real_beats_placebos  # kink not counted
     assert any("拐点" in n for n in v.notes)
+
+
+def test_verdict_only_kink_placebo_does_not_crash():
+    """codex PR#12 P2: with only the kink placebo (no monotone placebos → best is
+    None), the mixed reason must not crash on best.r2."""
+    real = _fr("REAL_WGC", 0.66)
+    placebos = [_fr("kink_2022", 0.88)]  # kink dominates → mixed, best=None
+    v = adjudicate(real, placebos, _dr(3.5))
+    assert v.verdict == "mixed"
+    assert v.best_placebo_key is None and np.isnan(v.best_placebo_r2)
+    assert "n/a" in v.reason
+
+
+def test_verdict_diff_excludes_unidentified_placebo():
+    """A placebo whose differenced ⑤ is unidentified (flow_t NaN) must not count
+    toward diff_singles_out_real (codex PR#12 P1)."""
+    real = _fr("REAL_WGC", 0.66)
+    placebos = [_fr("t", 0.36), _fr("kink_2022", 0.40)]
+    # t's diff is unidentified → NaN; should be ignored, so real (t=3.5) singles out
+    diff_placebos = [_dr_key("t", float("nan")), _dr_key("cum_cpi", 1.0)]
+    v = adjudicate(real, placebos, _dr(3.5), diff_placebos=diff_placebos)
+    assert v.diff_singles_out_real  # NaN-t placebo ignored, real beats cum_cpi(1.0)
+    assert v.verdict == "real"
