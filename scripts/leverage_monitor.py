@@ -25,9 +25,10 @@ repo exposure, breadth) are sell-side-report constants entered as manual
 snapshots BY DESIGN — they have no free first-party feed and are not automated.
 
 Methodology notes baked into the output (anti-misuse):
-  - "debt ÷ market cap" ratio is reported but FLAGGED — it is denominator-
-    polluted (price is driven by the leverage itself) and lags at tops,
-    peaks instead at panic bottoms (2008-10). Used as context, NOT as the
+  - The "debt ÷ S&P price-index proxy" ratio is reported but FLAGGED — note
+    the denominator is the S&P PRICE INDEX, not true market cap. It is
+    denominator-polluted (price is driven by the leverage itself) and lags at
+    tops, peaks instead at panic bottoms (2008-10). Context only, NOT a
     primary risk signal.
   - Primary signals: absolute debt level + 2nd derivative (mom/yoy), and
     net/gross "hardness" (less cash buffer = more fragile).
@@ -40,11 +41,14 @@ from pathlib import Path
 import pandas as pd
 import numpy as np
 
-FRED_KEY = os.environ.get("FRED_API_KEY", "")
-PROJ = Path("~/Projects/lab-macro-regime").expanduser()
-DATA_DIR = PROJ / "data"; DATA_DIR.mkdir(exist_ok=True)
-# Show Page session for this conversation
-SHOW_SRC = Path("~/.avibe/show/sesketjc7zsq6/src").expanduser()
+# Repo root derived from this file's location — portable across CI / forks /
+# arbitrary checkouts (no hardcoded $HOME path). DATA_DIR is created lazily in
+# write_signals(), never at import time.
+PROJ = Path(__file__).resolve().parents[1]
+DATA_DIR = PROJ / "data"
+# Optional Show-Page sink: opt-in only. Set LEVERAGE_SHOW_SRC to a Show-Page
+# `src/` dir to also emit signals.ts there; unset → only the repo JSON is written.
+SHOW_SRC = Path(os.environ["LEVERAGE_SHOW_SRC"]).expanduser() if os.environ.get("LEVERAGE_SHOW_SRC") else None
 
 UA = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"}
 
@@ -68,8 +72,19 @@ def fetch_finra() -> pd.DataFrame:
     df = pd.read_excel(io.BytesIO(raw), sheet_name=0)
     df.columns = ["ym", "debit_M", "cash_credit_M", "margin_credit_M"]
     df = df.dropna(subset=["debit_M"]).copy()
-    df["ym"] = df["ym"].astype(str)
+    df["ym"] = _to_ym(df["ym"])
     return df
+
+
+def _to_ym(s: pd.Series) -> pd.Series:
+    """Coerce a date-ish column (Timestamp, 'Jan-97', '1997-01-31', '1997-01', …)
+    to canonical 'YYYY-MM' so FINRA aligns with Shiller/Yahoo. Fail fast if any
+    row is unparseable — a silent NaT would drop rows and corrupt the series."""
+    dt = pd.to_datetime(s, errors="coerce")
+    if dt.isna().any():
+        bad = s[dt.isna()].astype(str).tolist()[:5]
+        raise ValueError(f"FINRA date column has unparseable values: {bad}")
+    return dt.dt.strftime("%Y-%m")
 
 
 def fetch_shiller_sp() -> pd.Series:
@@ -99,19 +114,21 @@ def fetch_sp500_monthly() -> pd.Series:
     return df.groupby("ym")["close"].last().astype(float).sort_index()
 
 
-def chain_sp(shiller: pd.Series, fred: pd.Series) -> pd.Series:
-    """Shiller base, extended forward with FRED month-over-month returns (keeps one level)."""
+def chain_sp(shiller: pd.Series, ext_sp: pd.Series) -> pd.Series:
+    """Shiller base, extended forward with Yahoo ^GSPC month-over-month returns (keeps one level)."""
     last_ym = shiller.index.max()
-    fmonths = sorted(m for m in fred.index if m >= last_ym)
+    fmonths = sorted(m for m in ext_sp.index if m >= last_ym)
     base = float(shiller.loc[last_ym]); ext = {}; prev = last_ym; P = base
     for m in fmonths[1:]:
-        P *= fred.loc[m] / fred.loc[prev]; ext[m] = P; prev = m
+        P *= ext_sp.loc[m] / ext_sp.loc[prev]; ext[m] = P; prev = m
     out = pd.concat([shiller, pd.Series(ext)]).sort_index()
     return out[~out.index.duplicated(keep="last")]
 
 
 def build_series() -> pd.DataFrame:
-    fin = fetch_finra().set_index("ym")
+    fin = fetch_finra()
+    fin["ym"] = _to_ym(fin["ym"])   # normalize again here (idempotent) so the
+    fin = fin.set_index("ym")       # transform path is robust to any caller/mock
     sp = chain_sp(fetch_shiller_sp(), fetch_sp500_monthly())
     fin["sp"] = sp
     fin = fin.dropna(subset=["sp"]).reset_index().sort_values("ym")
@@ -119,7 +136,7 @@ def build_series() -> pd.DataFrame:
     fin["net_B"] = (fin["debit_M"] - fin["cash_credit_M"].fillna(0)
                     - fin["margin_credit_M"].fillna(0)) / 1000.0
     fin["net_gross"] = fin["net_B"] / fin["gross_B"]
-    fin["ratio"] = fin["gross_B"] / fin["sp"]            # debt ÷ S&P (denominator-polluted — flagged)
+    fin["ratio"] = fin["gross_B"] / fin["sp"]            # debt ÷ S&P price-index proxy (NOT market cap; denominator-polluted — flagged)
     fin["dt"] = pd.to_datetime(fin["ym"], format="%Y-%m")
     return fin.reset_index(drop=True)
 
@@ -155,8 +172,8 @@ def compute(df: pd.DataFrame) -> dict:
             {"label": "net/gross 硬度", "value": f"{cur['net_gross']:.2f}",
              "status": "red" if cur['net_gross'] > 0.6 else ("amber" if cur['net_gross'] > net_med else "green"),
              "note": f"中位 {net_med:.2f}；越高=现金缓冲越少=越脆"},
-            {"label": "debt÷市值 ratio 百分位", "value": f"{pct(df,'ratio',cur['ratio']):.0f}%",
-             "status": "muted", "note": "⚠ 分母污染指标，顶部失真，仅作背景——不据此判断风险"},
+            {"label": "debt÷S&P价格指数(代理) ratio 百分位", "value": f"{pct(df,'ratio',cur['ratio']):.0f}%",
+             "status": "muted", "note": "⚠ 分母是S&P价格指数(非真实市值)，分母污染、顶部失真，仅作背景——不据此判断风险"},
         ],
     }
 
@@ -239,30 +256,34 @@ def compute(df: pd.DataFrame) -> dict:
         "methodology": (
             "跌幅 = 火花 × 放大器 × 燃料。本仪表盘监控三者状态，不预测火花。"
             "primary 信号：绝对债务水平 + 二阶导（mom/yoy）+ net/gross 硬度。"
-            "debt÷市值 ratio 因分母污染（价格被杠杆本身推高），顶部失真、底部虚高，仅作背景。"
+            "debt÷S&P价格指数(代理) ratio 因分母污染（价格被杠杆本身推高，且分母是价格指数而非真实市值），顶部失真、底部虚高，仅作背景。"
         ),
         "sources": [
             "FINRA Customer Margin Balances (官方, 1997+)",
             "Shiller S&P (Yale ie_data.xls, 1871+)",
-            "FRED SP500 (chained 2023+→2026)",
+            "Yahoo Finance ^GSPC monthly close (chains Shiller forward → 2026)",
             "摩根士丹利 6/16、摩根大通 6/26 研报（研报级字段，手工录入）",
         ],
     }
 
 
 def write_signals(sig: dict) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
     (DATA_DIR / "leverage_signals.json").write_text(json.dumps(sig, indent=2, ensure_ascii=False))
+    # Show-Page sink is opt-in via LEVERAGE_SHOW_SRC (see module header).
+    if SHOW_SRC is None:
+        return
     if SHOW_SRC.exists():
         ts = "// AUTO-GENERATED by scripts/leverage_monitor.py — do not edit by hand.\n"
         ts += "export const SIGNALS = " + json.dumps(sig, ensure_ascii=False) + " as const;\n"
         (SHOW_SRC / "signals.ts").write_text(ts)
         print(f"  → wrote show page: {SHOW_SRC/'signals.ts'}")
     else:
-        print(f"  (show src not found at {SHOW_SRC}, skipped ts)")
+        print(f"  (LEVERAGE_SHOW_SRC set but {SHOW_SRC} not found, skipped ts)")
 
 
 def main() -> None:
-    print("[1/3] Fetch FINRA + Shiller + FRED ...")
+    print("[1/3] Fetch FINRA + Shiller + Yahoo ^GSPC ...")
     df = build_series()
     print(f"      merged {len(df)} months: {df['ym'].iloc[0]} → {df['ym'].iloc[-1]}")
     print("[2/3] Compute 3-layer signals ...")
