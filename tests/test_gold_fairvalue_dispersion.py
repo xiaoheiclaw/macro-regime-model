@@ -233,15 +233,38 @@ def test_estimator_gaps_are_log_ratios():
 
 
 # ── 4. dispersion rank ──────────────────────────────────────────────────
-def test_rank_in_unit_interval_and_monotone():
-    n, w = 80, 30
+def test_dispersion_rank_reaches_zero_and_one():
+    """The rank maps the trailing-window MIN → 0.0 and MAX → 1.0 — the contract a
+    bare .rank(pct=True) (floor 1/window) would violate, and that the soft weight
+    (1 − rank) needs to return to FULL trend at the dispersion minimum."""
+    n, w = 60, 30
     idx = pd.date_range("1990-01-31", periods=n, freq="ME")
-    # a clean monotone-increasing dispersion → rank should climb toward 1
-    disp = pd.Series(np.linspace(0.05, 0.5, n), index=idx)
+    disp = pd.Series(0.30, index=idx)
+    disp.iloc[40] = 0.01   # window min (inside full windows from t=40 on)
+    disp.iloc[50] = 0.99   # window max
     rank = dispersion_rank(disp, w)
-    assert rank.min() >= 0.0 and rank.max() <= 1.0
-    # the last value is the window max → rank == 1.0
-    np.testing.assert_allclose(rank.iloc[-1], 1.0)
+    assert rank.dropna().between(0.0, 1.0).all()
+    np.testing.assert_allclose(rank.iloc[40], 0.0)   # own value is its window min
+    np.testing.assert_allclose(rank.iloc[50], 1.0)   # own value is its window max
+
+
+def test_dispersion_rank_tied_min_is_zero():
+    """method='min': tied minima all take the smallest rank → 0.0 after rescale
+    (not an averaged mid-rank), so repeated consensus readings gate identically
+    to a single one."""
+    n, w = 60, 30
+    idx = pd.date_range("1990-01-31", periods=n, freq="ME")
+    disp = pd.Series(np.linspace(0.2, 0.4, n), index=idx)  # rising baseline
+    disp.iloc[20] = 0.01
+    disp.iloc[40] = 0.01   # ties the min; t=40 sits inside a full window
+    rank = dispersion_rank(disp, w)
+    np.testing.assert_allclose(rank.iloc[40], 0.0)   # tied min → 0.0, not averaged
+
+
+def test_dispersion_rank_rejects_window_of_one():
+    idx = pd.date_range("1990-01-31", periods=10, freq="ME")
+    with pytest.raises(ValueError):
+        dispersion_rank(pd.Series(np.arange(10.0), index=idx), window=1)
 
 
 # ── 5. S4 positions ─────────────────────────────────────────────────────
@@ -415,3 +438,21 @@ def test_estimator_coverage_reports_skipped_lens():
     assert cov.loc["a", "n_months"] == 10
     assert cov.loc["b", "n_months"] == 0
     assert pd.isna(cov.loc["b", "first"])
+
+
+def test_landmarks_snap_to_month_end():
+    """A 'YYYY-MM' landmark must hit that month's END row (the panel is month-end
+    indexed), not the prior month. Regression for pd.Timestamp('2011-09')→
+    2011-09-01 silently reading the 2011-08 row."""
+    from scripts.gold_dispersion_backtest import landmarks_table
+    idx = pd.date_range("2007-01-31", periods=180, freq="ME")  # 2007-01 .. 2021-12
+    disp = pd.Series(np.arange(180.0), index=idx)
+    rank = pd.Series(np.linspace(0.0, 1.0, 180), index=idx)
+    n_est = pd.Series(6, index=idx)
+    lm = landmarks_table(disp, rank, n_est, idx)
+    # '2011-09' → 2011-09-30, not 2011-08-31
+    assert lm.loc["2011-09 nominal peak", "month"] == "2011-09"
+    assert lm.loc["2011-09 nominal peak", "dispersion"] == disp.loc[pd.Timestamp("2011-09-30")]
+    # '2020-03' → 2020-03-31, not 2020-02-29
+    assert lm.loc["2020-03 COVID trough", "month"] == "2020-03"
+

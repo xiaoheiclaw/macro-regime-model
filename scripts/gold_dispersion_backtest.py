@@ -95,6 +95,21 @@ LANDMARKS: List[tuple[str, str]] = [
 DISP_WINDOW_BAND = (60, 120)
 
 
+def _month_start(s: str) -> pd.Timestamp:
+    """Snap a date string (YYYY-MM or YYYY-MM-DD) to the first day of its month.
+    Robust to the YYYY-MM form so segment start bounds never silently land on a
+    mid/month-start that mis-slices a month-end panel."""
+    return pd.Period(s, freq="M").to_timestamp()
+
+
+def _month_end(s: str) -> pd.Timestamp:
+    """Snap a date string (YYYY-MM or YYYY-MM-DD) to the LAST day (month-end) of
+    its month. The panel is month-end indexed, so an end bound must be a month-end
+    or `<= bound` drops the final month (e.g. '2011-09' → 2011-09-01 would exclude
+    the 2011-09-30 row and mis-read the landmark one month early)."""
+    return pd.Period(s, freq="M").to_timestamp("M")
+
+
 def compute_implieds(df: pd.DataFrame, calib_window: int) -> Dict[str, pd.Series]:
     """All six fair-value implied-gold lenses, each calibrated on a trailing
     `calib_window` (ex-ante). A lens whose input is missing returns NaN there
@@ -111,7 +126,7 @@ def compute_implieds(df: pd.DataFrame, calib_window: int) -> Dict[str, pd.Series
 
 
 def build_positions(
-    panel: pd.DataFrame, rank: pd.Series, disp_window_label: str
+    panel: pd.DataFrame, rank: pd.Series
 ) -> Dict[str, pd.Series]:
     """S0 / S1 / S4_hard / S4_soft. S1 and S4 share the 3/6/12 blend + vol target,
     so the only difference is the dispersion weight on S4."""
@@ -127,7 +142,7 @@ def build_positions(
 def run_all(
     panel: pd.DataFrame, rank: pd.Series, cost_bps: float
 ) -> Dict[str, pd.DataFrame]:
-    positions = build_positions(panel, rank, "")
+    positions = build_positions(panel, rank)
     return {
         label: run_backtest(p, panel["gold_ret"], panel["tbill_ret"], cost_bps=cost_bps)
         for label, p in positions.items()
@@ -149,8 +164,8 @@ def landmarks_table(
     warm-up (e.g. 1980, before the rank window fills) — both shown honestly."""
     rows = []
     for name, ds in LANDMARKS:
-        ts = pd.Timestamp(ds)
-        # nearest on-or-before panel month; fall back to nearest any-side
+        # snap to MONTH-END so '2011-09' matches the 2011-09-30 row, not 2011-08-31
+        ts = _month_end(ds)
         valid = panel_index[panel_index <= ts]
         idx = valid[-1] if len(valid) else panel_index[0]
         rows.append({
@@ -192,8 +207,9 @@ def verdict(full: pd.DataFrame, landmarks: pd.DataFrame) -> str:
     s4h_beats_s1 = better(s4h, s1)
     s4s_beats_s1 = better(s4s, s1)
     s4_beats_s1 = s4h_beats_s1 or s4s_beats_s1
-    best = s4h if (s4h["calmar"] + s4h["sharpe"]) >= (s4s["calmar"] + s4s["sharpe"]) else s4s
-    best_label = "S4_hard" if best is s4h else "S4_soft"
+    # name the variant(s) that actually clear the decisive bar — do NOT pick a
+    # "representative" by summing Sharpe+Calmar (different scales, weak meaning).
+    winners = [lbl for lbl, won in (("S4_hard", s4h_beats_s1), ("S4_soft", s4s_beats_s1)) if won]
 
     lines = ["## Verdict (honest kill conditions, net of cost)\n"]
     lines.append(f"- S1_blend vs S0: Sharpe {s1['sharpe']:.2f} vs {s0['sharpe']:.2f}, "
@@ -207,23 +223,28 @@ def verdict(full: pd.DataFrame, landmarks: pd.DataFrame) -> str:
                  f"{'soft dispersion ADDS edge' if s4s_beats_s1 else 'no edge'}")
     lines.append("")
 
-    # descriptive validity: did dispersion actually spike at the named turns?
-    valid_lm = landmarks.dropna(subset=["dispersion"])
-    if len(valid_lm) >= 2:
-        med = valid_lm["dispersion"].median()
-        spike = valid_lm[valid_lm["dispersion"] > med]
-        validity = (f"the dispersion *did* rise above its landmark median at "
-                    f"{len(spike)}/{len(valid_lm)} named turns "
-                    f"(landmarks table below) — the signal is *valid* descriptively")
+    # descriptive validity: did dispersion actually spike at the named turns? Use
+    # the strategy's OWN high-dispersion tier (rank ≥ 2/3, where S4_hard exits) as
+    # the "spike" bar — coherent with what the strategy acts on — rather than a
+    # raw cross-landmark value comparison (which only ranks the 5 landmarks against
+    # EACH OTHER, not against their history). Only rankable turns count: the 1980
+    # peak has no rank yet (the rank window hasn't filled by then).
+    rankable = landmarks.dropna(subset=["rank"])
+    if len(rankable) >= 2:
+        n_hi = int((rankable["rank"] >= 2.0 / 3.0).sum())
+        validity = (f"the dispersion DID enter the strategy's high-dispersion tier "
+                    f"(rank ≥ 2/3, where S4_hard exits) at {n_hi}/{len(rankable)} "
+                    "rankable named turns (landmarks table) — the signal is *valid* "
+                    "descriptively")
     else:
-        validity = "too few landmark readings to describe"
+        validity = "too few rankable landmark readings to describe"
 
     if s4_beats_s1:
-        lines.append(f"**① DISPERSION HAS EDGE: {best_label} beats S1 pure trend on a "
-                     "risk-adjusted, cost-net basis — the cross-lens disagreement captures "
-                     "turn information that S1's trend alone misses. (Edge must also survive "
-                     "the dispersion-window band below to count as OOS structure, not a "
-                     f"parameter artifact.) Descriptively, {validity}.**")
+        lines.append(f"**① DISPERSION HAS EDGE: {' and '.join(winners)} beat S1 pure "
+                     "trend on a risk-adjusted, cost-net basis — the cross-lens disagreement "
+                     "captures turn information that S1's trend alone misses. (Edge must also "
+                     "survive the dispersion-window band below to count as OOS structure, not "
+                     f"a parameter artifact.) Descriptively, {validity}.**")
     else:
         lines.append("**② KILLED: scaling trend by valuation dispersion adds nothing over "
                      "S1 pure trend on both decisive metrics (Sharpe AND Calmar). S1's price "
@@ -329,7 +350,10 @@ def main() -> None:
     sens_cost: Dict[float, pd.DataFrame] = {}
     for c in (0.0, 10.0, 20.0):
         bt_c = run_all(panel, rank, c)
-        m = metrics_table(bt_c).loc[["S0_buyhold", "S1_blend", "S4_hard", "S4_soft"]]
+        # score on the SAME common investable window as the main table — not on
+        # metrics_table's implicit per-cost common_span — so the cost band stays
+        # same-track with the headline comparison.
+        m = metrics_table(bt_c, cstart, cend).loc[["S0_buyhold", "S1_blend", "S4_hard", "S4_soft"]]
         sens_cost[c] = m[["sharpe", "calmar", "max_dd", "cagr"]]
 
     lm = landmarks_table(disp, rank, n_est, panel.index)
@@ -401,9 +425,13 @@ def main() -> None:
     pmin, pmax = panel.index.min(), panel.index.max()
     min_seg_months = 12
     for name, s, e in DEFAULT_SEGMENTS:
-        score_lo = max(cstart, pd.Timestamp(s))
-        score_hi = min(cend, pd.Timestamp(e))
-        if pd.Timestamp(s) > pmax or pd.Timestamp(e) < pmin:
+        # snap start→month-start, end→month-end so a YYYY-MM end bound includes
+        # its month-end row (pd.Timestamp('2000-12') would land on the 1st and
+        # drop Dec) — same helper the landmarks use, so titles match scored months.
+        seg_lo, seg_hi = _month_start(s), _month_end(e)
+        score_lo = max(cstart, seg_lo)
+        score_hi = min(cend, seg_hi)
+        if seg_lo > pmax or seg_hi < pmin:
             parts.append(f"### {name}\n_(skipped: no overlap with sample)_\n")
             continue
         m = metrics_table(backtests, score_lo, score_hi)

@@ -283,16 +283,25 @@ def dispersion(
 def dispersion_rank(
     disp: pd.Series, window: int = DEFAULT_DISP_WINDOW
 ) -> pd.Series:
-    """Leak-free ∈[0,1] rolling percentile rank of dispersion (trailing window):
-    0 = dispersion at its trailing-window MIN (consensus), 1 = at its MAX (max
-    disagreement). NaN until the window fills.
+    """Leak-free ∈[0,1] rolling rank of dispersion (trailing window): 0 = the
+    trailing-window MIN (consensus), 1 = the MAX (max disagreement). NaN until
+    the window fills.
 
-    The rank (not the raw dispersion) is what gates the strategy, so the gate is
-    adaptive to the dispersion distribution and never depends on a tuned absolute
-    threshold. `.rolling(window).rank(pct=True)` uses data ≤ t only → ex-ante."""
-    if window <= 0:
-        raise ValueError(f"window must be a positive integer, got {window}")
-    return disp.rolling(window, min_periods=window).rank(pct=True)
+    The rank (not the raw dispersion) gates the strategy, so the gate is adaptive
+    to the dispersion distribution and never depends on a tuned absolute threshold.
+
+    Implementation: a raw ``.rolling().rank(pct=True)`` bottoms out at 1/window
+    (the smallest of W values ranks 1/W), NOT 0 — that would violate the "0 = min"
+    contract and stop the soft weight (1−rank) ever returning to full trend at the
+    dispersion minimum. So we rank with ``method="min"`` (integer ranks; ties take
+    the smallest rank) and linearly rescale to a true [0,1]: (raw−1)/(window−1).
+    The trailing window uses data ≤ t only → ex-ante."""
+    if window < 2:
+        # window=1 makes (raw-1)/(window-1) a div-by-0; a 1-month "window" is also
+        # a degenerate rank (the lone point is both min and max → no information).
+        raise ValueError(f"window must be >= 2, got {window}")
+    raw = disp.rolling(window, min_periods=window).rank(method="min")
+    return ((raw - 1.0) / (window - 1.0)).clip(lower=0.0, upper=1.0)
 
 
 def estimator_count(gaps: pd.DataFrame) -> pd.Series:
