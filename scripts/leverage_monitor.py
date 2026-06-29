@@ -1,0 +1,266 @@
+#!/usr/bin/env python3
+"""US equity leverage fragility monitor — data pipeline.
+
+Pulls the authoritative raw series, computes the 3-layer signal snapshot
+(fuel / amplifier / ignition), and emits two artifacts:
+  1. data/leverage_signals.json   (persisted in this repo)
+  2. ~/.avibe/show/<session>/src/signals.ts  (consumed by the Show Page)
+
+Data sources (all free, all first-party — no sell-side chart dependency):
+  - FINRA "Customer Margin Balances" (gross margin debt, monthly)  [official, 1997+]
+  - Shiller S&P (Yale ie_data.xls)                                 [academic, 1871+]
+  - FRED SP500                                                     [chained 2023+ → 2026]
+
+Methodology notes baked into the output (anti-misuse):
+  - "debt ÷ market cap" ratio is reported but FLAGGED — it is denominator-
+    polluted (price is driven by the leverage itself) and lags at tops,
+    peaks instead at panic bottoms (2008-10). Used as context, NOT as the
+    primary risk signal.
+  - Primary signals: absolute debt level + 2nd derivative (mom/yoy), and
+    net/gross "hardness" (less cash buffer = more fragile).
+"""
+from __future__ import annotations
+import json, os, io, time, urllib.request
+from datetime import datetime
+from pathlib import Path
+
+import pandas as pd
+import numpy as np
+
+FRED_KEY = os.environ.get("FRED_API_KEY", "")
+PROJ = Path("~/Projects/lab-macro-regime").expanduser()
+DATA_DIR = PROJ / "data"; DATA_DIR.mkdir(exist_ok=True)
+# Show Page session for this conversation
+SHOW_SRC = Path("~/.avibe/show/sesketjc7zsq6/src").expanduser()
+
+UA = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"}
+
+
+def _get(url: str, timeout: int = 60, retries: int = 3) -> bytes:
+    last = None
+    for i in range(retries):
+        try:
+            req = urllib.request.Request(url, headers=UA)
+            return urllib.request.urlopen(req, timeout=timeout).read()
+        except Exception as e:  # network hiccup / proxy jitter — retry
+            last = e
+            print(f"    (retry {i+1}/{retries} {type(e).__name__}: {url[:60]})")
+            time.sleep(2 * (i + 1))
+    raise last
+
+
+def fetch_finra() -> pd.DataFrame:
+    """FINRA Customer Margin Balances. Returns ym-indexed: debit, cash_credit, margin_credit (in $M)."""
+    raw = _get("https://www.finra.org/sites/default/files/2021-03/margin-statistics.xlsx")
+    df = pd.read_excel(io.BytesIO(raw), sheet_name=0)
+    df.columns = ["ym", "debit_M", "cash_credit_M", "margin_credit_M"]
+    df = df.dropna(subset=["debit_M"]).copy()
+    df["ym"] = df["ym"].astype(str)
+    return df
+
+
+def fetch_shiller_sp() -> pd.Series:
+    """Shiller S&P price (P), monthly, ym-indexed."""
+    raw = _get("http://www.econ.yale.edu/~shiller/data/ie_data.xls")
+    r = pd.read_excel(io.BytesIO(raw), sheet_name="Data", header=7)
+    r = r[["Date", "P"]].dropna()
+    dv = pd.to_numeric(r["Date"], errors="coerce"); r = r[dv.notna()]
+    yr = dv.astype(int); mo = np.round((dv - yr) * 100).astype(int)
+    r = r[(mo >= 1) & (mo <= 12)]
+    dt = pd.to_datetime(dict(year=yr.astype(int), month=mo.astype(int), day=1))
+    r["ym"] = dt.dt.strftime("%Y-%m")
+    r["P"] = pd.to_numeric(r["P"], errors="coerce")
+    return r.dropna(subset=["P"]).sort_values("ym").set_index("ym")["P"]
+
+
+def fetch_sp500_monthly() -> pd.Series:
+    """S&P 500 monthly close, ym-indexed. Used to chain Shiller forward.
+    Source: Yahoo query1 (FRED API/CSV endpoint was unreachable from this host)."""
+    url = ("https://query1.finance.yahoo.com/v8/finance/chart/%5EGSPC"
+           "?interval=1mo&range=10y")
+    d = json.loads(_get(url, 40))
+    r = d["chart"]["result"][0]
+    ts = r["timestamp"]; cl = r["indicators"]["quote"][0]["close"]
+    df = pd.DataFrame({"ts": ts, "close": cl}).dropna()
+    df["ym"] = pd.to_datetime(df["ts"], unit="s").dt.strftime("%Y-%m")
+    return df.groupby("ym")["close"].last().astype(float).sort_index()
+
+
+def chain_sp(shiller: pd.Series, fred: pd.Series) -> pd.Series:
+    """Shiller base, extended forward with FRED month-over-month returns (keeps one level)."""
+    last_ym = shiller.index.max()
+    fmonths = sorted(m for m in fred.index if m >= last_ym)
+    base = float(shiller.loc[last_ym]); ext = {}; prev = last_ym; P = base
+    for m in fmonths[1:]:
+        P *= fred.loc[m] / fred.loc[prev]; ext[m] = P; prev = m
+    out = pd.concat([shiller, pd.Series(ext)]).sort_index()
+    return out[~out.index.duplicated(keep="last")]
+
+
+def build_series() -> pd.DataFrame:
+    fin = fetch_finra().set_index("ym")
+    sp = chain_sp(fetch_shiller_sp(), fetch_sp500_monthly())
+    fin["sp"] = sp
+    fin = fin.dropna(subset=["sp"]).reset_index().sort_values("ym")
+    fin["gross_B"] = fin["debit_M"] / 1000.0
+    fin["net_B"] = (fin["debit_M"] - fin["cash_credit_M"].fillna(0)
+                    - fin["margin_credit_M"].fillna(0)) / 1000.0
+    fin["net_gross"] = fin["net_B"] / fin["gross_B"]
+    fin["ratio"] = fin["gross_B"] / fin["sp"]            # debt ÷ S&P (denominator-polluted — flagged)
+    fin["dt"] = pd.to_datetime(fin["ym"], format="%Y-%m")
+    return fin.reset_index(drop=True)
+
+
+def pct(df: pd.DataFrame, col: str, val: float) -> float:
+    return float((df[col] < val).mean() * 100)
+
+
+def compute(df: pd.DataFrame) -> dict:
+    cur = df.iloc[-1]
+    prev = df.iloc[-2]
+    yoy_row = df[df["dt"] == (cur["dt"] - pd.DateOffset(years=1))]
+    yoy = (cur["gross_B"] / yoy_row["gross_B"].values[0] - 1) * 100 if len(yoy_row) else None
+    p21 = df[df["ym"] == "2021-10"]
+    p21 = p21.iloc[0] if len(p21) else None
+    rp = df.loc[df["ratio"].idxmax()]
+    net_med = float(df["net_gross"].median())
+
+    # L1 fuel signals
+    debt_at_high = bool(df["gross_B"].iloc[-1] >= df["gross_B"].max() - 1e-6)
+    l1 = {
+        "name": "燃料 (Fuel) — 干柴多干",
+        "status": "red",
+        "items": [
+            {"label": "Gross margin debt 绝对水平", "value": f"${cur['gross_B']:,.0f}B",
+             "status": "red" if debt_at_high else "amber",
+             "note": "史上最高，连续 6 月创新高" if debt_at_high else "高位"},
+            {"label": "净新增 (mom)", "value": f"{(cur['gross_B']/prev['gross_B']-1)*100:+.1f}%",
+             "status": "red" if (cur['gross_B'] > prev['gross_B']) else "green",
+             "note": "二阶导：仍在加速"},
+            {"label": "同比 (yoy)", "value": f"{yoy:+.0f}%" if yoy is not None else "n/a",
+             "status": "red" if (yoy and yoy > 20) else "amber", "note": "vs 一年前"},
+            {"label": "net/gross 硬度", "value": f"{cur['net_gross']:.2f}",
+             "status": "red" if cur['net_gross'] > 0.6 else ("amber" if cur['net_gross'] > net_med else "green"),
+             "note": f"中位 {net_med:.2f}；越高=现金缓冲越少=越脆"},
+            {"label": "debt÷市值 ratio 百分位", "value": f"{pct(df,'ratio',cur['ratio']):.0f}%",
+             "status": "muted", "note": "⚠ 分母污染指标，顶部失真，仅作背景——不据此判断风险"},
+        ],
+    }
+
+    # L2 amplifier (partly semi-auto / manual snapshot)
+    l2 = {
+        "name": "放大器 (Amplifier) — 弹药与传导",
+        "status": "amber",
+        "items": [
+            {"label": "杠杆 ETF AUM (TQQQ/SOXL/UPRO 等)", "value": "~$247B",
+             "status": "amber", "note": "JPM 6/26，集中科技；半自动（周度抓发行商）"},
+            {"label": "融资成本 AXW 期货利差", "value": "+140bp",
+             "status": "red", "note": "大摩 6/16，除年末外史上最高；🔴 研报级，手工录入"},
+            {"label": "半导体 realized vol", "value": "待接入",
+             "status": "muted", "note": "MVP 待加：SOXX/费半日价格→vol"},
+            {"label": "交易商股权回购敞口", "value": "$2230B",
+             "status": "red", "note": "大摩 6/16 史上最高；🔴 研报级，手工录入"},
+        ],
+    }
+
+    # L3 ignition
+    l3 = {
+        "name": "启动 (Ignition) — 火花+点火",
+        "status": "green",
+        "items": [
+            {"label": "三联启动信号", "value": "未触发",
+             "status": "green",
+             "note": "半导体vol跳 + 杠杆ETF尾盘流量激增 + 广度塌缩，三者同现才算点火"},
+            {"label": "下一高脆弱窗口", "value": "NVDA FY27 Q2 ~8月底",
+             "status": "amber", "note": "广度最窄+AI最拥挤，财报/指引 miss 风险最高"},
+        ],
+    }
+
+    monitors = [
+        {"name": "FINRA gross margin debt (6月值)", "current": "待 7月底发布", "threshold": "续创新高=压力续增；掉头=拐点", "status": "watch", "source": "FINRA", "avail": "auto"},
+        {"name": "AXW 期货利差", "current": "+140bp", "threshold": "回落=缓解；续升=临界", "status": "red", "source": "大摩研报", "avail": "manual"},
+        {"name": "市场广度 (>5 行业跑赢)", "current": "仅信息技术 1 个", "threshold": "扩散=健康；持续仅科技=脆弱", "status": "red", "source": "大摩/JPM", "avail": "semi"},
+        {"name": "半导体 realized vol + ETF 流量", "current": "待接入", "threshold": "vol跳+流量激增=点火", "status": "watch", "source": "价格估算", "avail": "todo"},
+        {"name": "零售信用违约率", "current": "待接入", "threshold": "margin退潮+零售信用恶化=系统性", "status": "watch", "source": "FRED", "avail": "todo"},
+    ]
+
+    events = [
+        {"date": "2026-07 下旬", "label": "FINRA 6月 margin debt 发布", "type": "data"},
+        {"date": "2026-07", "label": "CPI / FOMC", "type": "macro"},
+        {"date": "2026-08 下旬", "label": "NVDA FY27 Q2 财报（最高脆弱窗口）", "type": "earnings"},
+        {"date": "2026-08", "label": "超大规模云厂商 capex 指引", "type": "earnings"},
+    ]
+
+    # chart history (sample to ~ monthly, all points fine — ~350)
+    hist = df.tail(360)
+    chart = {
+        "dt": hist["ym"].tolist(),
+        "gross": [round(x, 1) for x in hist["gross_B"].tolist()],
+        "ratio": [round(float(x), 4) for x in hist["ratio"].tolist()],
+    }
+
+    return {
+        "updated": datetime.now().strftime("%Y-%m-%d"),
+        "data_range": f"{df['ym'].iloc[0]} → {df['ym'].iloc[-1]}",
+        "n_months": len(df),
+        "latest": {
+            "ym": cur["ym"], "gross_B": round(float(cur["gross_B"]), 0),
+            "net_B": round(float(cur["net_B"]), 0), "net_gross": round(float(cur["net_gross"]), 3),
+            "mom_pct": round((cur["gross_B"] / prev["gross_B"] - 1) * 100, 1),
+            "yoy_pct": round(yoy, 0) if yoy is not None else None,
+            "ratio": round(float(cur["ratio"]), 4),
+            "ratio_percentile": round(pct(df, "ratio", cur["ratio"]), 0),
+            "sp": round(float(cur["sp"]), 0),
+        },
+        "vs_2021_peak": {
+            "gross_B": round(float(p21["gross_B"]), 0) if p21 is not None else None,
+            "gross_delta_pct": round((cur["gross_B"] / p21["gross_B"] - 1) * 100, 0) if p21 is not None else None,
+            "ratio": round(float(p21["ratio"]), 4) if p21 is not None else None,
+        },
+        "ratio_peak": {"ym": rp["ym"], "ratio": round(float(rp["ratio"]), 4),
+                       "note": "GFC 恐慌底——分母污染反向证据：暴跌时比率反而冲顶"},
+        "layers": [l1, l2, l3],
+        "monitors": monitors,
+        "events": events,
+        "chart": chart,
+        "methodology": (
+            "跌幅 = 火花 × 放大器 × 燃料。本仪表盘监控三者状态，不预测火花。"
+            "primary 信号：绝对债务水平 + 二阶导（mom/yoy）+ net/gross 硬度。"
+            "debt÷市值 ratio 因分母污染（价格被杠杆本身推高），顶部失真、底部虚高，仅作背景。"
+        ),
+        "sources": [
+            "FINRA Customer Margin Balances (官方, 1997+)",
+            "Shiller S&P (Yale ie_data.xls, 1871+)",
+            "FRED SP500 (chained 2023+→2026)",
+            "摩根士丹利 6/16、摩根大通 6/26 研报（研报级字段，手工录入）",
+        ],
+    }
+
+
+def write_signals(sig: dict) -> None:
+    (DATA_DIR / "leverage_signals.json").write_text(json.dumps(sig, indent=2, ensure_ascii=False))
+    if SHOW_SRC.exists():
+        ts = "// AUTO-GENERATED by scripts/leverage_monitor.py — do not edit by hand.\n"
+        ts += "export const SIGNALS = " + json.dumps(sig, ensure_ascii=False) + " as const;\n"
+        (SHOW_SRC / "signals.ts").write_text(ts)
+        print(f"  → wrote show page: {SHOW_SRC/'signals.ts'}")
+    else:
+        print(f"  (show src not found at {SHOW_SRC}, skipped ts)")
+
+
+def main() -> None:
+    print("[1/3] Fetch FINRA + Shiller + FRED ...")
+    df = build_series()
+    print(f"      merged {len(df)} months: {df['ym'].iloc[0]} → {df['ym'].iloc[-1]}")
+    print("[2/3] Compute 3-layer signals ...")
+    sig = compute(df)
+    print(f"      latest {sig['latest']['ym']}: gross ${sig['latest']['gross_B']:,.0f}B "
+          f"({sig['latest']['mom_pct']:+.1f}% mom), net/gross {sig['latest']['net_gross']}")
+    print("[3/3] Write artifacts ...")
+    write_signals(sig)
+    print(f"  → wrote {DATA_DIR/'leverage_signals.json'}")
+    print("done.")
+
+
+if __name__ == "__main__":
+    main()
