@@ -800,6 +800,417 @@ def estimate_vecm(
     }
 
 
+# ── Gregory-Hansen cointegration with a single endogenous break (step 3) ─
+# PR #3. PR #1 (bivariate Johansen) and PR #2 (trivariate Johansen) both fail to
+# find a STABLE constant-parameter cointegrating relation. The next falsifiable
+# question (spec §2 cross-validation): is the anchor *segmented* — i.e. does a
+# cointegrating relation exist once we allow ONE structural break (level shift /
+# regime shift) at an unknown date? Gregory & Hansen (1996, J. Econometrics 70)
+# answer this with a residual-based test whose null is "no cointegration" and
+# whose alternative is "cointegration with a regime shift at an unknown break".
+#
+# Procedure (GH 1996):
+#   For every candidate break index in the trimmed interior τ∈[trim, 1−trim]:
+#     fit the cointegrating regression with a break dummy φ_t = 1{t > [Tτ]}:
+#       model "C"  (level shift)  : y1 = μ1 + μ2·φ + αᵀy2 + e
+#       model "C/T"(level+trend)  : y1 = μ1 + μ2·φ + β·t + αᵀy2 + e
+#       model "C/S"(regime shift) : y1 = μ1 + μ2·φ + α1ᵀy2 + α2ᵀ(y2·φ) + e
+#     then test the residual e for a unit root (ADF*, Phillips Zt*, Zα*).
+#   The GH statistic for each flavor = the SMALLEST (most negative) statistic
+#   across all break points; the argmin is the estimated break. Reject "no
+#   cointegration" when the GH statistic < the GH critical value (which is more
+#   negative than the standard ADF/PP CVs because we minimized over breaks).
+#
+# Critical values: Gregory & Hansen (1996) Table 1, indexed by model and m =
+# number of I(1) regressors (m=1 bivariate, m=2 trivariate). ADF* and Zt* share
+# one CV table; Zα* has its own.
+_GH_CV = {
+    "C": {  # level shift
+        "adf_zt": {
+            1: {0.01: -5.13, 0.05: -4.61, 0.10: -4.34},
+            2: {0.01: -5.44, 0.05: -4.92, 0.10: -4.69},
+            3: {0.01: -5.77, 0.05: -5.28, 0.10: -5.02},
+            4: {0.01: -6.05, 0.05: -5.56, 0.10: -5.31},
+        },
+        "zalpha": {
+            1: {0.01: -50.07, 0.05: -40.48, 0.10: -36.19},
+            2: {0.01: -57.28, 0.05: -47.96, 0.10: -43.22},
+            3: {0.01: -63.64, 0.05: -53.58, 0.10: -48.65},
+            4: {0.01: -70.27, 0.05: -59.40, 0.10: -54.38},
+        },
+    },
+    "C/T": {  # level shift with trend
+        "adf_zt": {
+            1: {0.01: -5.45, 0.05: -4.99, 0.10: -4.72},
+            2: {0.01: -5.80, 0.05: -5.29, 0.10: -5.03},
+            3: {0.01: -6.05, 0.05: -5.57, 0.10: -5.33},
+            4: {0.01: -6.36, 0.05: -5.83, 0.10: -5.59},
+        },
+        "zalpha": {
+            1: {0.01: -57.01, 0.05: -47.65, 0.10: -43.34},
+            2: {0.01: -64.77, 0.05: -53.92, 0.10: -48.94},
+            3: {0.01: -70.15, 0.05: -59.76, 0.10: -54.94},
+            4: {0.01: -76.10, 0.05: -65.44, 0.10: -60.12},
+        },
+    },
+    "C/S": {  # regime shift (level + slope)
+        "adf_zt": {
+            1: {0.01: -5.47, 0.05: -4.95, 0.10: -4.68},
+            2: {0.01: -5.97, 0.05: -5.50, 0.10: -5.23},
+            3: {0.01: -6.51, 0.05: -6.00, 0.10: -5.75},
+            4: {0.01: -6.92, 0.05: -6.41, 0.10: -6.17},
+        },
+        "zalpha": {
+            1: {0.01: -57.17, 0.05: -47.04, 0.10: -41.85},
+            2: {0.01: -68.21, 0.05: -58.33, 0.10: -52.85},
+            3: {0.01: -80.15, 0.05: -68.94, 0.10: -63.42},
+            4: {0.01: -90.84, 0.05: -78.87, 0.10: -72.75},
+        },
+    },
+}
+
+
+def gregory_hansen_min_obs(m: int, max_lag: int = 6) -> int:
+    """Minimum complete rows ``gregory_hansen_test`` requires for ``m`` regressors
+    and ``max_lag`` ADF augmentation. Exposed so callers gate on the SAME bound
+    the test enforces internally (no divergent magic thresholds)."""
+    n_params_cs = 2 + 2 * m  # the largest design (C/S)
+    return max(40, 4 * (n_params_cs + max_lag))
+
+
+def _gh_critical_values(model: str, m: int, stat: str) -> Optional[Dict[float, float]]:
+    """GH (1996) Table 1 critical values for ``model`` (C / C/T / C/S), ``m``
+    I(1) regressors, and ``stat`` ('adf'/'zt' share a table; 'zalpha' its own).
+    Returns {0.01,0.05,0.10: cv} or None if m is outside the tabulated 1..4. A
+    COPY is returned so a caller mutating it cannot corrupt the module table."""
+    table = _GH_CV[model]["zalpha" if stat == "zalpha" else "adf_zt"]
+    cv = table.get(m)
+    return dict(cv) if cv is not None else None
+
+
+def _adf_resid_stat(resid: np.ndarray, max_lag: int) -> tuple:
+    """ADF* t-statistic on cointegrating residuals — NO deterministic term
+    (regression='n'), since the residuals are mean-zero by OLS construction.
+    Lag chosen by AIC up to ``max_lag`` (GH use a data-dependent ADF lag).
+    Returns (stat, used_lag)."""
+    from statsmodels.tsa.stattools import adfuller
+
+    res = adfuller(np.asarray(resid, dtype=float), maxlag=max_lag,
+                   regression="n", autolag="AIC")
+    return float(res[0]), int(res[2])
+
+
+def _phillips_z_resid(resid: np.ndarray, bandwidth: Optional[int] = None) -> tuple:
+    """Phillips (1987) Zα and Zt unit-root statistics for the residual AR(1)
+    e_t = ρ·e_{t-1} + u_t (NO intercept — residuals are mean-zero by OLS).
+
+    Long-run variance λ̂² uses a Bartlett kernel; default bandwidth is the
+    Newey-West rule l = floor(4·(n/100)^{2/9}). Formulas follow Hamilton (1994)
+    §17.6 (Phillips-Perron, no-deterministic case):
+
+        Zα = n(ρ̂−1) − ½(λ̂²−γ̂₀)·n²/M
+        Zt = √(γ̂₀/λ̂²)·t_ρ − ((λ̂²−γ̂₀)/(2λ̂))·(n/√M)
+
+    where M = Σ e_{t-1}², γ̂₀ = (1/n)Σû², t_ρ = (ρ̂−1)√M/s_ols.
+    Returns (z_alpha, z_t, rho, bandwidth)."""
+    e = np.asarray(resid, dtype=float)
+    y, ylag = e[1:], e[:-1]
+    M = float(ylag @ ylag)
+    if M <= 0:
+        raise ValueError("phillips_z: degenerate residual (Σe_{t-1}²≤0)")
+    rho = float(y @ ylag) / M
+    u = y - rho * ylag
+    n = len(u)
+    ssr = float(u @ u)
+    if ssr <= 0 or n < 3:
+        raise ValueError("phillips_z: degenerate residual autoregression")
+    gamma0 = ssr / n
+    s_ols = np.sqrt(ssr / (n - 1))
+    t_rho = (rho - 1.0) * np.sqrt(M) / s_ols
+    if bandwidth is None:
+        bandwidth = int(4.0 * (n / 100.0) ** (2.0 / 9.0))
+    bandwidth = max(0, int(bandwidth))
+    lam2 = gamma0
+    for j in range(1, bandwidth + 1):
+        w = 1.0 - j / (bandwidth + 1.0)
+        cov = float(u[j:] @ u[:-j]) / n
+        lam2 += 2.0 * w * cov
+    if lam2 <= 0:
+        # a non-positive Bartlett long-run variance makes Zα/Zt undefined. Do NOT
+        # silently fall back to γ̂₀ (that would disguise an invalid statistic as a
+        # valid one and could flip reject_no_coint). Raise so the caller marks
+        # this break/stat as failed rather than scoring it.
+        raise ValueError("phillips_z: non-positive long-run variance (λ̂²≤0)")
+    z_alpha = n * (rho - 1.0) - 0.5 * (lam2 - gamma0) * n * n / M
+    z_t = (np.sqrt(gamma0 / lam2) * t_rho
+           - ((lam2 - gamma0) / (2.0 * np.sqrt(lam2))) * (n / np.sqrt(M)))
+    return float(z_alpha), float(z_t), float(rho), int(bandwidth)
+
+
+def _gh_design(y2: np.ndarray, k: int, model: str) -> np.ndarray:
+    """Build the GH regressor matrix for a break AFTER row index ``k`` (0-based;
+    dummy φ_t = 1 for t > k). ``y2`` is (T, m) of I(1) regressors.
+      C   : [1, φ, y2]
+      C/T : [1, φ, t, y2]
+      C/S : [1, φ, y2, φ·y2]"""
+    T = y2.shape[0]
+    phi = (np.arange(T) > k).astype(float)
+    const = np.ones(T)
+    if model == "C":
+        return np.column_stack([const, phi, y2])
+    if model == "C/T":
+        trend = np.arange(1, T + 1, dtype=float)
+        return np.column_stack([const, phi, trend, y2])
+    if model == "C/S":
+        return np.column_stack([const, phi, y2, y2 * phi[:, None]])
+    raise ValueError(f"gregory_hansen: unknown model {model!r} (use C / C/T / C/S)")
+
+
+def gregory_hansen_test(
+    df: pd.DataFrame,
+    y_col: str,
+    x_cols,
+    model: str = "C/S",
+    trim: float = 0.15,
+    max_lag: int = 6,
+    bandwidth: Optional[int] = None,
+    alpha: float = 0.05,
+) -> Dict[str, object]:
+    """Gregory-Hansen (1996) residual-based cointegration test allowing ONE
+    endogenous structural break.
+
+    H0: no cointegration. H1: cointegration with a level/regime shift at an
+    unknown break. For each candidate break in the trimmed interior the
+    cointegrating regression is refit with a break dummy and the residual is
+    tested for a unit root; the GH statistic is the minimum (most negative)
+    ADF*/Zt*/Zα* over all breaks, with the argmin giving the estimated break.
+
+    Parameters
+    ----------
+    y_col   : dependent (ln gold).
+    x_cols  : I(1) regressor column(s); len == m (1 bivariate, 2 trivariate).
+    model   : "C" (level shift), "C/T" (level+trend), or "C/S" (regime shift).
+    trim    : interior fraction excluded at each end (GH default 0.15).
+    max_lag : max ADF* augmentation lag (AIC chooses ≤ this).
+    bandwidth: Bartlett bandwidth for Zα*/Zt* (None → Newey-West rule).
+    alpha   : reported reject flag uses this level (CVs for all levels returned).
+
+    Returns a dict with, per statistic, the min value, the break index/date, the
+    GH critical values, and a reject flag; plus the cointegrating-vector
+    coefficients at the ADF*-optimal break (pre/post for a regime shift)."""
+    x_cols = list(x_cols)
+    m = len(x_cols)
+    if m < 1:
+        raise ValueError("gregory_hansen_test needs >=1 regressor in x_cols")
+    if model not in _GH_CV:
+        raise ValueError(f"model must be one of {sorted(_GH_CV)}, got {model!r}")
+    # GH (1996) Table 1 only tabulates m=1..4. Reject an untabulated m up front:
+    # without critical values reject_no_coint would silently be False, which a
+    # caller could misread as "fail to reject" rather than "cannot test".
+    if m not in _GH_CV[model]["adf_zt"]:
+        raise ValueError(
+            f"gregory_hansen_test: m={m} regressors has no GH (1996) critical "
+            f"values (tabulated m∈{sorted(_GH_CV[model]['adf_zt'])})")
+    if not (0.0 < trim < 0.5):
+        raise ValueError(f"trim must be in (0, 0.5), got {trim}")
+    # CVs are tabulated only at 1/5/10% — index without an implicit KeyError.
+    if alpha not in (0.01, 0.05, 0.10):
+        raise ValueError(
+            f"alpha must be one of {{0.01, 0.05, 0.10}} (GH Table 1 levels), got {alpha}")
+
+    cols = [y_col] + x_cols
+    sub = df[cols].dropna()
+    # break_date reporting needs a datetime index; validate up front, not via a
+    # late AttributeError deep in _pack().
+    if not isinstance(sub.index, pd.DatetimeIndex):
+        raise ValueError(
+            "gregory_hansen_test requires a DatetimeIndex (break dates are "
+            f"reported from it); got {type(sub.index).__name__}")
+    # GH searches breaks by ROW ORDER and interprets trend/break_date by time. An
+    # unsorted or duplicated index would search breaks in the wrong temporal order
+    # while start/end (min/max) hide it — reject rather than silently mis-search.
+    if not sub.index.is_monotonic_increasing:
+        raise ValueError(
+            "gregory_hansen_test requires a time-sorted index "
+            "(break search is row-ordered); sort the frame first")
+    if sub.index.has_duplicates:
+        raise ValueError("gregory_hansen_test requires a unique time index "
+                         "(duplicate timestamps break the row↔date mapping)")
+    if not np.isfinite(sub.values).all():
+        raise ValueError(f"gregory_hansen_test got non-finite values in {cols}")
+    T = len(sub)
+    # need enough rows so each regime can fit the design and the ADF* lags.
+    n_params_cs = 2 + 2 * m  # the largest design (C/S)
+    min_obs = gregory_hansen_min_obs(m, max_lag)
+    if T < min_obs:
+        raise ValueError(
+            f"gregory_hansen_test needs >={min_obs} complete rows for {cols}, "
+            f"got {T} after dropna"
+        )
+
+    y = sub[y_col].to_numpy(dtype=float)
+    y2 = sub[x_cols].to_numpy(dtype=float)
+    idx = sub.index
+
+    lo = int(np.floor(trim * T))
+    hi = int(np.ceil((1.0 - trim) * T)) - 1
+    # keep a margin so both regimes have rows for the design + ADF lags
+    margin = n_params_cs + max_lag + 2
+    lo = max(lo, margin)
+    hi = min(hi, T - margin - 1)
+    if hi <= lo:
+        raise ValueError(
+            f"gregory_hansen_test: trimmed break window empty (T={T}, trim={trim})"
+        )
+
+    best = {
+        "adf": {"stat": np.inf, "k": None, "lag": None},
+        "zt": {"stat": np.inf, "k": None},
+        "zalpha": {"stat": np.inf, "k": None},
+    }
+    # per-statistic valid-break counts, tracked INDEPENDENTLY: a Phillips-Z
+    # failure (non-positive long-run variance) at a break must NOT drop that
+    # break's ADF* result from the ADF min search, and vice-versa.
+    n_valid = {"adf": 0, "zt": 0, "zalpha": 0}
+    n_breaks = 0  # breaks where the design was identified (>=1 stat could be tried)
+    n_failed = 0  # breaks where the design itself was unusable (rank-deficient)
+    for k in range(lo, hi + 1):
+        X = _gh_design(y2, k, model)
+        # OLS via lstsq. A rank-deficient design (collinear break regressors at
+        # extreme breaks) does NOT raise — lstsq returns a least-norm solution on
+        # an unidentified model. Detect it via the returned rank and skip, so an
+        # unidentified break never enters the min-statistic search.
+        try:
+            coef, _res, rank, _sv = np.linalg.lstsq(X, y, rcond=None)
+        except np.linalg.LinAlgError:
+            n_failed += 1
+            continue
+        if rank < X.shape[1]:
+            n_failed += 1
+            continue
+        resid = y - X @ coef
+        n_breaks += 1
+        # ADF* and the Phillips Z's are computed and counted SEPARATELY so one's
+        # numerical failure never contaminates the other's min-statistic search.
+        try:
+            adf_stat, used_lag = _adf_resid_stat(resid, max_lag)
+            if adf_stat < best["adf"]["stat"]:
+                best["adf"] = {"stat": adf_stat, "k": k, "lag": used_lag}
+            n_valid["adf"] += 1
+        except (ValueError, np.linalg.LinAlgError):
+            pass
+        try:
+            za, zt, _rho, _bw = _phillips_z_resid(resid, bandwidth)
+            if zt < best["zt"]["stat"]:
+                best["zt"] = {"stat": zt, "k": k}
+            if za < best["zalpha"]["stat"]:
+                best["zalpha"] = {"stat": za, "k": k}
+            n_valid["zt"] += 1
+            n_valid["zalpha"] += 1
+        except (ValueError, np.linalg.LinAlgError):
+            pass
+
+    if all(v == 0 for v in n_valid.values()):
+        raise ValueError(
+            "gregory_hansen_test: no statistic produced a valid break "
+            f"(T={T}, model={model}; all designs rank-deficient or degenerate)"
+        )
+
+    def _pack(stat_key: str) -> Dict[str, object]:
+        b = best[stat_key]
+        cv = _gh_critical_values(model, m, "zalpha" if stat_key == "zalpha" else "adf")
+        k = b["k"]
+        # a statistic with zero valid breaks is UNAVAILABLE — not "fail to reject".
+        available = k is not None
+        stat_val = float(b["stat"]) if available else None
+        reject = bool(available and cv is not None and stat_val < cv[alpha])
+        # the break dummy is φ_t = 1{t > k}: row k is the LAST pre-break period and
+        # row k+1 is the FIRST post-break period. Report the latter as the break
+        # date (the period the structure actually shifts), and expose both.
+        last_pre = None if k is None else idx[k].date().isoformat()
+        first_post = None if k is None else idx[min(k + 1, T - 1)].date().isoformat()
+        out = {
+            "stat": stat_val,
+            "available": available,
+            "n_valid_breaks": int(n_valid[stat_key]),
+            "break_index": (None if k is None else int(k)),
+            "break_date": first_post,
+            "last_pre_break_date": last_pre,
+            "first_post_break_date": first_post,
+            "break_fraction": (None if k is None else round((k + 1) / T, 3)),
+            "critical_values": cv,
+            "reject_no_coint": reject,
+        }
+        if "lag" in b:
+            out["adf_lag"] = b["lag"]
+        return out
+
+    results = {s: _pack(s) for s in ("adf", "zt", "zalpha")}
+
+    # cointegrating-vector coefficients at a given break. For C/S report pre/post
+    # regime slopes; for C/C-T the slope is constant and only the intercept shifts.
+    # Computed PER STATISTIC at that statistic's own optimal break, so a Zt*- or
+    # Zα*-driven rejection is explained by ITS break/vector, not ADF*'s.
+    def _coint_vector_at(k: Optional[int]) -> Optional[Dict[str, object]]:
+        if k is None:
+            return None
+        Xk = _gh_design(y2, k, model)
+        coef, _r, rk, _s = np.linalg.lstsq(Xk, y, rcond=None)
+        if rk < Xk.shape[1]:
+            return None
+        mu1, mu2 = float(coef[0]), float(coef[1])
+        trend_coef = None
+        if model == "C/S":
+            betas_pre = [float(c) for c in coef[2:2 + m]]
+            betas_post = [float(coef[2 + m + i] + coef[2 + i]) for i in range(m)]
+        elif model == "C/T":
+            # design = [const, φ, trend, y2] → coef[2] is the linear trend slope;
+            # without it the C/T regression can't be reconstructed.
+            trend_coef = float(coef[2])
+            betas_pre = betas_post = [float(c) for c in coef[3:3 + m]]
+        else:  # C
+            betas_pre = betas_post = [float(c) for c in coef[2:2 + m]]
+        return {
+            "x_cols": x_cols,
+            "break_index": int(k),
+            "break_date": idx[min(k + 1, T - 1)].date().isoformat(),
+            "intercept_pre": mu1,
+            "intercept_post": mu1 + mu2,
+            "trend_coef": trend_coef,  # None unless model == "C/T" (per-period slope)
+            "betas_pre": betas_pre,
+            "betas_post": betas_post,
+        }
+
+    coint_vectors = {s: _coint_vector_at(best[s]["k"]) for s in ("adf", "zt", "zalpha")}
+    # majority rule (pre-registered primary criterion): a cell "rejects" only when
+    # at least 2 of the 3 statistics reject — guards against an isolated single-
+    # statistic rejection being read as a research conclusion.
+    n_reject = sum(int(results[s]["reject_no_coint"]) for s in ("adf", "zt", "zalpha"))
+
+    return {
+        "model": model,
+        "y_col": y_col,
+        "x_cols": x_cols,
+        "m": int(m),
+        "n_obs": int(T),
+        "trim": float(trim),
+        "alpha_level": float(alpha),
+        "start": idx.min().date().isoformat(),
+        "end": idx.max().date().isoformat(),
+        "n_breaks_evaluated": int(n_breaks),
+        "n_breaks_failed": int(n_failed),
+        "adf": results["adf"],
+        "zt": results["zt"],
+        "zalpha": results["zalpha"],
+        # coint_vector = the ADF* (headline) break vector, back-compat; per-stat
+        # vectors in coint_vectors so a Zt*/Zα*-driven reject shows its own break.
+        "coint_vector": coint_vectors["adf"],
+        "coint_vectors": coint_vectors,
+        "n_reject": int(n_reject),
+        "any_reject": bool(n_reject >= 1),         # raw: ≥1 statistic rejects
+        "majority_reject": bool(n_reject >= 2),    # pre-registered primary rule
+        "cv_available": bool(_gh_critical_values(model, m, "adf") is not None),
+    }
 # ── Markov-switching regression (step 3 / PR #4: discrete time-varying anchor) ─
 # PR #1–#3 killed every linear / constant-parameter / single-break anchor
 # (bivariate, trivariate Johansen, Gregory-Hansen). The remaining hypothesis is

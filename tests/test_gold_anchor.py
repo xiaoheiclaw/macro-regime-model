@@ -20,6 +20,7 @@ from lib.gold_anchor import (
     classify_integration,
     combined_verdict,
     estimate_vecm,
+    gregory_hansen_test,
     fit_markov_switching,
     integration_segments,
     integration_table,
@@ -30,6 +31,7 @@ from lib.gold_anchor import (
     select_var_order,
     unit_root_tests,
 )
+from lib.gold_anchor import _phillips_z_resid
 from lib.gold_anchor import _ms_coeff_significant
 
 def _white_noise(n=400, seed=12345):
@@ -539,6 +541,296 @@ def test_estimate_vecm_det_orders_do_not_crash():
             assert (b["t"] >= 0) == (b["beta"] >= 0) or b["t"] == 0.0
 
 
+# ── PR #3: Gregory-Hansen cointegration with one endogenous break ───────
+def _regime_shift_cointegrated(n=400, k_break=200, b_pre=1.0, b_post=2.0,
+                               mu_pre=0.0, mu_post=3.0, seed=51):
+    """y is cointegrated with x THROUGHOUT, but the cointegrating vector shifts
+    at k_break (slope b_pre→b_post, intercept mu_pre→mu_post). x is a random
+    walk (I(1)); the equilibrium error is a tight stationary AR(1). A constant-
+    vector Johansen struggles, but GH (model C/S) should reject 'no coint' and
+    locate the break near k_break."""
+    idx = pd.date_range("1980-01-31", periods=n, freq="ME")
+    rng = np.random.default_rng(seed)
+    x = np.cumsum(rng.standard_normal(n)) * 0.5 + 0.03 * np.arange(n)
+    err = np.zeros(n)
+    for t in range(1, n):
+        err[t] = 0.4 * err[t - 1] + rng.standard_normal() * 0.15
+    pre = np.arange(n) < k_break
+    slope = np.where(pre, b_pre, b_post)
+    inter = np.where(pre, mu_pre, mu_post)
+    y = inter + slope * x + err
+    return pd.DataFrame({"ln_gold_nominal": y, "ln_debt_gdp": x}, index=idx), idx[k_break]
+
+
+def test_phillips_z_resid_unit_root_vs_stationary():
+    # Zα/Zt are strongly negative on stationary noise, mild on a random walk.
+    rng = np.random.default_rng(3)
+    za_s, zt_s, _, _ = _phillips_z_resid(rng.standard_normal(300))
+    za_r, zt_r, _, _ = _phillips_z_resid(np.cumsum(rng.standard_normal(300)))
+    assert zt_s < -5 and za_s < -50          # stationary → reject unit root
+    assert zt_r > -3 and za_r > -20          # random walk → fail to reject
+
+
+def test_gh_detects_regime_shift_cointegration():
+    df, true_break = _regime_shift_cointegrated()
+    gh = gregory_hansen_test(df, "ln_gold_nominal", ["ln_debt_gdp"], model="C/S")
+    assert gh["m"] == 1
+    # all three flavors should reject 'no cointegration' at 5%
+    assert gh["adf"]["reject_no_coint"] is True
+    assert gh["zt"]["reject_no_coint"] is True
+    assert gh["zalpha"]["reject_no_coint"] is True
+    # pre-registered majority rule: ≥2/3 reject → majority_reject True
+    assert gh["n_reject"] == 3
+    assert gh["majority_reject"] is True
+    # estimated break (ADF*) lands near the true break (within ~12% of sample)
+    est = pd.Timestamp(gh["adf"]["break_date"])
+    assert abs((est.year - true_break.year) * 12 + est.month - true_break.month) <= 48
+    # regime-shift coint vector recovers the slope change b_pre=1 → b_post=2
+    cv = gh["coint_vector"]
+    assert cv["betas_pre"][0] < cv["betas_post"][0]
+    # per-statistic vectors exist (each at its own break) — a Zt*/Zα*-driven
+    # rejection is explained by ITS break, not ADF*'s.
+    assert set(gh["coint_vectors"]) == {"adf", "zt", "zalpha"}
+    assert gh["coint_vector"] == gh["coint_vectors"]["adf"]
+    for s in ("adf", "zt", "zalpha"):
+        assert gh["coint_vectors"][s]["break_date"] == gh[s]["break_date"]
+
+
+def test_gh_does_not_reject_independent_walks():
+    # Behavior regression on a fixed seed: two independent I(1) walks must NOT
+    # yield a spurious break-driven cointegration rejection.
+    n = 320
+    idx = pd.date_range("1980-01-31", periods=n, freq="ME")
+    df = pd.DataFrame(
+        {"ln_gold_nominal": np.cumsum(np.random.default_rng(71).standard_normal(n)),
+         "ln_debt_gdp": np.cumsum(np.random.default_rng(72).standard_normal(n))},
+        index=idx,
+    )
+    gh = gregory_hansen_test(df, "ln_gold_nominal", ["ln_debt_gdp"], model="C/S")
+    assert gh["adf"]["reject_no_coint"] is False
+    assert gh["any_reject"] is False
+    assert gh["majority_reject"] is False
+
+
+def test_gh_critical_values_returned_copy_is_isolated():
+    # mutating a returned critical_values dict must NOT corrupt the module table
+    df, _ = _regime_shift_cointegrated()
+    gh1 = gregory_hansen_test(df, "ln_gold_nominal", ["ln_debt_gdp"], model="C")
+    gh1["adf"]["critical_values"][0.05] = 999.0  # caller scribbles on it
+    gh2 = gregory_hansen_test(df, "ln_gold_nominal", ["ln_debt_gdp"], model="C")
+    assert gh2["adf"]["critical_values"][0.05] == -4.61  # table intact
+
+
+def test_gh_summary_majority_rule_not_any_stat():
+    # _gh_summary must treat a cell as 'reject' only by the pre-registered
+    # majority rule (majority_reject), never by a single stray statistic.
+    from scripts.gold_anchor_analysis import _gh_summary, GH_MODELS
+
+    def cell(majority):
+        return {"majority_reject": majority, "adf": {"reject_no_coint": True}}
+
+    # one cell with a lone-stat reject (majority False) → summary any_reject False
+    res_lone = {"systems": {
+        "bivariate": {"skip": None, "models": {m: cell(False) for m in GH_MODELS}},
+        "trivariate": {"skip": "n/a"},
+    }}
+    s = _gh_summary(res_lone)
+    assert s["any_reject"] is False and s["n_completed"] == len(GH_MODELS)
+    # a cell that meets the majority bar → any_reject True
+    res_maj = {"systems": {
+        "bivariate": {"skip": None, "models": {GH_MODELS[0]: cell(True),
+                                               GH_MODELS[1]: cell(False)}},
+        "trivariate": {"skip": "n/a"},
+    }}
+    assert _gh_summary(res_maj)["any_reject"] is True
+
+
+def test_gh_independent_walks_no_majority_reject():
+    # Behavior regression on a handful of FIXED independent-walk seeds: under the
+    # pre-registered ≥2/3 majority rule, none should be flagged as cointegrated.
+    # (A broken impl that always "finds" a break would fail here.) Fixed seeds +
+    # the decision criterion (majority_reject) make this robust, not a chancy
+    # empirical-rate threshold.
+    n = 150
+    idx = pd.date_range("1980-01-31", periods=n, freq="ME")
+    for s in range(6):
+        df = pd.DataFrame(
+            {"ln_gold_nominal": np.cumsum(np.random.default_rng(1000 + 2 * s).standard_normal(n)),
+             "ln_debt_gdp": np.cumsum(np.random.default_rng(1001 + 2 * s).standard_normal(n))},
+            index=idx,
+        )
+        gh = gregory_hansen_test(df, "ln_gold_nominal", ["ln_debt_gdp"],
+                                 model="C/S", max_lag=2)
+        assert gh["majority_reject"] is False, f"seed {s} spuriously majority-rejected"
+
+
+def test_gh_trivariate_m_and_cv_lookup():
+    df, _ = _regime_shift_cointegrated()
+    df = df.copy()
+    df["real_rate_10y"] = np.cumsum(np.random.default_rng(9).standard_normal(len(df))) * 0.2
+    gh = gregory_hansen_test(df, "ln_gold_nominal",
+                             ["ln_debt_gdp", "real_rate_10y"], model="C/S")
+    assert gh["m"] == 2
+    # m=2 C/S critical values are tabulated and echoed back
+    assert gh["adf"]["critical_values"][0.05] == -5.50
+    assert gh["zalpha"]["critical_values"][0.05] == -58.33
+    assert len(gh["coint_vector"]["betas_pre"]) == 2
+
+
+def test_gh_level_shift_model_runs_and_cv_matches_table():
+    df, _ = _regime_shift_cointegrated()
+    gh = gregory_hansen_test(df, "ln_gold_nominal", ["ln_debt_gdp"], model="C")
+    # GH (1996) Table 1, model C, m=1, ADF*/Zt* shared CVs
+    assert gh["adf"]["critical_values"] == {0.01: -5.13, 0.05: -4.61, 0.10: -4.34}
+    assert gh["zt"]["critical_values"] == {0.01: -5.13, 0.05: -4.61, 0.10: -4.34}
+    assert gh["zalpha"]["critical_values"][0.01] == -50.07
+    # reject flag is consistent with stat vs the alpha-level CV
+    assert gh["adf"]["reject_no_coint"] == (
+        gh["adf"]["stat"] < gh["adf"]["critical_values"][0.05])
+
+
+def test_gh_validates_inputs():
+    df, _ = _regime_shift_cointegrated()
+    with pytest.raises(ValueError):
+        gregory_hansen_test(df, "ln_gold_nominal", [], model="C")     # no regressors
+    with pytest.raises(ValueError):
+        gregory_hansen_test(df, "ln_gold_nominal", ["ln_debt_gdp"], model="BAD")
+    with pytest.raises(ValueError):
+        gregory_hansen_test(df, "ln_gold_nominal", ["ln_debt_gdp"], trim=0.7)
+    with pytest.raises(ValueError):
+        gregory_hansen_test(df.iloc[:20], "ln_gold_nominal", ["ln_debt_gdp"])  # too few
+    bad = df.copy()
+    bad.iloc[5, 0] = np.inf
+    with pytest.raises(ValueError):
+        gregory_hansen_test(bad, "ln_gold_nominal", ["ln_debt_gdp"])  # non-finite
+    # alpha not in the GH critical-value table → explicit ValueError, not KeyError
+    with pytest.raises(ValueError):
+        gregory_hansen_test(df, "ln_gold_nominal", ["ln_debt_gdp"], alpha=0.025)
+    # non-datetime index → explicit ValueError (break dates need a DatetimeIndex)
+    nodate = df.reset_index(drop=True)
+    with pytest.raises(ValueError):
+        gregory_hansen_test(nodate, "ln_gold_nominal", ["ln_debt_gdp"])
+    # unsorted time index → ValueError (break search is row-ordered)
+    shuffled = df.iloc[np.argsort(np.random.default_rng(0).standard_normal(len(df)))]
+    with pytest.raises(ValueError, match="time-sorted"):
+        gregory_hansen_test(shuffled, "ln_gold_nominal", ["ln_debt_gdp"])
+    # duplicate timestamps → ValueError (row↔date mapping ambiguous)
+    dup = pd.concat([df.iloc[:5], df])
+    with pytest.raises(ValueError, match="unique time index"):
+        gregory_hansen_test(dup.sort_index(), "ln_gold_nominal", ["ln_debt_gdp"])
+
+
+def test_gh_ct_model_reports_trend_coef():
+    # the publicly-supported C/T (level+trend) model must expose the linear trend
+    # coefficient so the regression is reconstructable; C / C/S have trend_coef None.
+    df, _ = _regime_shift_cointegrated()
+    ct = gregory_hansen_test(df, "ln_gold_nominal", ["ln_debt_gdp"], model="C/T")
+    for s in ("adf", "zt", "zalpha"):
+        assert ct["coint_vectors"][s]["trend_coef"] is not None
+    c = gregory_hansen_test(df, "ln_gold_nominal", ["ln_debt_gdp"], model="C")
+    assert c["coint_vectors"]["adf"]["trend_coef"] is None
+
+
+def test_gh_summary_counts_missing_system_as_incomplete():
+    # P1 hardening: _gh_summary must gate on the EXPECTED system set, so a gh_res
+    # that is MISSING the trivariate system entirely counts it as incomplete
+    # (kill condition must not fire on the bivariate evidence alone).
+    from scripts.gold_anchor_analysis import _gh_summary, GH_MODELS
+
+    res = {"systems": {  # trivariate deliberately absent
+        "bivariate": {"skip": None,
+                      "models": {m: {"majority_reject": False} for m in GH_MODELS}},
+    }}
+    s = _gh_summary(res)
+    assert s["n_completed"] == len(GH_MODELS)
+    assert s["n_incomplete"] >= len(GH_MODELS)  # the missing trivariate counts
+    assert s["any_reject"] is False
+
+
+def test_gh_min_obs_helper_matches_test_gate():
+    # the exposed min-obs helper is exactly the bound the test enforces: one row
+    # below it raises, exactly at it does not (for the too-few branch).
+    df, _ = _regime_shift_cointegrated(n=400)
+    need = ga.gregory_hansen_min_obs(1)
+    with pytest.raises(ValueError):
+        gregory_hansen_test(df.iloc[:need - 1], "ln_gold_nominal", ["ln_debt_gdp"])
+    # at the bound it proceeds past the length check (may still run/return)
+    gh = gregory_hansen_test(df.iloc[:need], "ln_gold_nominal", ["ln_debt_gdp"])
+    assert gh["n_obs"] == need
+
+
+def test_gh_rank_deficient_break_is_skipped():
+    # a constant regressor makes the C/S design rank-deficient at every break
+    # (collinear const & y2 & interaction) — lstsq returns a least-norm solution
+    # rather than raising, so the rank guard must count those as failed and the
+    # test must still return without crashing (n_breaks_failed > 0).
+    n = 200
+    idx = pd.date_range("1990-01-31", periods=n, freq="ME")
+    df = pd.DataFrame(
+        {"ln_gold_nominal": np.cumsum(np.random.default_rng(3).standard_normal(n)),
+         "flat": np.ones(n)},  # constant → collinear with the design const
+        index=idx,
+    )
+    # every break design is rank-deficient (const ≡ flat) → all fail → ValueError
+    with pytest.raises(ValueError, match="no statistic produced a valid break"):
+        gregory_hansen_test(df, "ln_gold_nominal", ["flat"], model="C/S")
+
+
+def test_gh_break_in_trimmed_interior():
+    # the estimated break must respect the trim window (no edge breaks)
+    df, _ = _regime_shift_cointegrated()
+    gh = gregory_hansen_test(df, "ln_gold_nominal", ["ln_debt_gdp"],
+                             model="C/S", trim=0.15)
+    for stat in ("adf", "zt", "zalpha"):
+        frac = gh[stat]["break_fraction"]
+        assert 0.15 <= frac <= 0.85
+
+
+def test_gh_break_date_is_first_post_break():
+    # φ_t = 1{t>k}: last_pre = idx[k], first_post = idx[k+1]; break_date defaults
+    # to the FIRST POST-break period (the month the structure actually shifts).
+    df, _ = _regime_shift_cointegrated()
+    gh = gregory_hansen_test(df, "ln_gold_nominal", ["ln_debt_gdp"], model="C/S")
+    a = gh["adf"]
+    assert a["break_date"] == a["first_post_break_date"]
+    last_pre = pd.Timestamp(a["last_pre_break_date"])
+    first_post = pd.Timestamp(a["first_post_break_date"])
+    assert first_post > last_pre  # post strictly after pre (one period later)
+
+
+def test_gh_unsupported_m_raises():
+    # GH (1996) tabulates m=1..4 only; m=5 must raise, not silently return
+    # reject_no_coint=False with critical_values=None.
+    n = 240
+    idx = pd.date_range("1980-01-31", periods=n, freq="ME")
+    cols = {f"x{i}": np.cumsum(np.random.default_rng(i).standard_normal(n)) for i in range(5)}
+    df = pd.DataFrame({"ln_gold_nominal": np.cumsum(np.random.default_rng(99).standard_normal(n)),
+                       **cols}, index=idx)
+    with pytest.raises(ValueError, match="critical values"):
+        gregory_hansen_test(df, "ln_gold_nominal", list(cols), model="C")
+
+
+def test_run_gregory_hansen_always_has_both_systems():
+    # P1 regression: the trivariate system must ALWAYS be present (skipped, not
+    # vanished) when the TIPS cutoff / real_rate column is missing — otherwise the
+    # verdict could fire the kill condition on the bivariate evidence alone.
+    from scripts.gold_anchor_analysis import (
+        _run_gregory_hansen, _gh_summary, GH_MODELS)
+
+    n = 240
+    idx = pd.date_range("1980-01-31", periods=n, freq="ME")
+    # panel WITHOUT real_rate_10y and WITHOUT a tips cutoff note
+    df = pd.DataFrame(
+        {"ln_gold_nominal": np.cumsum(np.random.default_rng(1).standard_normal(n)),
+         "ln_debt_gdp": np.cumsum(np.random.default_rng(2).standard_normal(n))},
+        index=idx,
+    )
+    res = _run_gregory_hansen(df, notes={"real_rate_tips_start": "n/a"})
+    assert set(res["systems"]) == {"bivariate", "trivariate"}
+    assert res["systems"]["trivariate"]["skip"]  # skipped, not dropped
+    # the skipped trivariate contributes its cells to the incomplete tally
+    s = _gh_summary(res)
+    assert s["n_incomplete"] >= len(GH_MODELS)
 # ── PR #4: Markov-switching regression (discrete time-varying anchor) ────
 def _two_regime_panel(n=360, block=30, b_lo=2.5, b_hi=-2.5, seed=0):
     """Synthetic gold panel whose Δln(gold)→Δln(debt/GDP) coefficient FLIPS sign
