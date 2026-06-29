@@ -22,7 +22,6 @@ import pandas as pd
 import pytest
 
 from lib.gold_dedollar_gap import (
-    DEFAULT_COMPONENTS,
     adjudicate,
     build_di,
     build_gap_panel,
@@ -131,6 +130,24 @@ def test_zscore_over_uses_baseline_only():
     np.testing.assert_allclose(z.iloc[3], (100 - 2) / np.std([1, 2, 3]), atol=1e-9)
 
 
+def test_di_rejects_unknown_and_missing_weight_keys():
+    """A typo'd weight key (or omitting a present component) must raise, not
+    silently collapse DI to fewer factors (codex R3 P2)."""
+    df = _panel()
+    with pytest.raises(ValueError):  # typo: 'custdy_share'
+        build_di(df, weights={"cb_cum_excess": 0.5, "custdy_share": 0.5})
+    with pytest.raises(ValueError):  # omits custody_share entirely
+        build_di(df, weights={"cb_cum_excess": 1.0})
+
+
+def test_di_min_present_out_of_range_raises():
+    df = _panel()
+    with pytest.raises(ValueError):
+        build_di(df, min_present=0)
+    with pytest.raises(ValueError):
+        build_di(df, min_present=3)  # only 2 components present
+
+
 def test_di_all_components_missing_raises():
     idx = pd.date_range("2010-01-31", periods=12, freq="ME")
     df = pd.DataFrame({"cb_cum_excess": np.nan, "custody_share": np.nan}, index=idx)
@@ -226,6 +243,47 @@ def test_rolling_resid_constant_x_window_is_nan():
     y = pd.Series(np.arange(n, dtype=float), index=idx)
     resid = rolling_ols_resid(y, di, w)
     assert resid.dropna().empty
+
+
+def test_compute_deviation_window_is_calendar_months_not_obs():
+    """A missing month inside the trailing window must blank that window's residual
+    (window = calendar months, not observations; codex R3 P2). The deviation runs
+    on a complete ME grid with gaps kept NaN."""
+    n, w = 80, 24
+    idx = pd.date_range("2010-01-31", periods=n, freq="ME")
+    rng = np.random.RandomState(31)
+    di = pd.Series(np.cumsum(rng.randn(n)) * 0.1, index=idx)
+    y = pd.Series(1.0 + 1.0 * di.to_numpy() + rng.randn(n) * 0.02, index=idx)
+    # drop one interior month from BOTH inputs → a hole on the common grid
+    hole = idx[50]
+    y2 = y.drop(hole)
+    di2 = di.drop(hole)
+    dev = compute_deviation(y2, di2, window=w)  # default min_obs = window
+    # every window covering the hole (t from 50's grid pos .. +w-1) must be NaN
+    grid = pd.date_range(idx.min(), idx.max(), freq="ME")
+    pos = grid.get_loc(hole)
+    affected = grid[pos:pos + w]
+    aff = dev.resid.reindex(affected)
+    assert aff.isna().all()
+
+
+def test_conditional_table_threshold_excludes_unobservable_tail():
+    """The top-decile cutoff and split are computed only on months whose forward
+    return is observable (codex R3 P2): a huge-but-unobservable tail spike must NOT
+    define the extreme group (which would then be empty after dropna)."""
+    n = 60
+    idx = pd.date_range("2010-01-31", periods=n, freq="ME")
+    rng = np.random.RandomState(41)
+    gap = pd.Series(rng.randn(n), index=idx)
+    gap.iloc[-6:] = 100.0           # extreme ONLY in the last 6 (unobservable at 12m)
+    gap.iloc[10:14] = 50.0          # a genuine observable extreme mid-sample
+    price = pd.Series(np.exp(np.cumsum(rng.randn(n) * 0.02)), index=idx)
+    tbl = conditional_forward_table(gap, price, horizons=(12,), top_q=0.9)
+    ext = tbl[tbl["regime"] == "extreme_high"].iloc[0]
+    # extreme group is non-empty and drawn from the observable mid-sample spike,
+    # not the unobservable tail (which a full-sample threshold would have selected
+    # and then dropped → n=0).
+    assert int(ext["n"]) > 0
 
 
 def test_compute_deviation_reports_both_zscores():
@@ -349,7 +407,7 @@ def test_conditional_forward_table_rejects_bad_q():
 
 
 # ── 5. current reading + verdict ─────────────────────────────────────────
-def _dev_with_latest_pct(target_high=True):
+def _dev_with_latest_pct():
     n = 100
     idx = pd.date_range("2010-01-31", periods=n, freq="ME")
     rng = np.random.RandomState(13)
@@ -387,17 +445,29 @@ def test_adjudicate_labels():
     from lib.gold_dedollar_gap import CurrentReading
     ts = pd.Timestamp("2026-01-31")
     extreme = CurrentReading(asof=ts, gap_z_full=2.5, gap_pct_full=0.97,
-                             gap_pct_roll=1.0, di_pct_full=0.9)
+                             gap_pct_roll=1.0, di_pct_full=0.9, n_resid=120)
     normal = CurrentReading(asof=ts, gap_z_full=0.1, gap_pct_full=0.45,
-                            gap_pct_roll=0.5, di_pct_full=0.5)
+                            gap_pct_roll=0.5, di_pct_full=0.5, n_resid=120)
     elevated = CurrentReading(asof=ts, gap_z_full=0.8, gap_pct_full=0.80,
-                              gap_pct_roll=0.8, di_pct_full=0.7)
+                              gap_pct_roll=0.8, di_pct_full=0.7, n_resid=120)
     unknown = CurrentReading(asof=None, gap_z_full=np.nan, gap_pct_full=np.nan,
-                             gap_pct_roll=np.nan, di_pct_full=np.nan)
+                             gap_pct_roll=np.nan, di_pct_full=np.nan, n_resid=0)
     assert adjudicate(extreme)[0] == "EXTREME"
     assert adjudicate(normal)[0] == "NORMAL"
     assert adjudicate(elevated)[0] == "ELEVATED"
     assert adjudicate(unknown)[0] == "UNKNOWN"
+
+
+def test_adjudicate_thin_history_is_unknown():
+    """A thin sample must not produce a spurious EXTREME (codex R3 P2): even at the
+    100th percentile, too few residuals → UNKNOWN."""
+    from lib.gold_dedollar_gap import CurrentReading
+    ts = pd.Timestamp("2026-01-31")
+    thin = CurrentReading(asof=ts, gap_z_full=3.0, gap_pct_full=1.0,
+                          gap_pct_roll=1.0, di_pct_full=1.0, n_resid=5)
+    assert adjudicate(thin, min_n=36)[0] == "UNKNOWN"
+    # with the bar lowered it can resolve again
+    assert adjudicate(thin, min_n=4)[0] == "EXTREME"
 
 
 # ── 6. panel assembly with injected (offline) data ───────────────────────

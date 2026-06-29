@@ -131,7 +131,7 @@ def main() -> None:
     # ── current positioning + verdict ──
     cr_nom = current_reading(dev_nom, di, roll_window=args.reg_window)
     cr_real = current_reading(dev_real, di, roll_window=args.reg_window)
-    label, verdict_msg = adjudicate(cr_nom)
+    label, verdict_msg = adjudicate(cr_nom, min_n=max(args.reg_window, 36))
 
     # ── robustness: weight perturbation (only if >=2 components present) ──
     weight_rows: List[List[str]] = []
@@ -189,7 +189,8 @@ def main() -> None:
     P.append(f"**{label}** — {verdict_msg}\n")
     P.append("- 名义口径 ln(gold) vs DI:当前偏离 "
              f"z={_fmt(cr_nom.gap_z_full)},历史分位 {_fmt_pct(cr_nom.gap_pct_full)}"
-             f"(截至 {asof_str} ); 滚动分位 {_fmt_pct(cr_nom.gap_pct_roll)}。")
+             f"(截至 {asof_str},残差样本 n={cr_nom.n_resid},裁决最小样本要求 "
+             f"{max(args.reg_window, 36)}); 滚动分位 {_fmt_pct(cr_nom.gap_pct_roll)}。")
     P.append("- 实际购买力口径 ln(gold/CPI) vs DI:当前偏离 "
              f"z={_fmt(cr_real.gap_z_full)},历史分位 {_fmt_pct(cr_real.gap_pct_full)}。")
     P.append(f"- DI 自身历史分位 {_fmt_pct(cr_nom.di_pct_full)}(去美元化基本面本身处于"

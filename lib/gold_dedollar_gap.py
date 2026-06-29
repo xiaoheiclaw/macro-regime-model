@@ -352,7 +352,21 @@ def build_di(
     if weights is None:
         w = {c: 1.0 for c in present}
     else:
-        w = {c: float(weights.get(c, 0.0)) for c in present}
+        all_names = {c for c, _ in components}
+        unknown = set(weights) - all_names
+        if unknown:
+            # a typo'd key would otherwise be silently ignored and the leg it was
+            # meant to weight would fall to 0 → DI silently collapses to fewer
+            # factors (codex PR#14 R3 P2).
+            raise ValueError(
+                f"unknown weight keys {sorted(unknown)}; valid components are "
+                f"{sorted(all_names)}")
+        missing = [c for c in present if c not in weights]
+        if missing:
+            raise ValueError(
+                f"weights must specify every present component; missing {missing} "
+                f"(present = {present}). Pass an explicit 0.0 to zero-weight a leg.")
+        w = {c: float(weights[c]) for c in present}
         if any(v < 0 for v in w.values()):
             raise ValueError(
                 f"weights must be non-negative (a negative weight inverts a "
@@ -366,7 +380,10 @@ def build_di(
     comp_df = pd.DataFrame(signed)
     if min_present is None:
         min_present = len(present)
-    min_present = max(1, min(min_present, len(present)))
+    if not (1 <= min_present <= len(present)):
+        # silent clamping hides a misconfiguration (codex PR#14 R3 P3).
+        raise ValueError(
+            f"min_present must be in [1, n_present={len(present)}], got {min_present}")
 
     # per-row weighted mean over present components, renormalizing the weights of
     # the components that are non-NaN at that row.
@@ -478,10 +495,24 @@ def compute_deviation(
     ``min_obs`` (default = ``window``, the full trailing window) is forwarded to
     ``rolling_ols_resid``; the gold/DI common window is contiguous monthly so the
     full-window default rarely drops a fit, but a caller can relax it to tolerate
-    gaps explicitly."""
+    gaps explicitly.
+
+    The regression runs on a **complete month-end grid** spanning the common
+    coverage, with any missing months kept as NaN (codex PR#14 R3 P2): this makes
+    ``window`` mean *calendar months*, not *observations*, so a hole in CPI/DI/gold
+    cannot let a 60-month window silently fit across a multi-month gap — that
+    window simply fails the ``min_obs`` test and yields NaN."""
     common = y.dropna().index.intersection(di.dropna().index)
-    yc = y.reindex(common)
-    dc = di.reindex(common)
+    if len(common) == 0:
+        empty = pd.Series(np.nan, index=y.index, dtype="float64")
+        return DeviationResult(resid=empty.rename("resid"),
+                               gap_z_roll=empty.copy(), gap_z_full=empty.copy(),
+                               window=window,
+                               notes={"definition": "no common overlap",
+                                      "window": str(window), "n_resid": "0"})
+    grid = pd.date_range(common.min(), common.max(), freq=pd.offsets.MonthEnd())
+    yc = y.reindex(grid)
+    dc = di.reindex(grid)
     resid = rolling_ols_resid(yc, dc, window, min_obs=min_obs).reindex(y.index)
     return DeviationResult(
         resid=resid,
@@ -536,10 +567,15 @@ def conditional_forward_table(
     ahead of the fundamentals) vs the **rest** of history.
 
     *** This is a conditional DESCRIPTION, NOT a prediction or a causal claim. ***
-    The threshold ``quantile(gap, top_q)`` is full-sample (in-sample); a high
-    deviation has historically often preceded weaker forward returns, but that is
-    a description of past co-movement, not a guarantee. N is small (post-2010
-    fundamentals) — reported in the table.
+    A high deviation has historically often preceded weaker forward returns, but
+    that is a description of past co-movement, not a guarantee. N is small
+    (post-2010 fundamentals) — reported in the table.
+
+    The threshold and the extreme/rest split are computed **per horizon on the
+    months whose forward return is actually observable** (codex PR#14 R3 P2):
+    ``valid = gap.dropna().index ∩ fwd.dropna().index``. Otherwise the last `h`
+    (unobservable) months would shift the top-decile cutoff and then be dropped by
+    ``_summ``, biasing the extreme group's count and distribution.
 
     Returns a long DataFrame: columns [horizon, regime, n, mean, median, p25,
     p75, hit]."""
@@ -549,15 +585,20 @@ def conditional_forward_table(
     if g.empty:
         return pd.DataFrame(
             columns=["horizon", "regime", "n", "mean", "median", "p25", "p75", "hit"])
-    thr = float(g.quantile(top_q))
-    extreme_idx = g[g >= thr].index
-    rest_idx = g[g < thr].index
     rows = []
     for h in horizons:
         fwd = forward_log_return(price, h)
+        valid = g.index.intersection(fwd.dropna().index)
+        gv = g.reindex(valid)
+        if gv.empty:
+            for regime in ("extreme_high", "rest"):
+                rows.append({"horizon": h, "regime": regime, **_summ(pd.Series(dtype=float))})
+            continue
+        thr = float(gv.quantile(top_q))
+        extreme_idx = gv[gv >= thr].index
+        rest_idx = gv[gv < thr].index
         for regime, idx in (("extreme_high", extreme_idx), ("rest", rest_idx)):
-            s = _summ(fwd.reindex(idx))
-            rows.append({"horizon": h, "regime": regime, **s})
+            rows.append({"horizon": h, "regime": regime, **_summ(fwd.reindex(idx))})
     return pd.DataFrame(rows)
 
 
@@ -569,6 +610,7 @@ class CurrentReading:
     gap_pct_full: float        # full-sample percentile of the latest residual ∈[0,1]
     gap_pct_roll: float        # latest leak-free trailing percentile ∈[0,1]
     di_pct_full: float         # where DI itself sits in its history ∈[0,1]
+    n_resid: int = 0           # number of defined residuals (history depth)
 
 
 def current_reading(
@@ -590,7 +632,7 @@ def current_reading(
     di_hist = di.dropna()
     if asof is None:
         return CurrentReading(asof=None, gap_z_full=np.nan, gap_pct_full=np.nan,
-                              gap_pct_roll=np.nan, di_pct_full=np.nan)
+                              gap_pct_roll=np.nan, di_pct_full=np.nan, n_resid=0)
     latest = float(resid.loc[asof])
     pct_roll = rolling_percentile(dev.resid, roll_window).reindex([asof]).iloc[0]
     di_at_asof = di.reindex([asof]).iloc[0]
@@ -601,6 +643,7 @@ def current_reading(
         gap_pct_roll=float(pct_roll) if np.isfinite(pct_roll) else np.nan,
         di_pct_full=(full_percentile(di_hist, float(di_at_asof))
                      if np.isfinite(di_at_asof) else np.nan),
+        n_resid=int(len(resid)),
     )
 
 
@@ -610,18 +653,27 @@ def adjudicate(
     extreme_pct: float = EXTREME_PCT,
     elevated_pct: float = ELEVATED_PCT,
     high_z: float = HIGH_Z,
+    min_n: int = 36,
 ) -> Tuple[str, str]:
     """Headline verdict on whether gold is running ahead of the de-dollarization
     fundamentals RIGHT NOW. Returns (label, text).
 
     Labels: EXTREME (price far ahead — top decile / high z), ELEVATED (above
-    normal), NORMAL (within historical range), UNKNOWN (no reading). Honest by
-    design: 'extreme' describes valuation richness vs history, NOT a forecast that
-    a drawdown must follow."""
+    normal), NORMAL (within historical range), UNKNOWN (no / too-little history).
+    Honest by design: 'extreme' describes valuation richness vs history, NOT a
+    forecast that a drawdown must follow.
+
+    A minimum history of ``min_n`` defined residuals is required (codex PR#14 R3
+    P2): with a handful of points a percentile of 1.0 is meaningless, so a thin
+    sample returns UNKNOWN rather than a spurious EXTREME."""
     pct = reading.gap_pct_full
     z = reading.gap_z_full
     if not np.isfinite(pct):
         return "UNKNOWN", "No deviation reading available (insufficient overlap)."
+    if reading.n_resid < min_n:
+        return ("UNKNOWN",
+                f"insufficient history: only {reading.n_resid} deviation "
+                f"observations (< {min_n}); percentile/z not meaningful yet.")
     if pct >= extreme_pct or (np.isfinite(z) and z >= high_z):
         label = "EXTREME"
         msg = (f"gold sits in the top {(1 - pct) * 100:.0f}% of its historical "
