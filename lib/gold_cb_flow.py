@@ -89,11 +89,20 @@ DEFAULT_SIGNAL = "cum_excess"
 
 
 # ── CSV materialization / load ─────────────────────────────────────────────
+def _embedded_series() -> pd.Series:
+    """The authoritative annual series, as a year-end-indexed Series (tonnes)."""
+    return pd.Series(
+        {pd.Timestamp(f"{y}-12-31"): v for y, v in sorted(WGC_ANNUAL_TONNES.items())}
+    )
+
+
 def write_wgc_csv(path: str = DEFAULT_WGC_CSV) -> str:
     """Write the authoritative annual series to `path` (with provenance header).
     Returns the path. `data/` is gitignored, so this is a regenerable mirror of
     `WGC_ANNUAL_TONNES`."""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    dir_ = os.path.dirname(path)
+    if dir_:
+        os.makedirs(dir_, exist_ok=True)
     lines = [
         f"# {WGC_SOURCE}",
         "# ESTIMATES with revision noise; quarterly detail annualized→ here annual only.",
@@ -107,11 +116,22 @@ def write_wgc_csv(path: str = DEFAULT_WGC_CSV) -> str:
     return path
 
 
-def load_wgc_annual(path: str = DEFAULT_WGC_CSV, *, write_if_missing: bool = True) -> pd.Series:
-    """Load the annual WGC series as a Series indexed by year-end Timestamp
-    (tonnes). Reads `path` if present; otherwise falls back to the embedded
-    `WGC_ANNUAL_TONNES` and (by default) materializes the CSV so the `data/`
-    artifact exists. Raises if the CSV is present but malformed/empty."""
+def load_wgc_annual(path: Optional[str] = None, *, write_if_missing: bool = True) -> pd.Series:
+    """Load the annual WGC series as a year-end-indexed Series (tonnes).
+
+    Reproducibility contract (codex PR#10 P1): on the **default path**
+    (`path=None`) the embedded `WGC_ANNUAL_TONNES` is *authoritative* — any stale
+    `data/wgc_cb_purchases.csv` on the machine is **ignored** and (by default)
+    overwritten with the embedded values, so a run can never silently depend on a
+    leftover/edited CSV. A CSV override is honoured **only** when an explicit
+    custom `path` is passed (e.g. an alternative vintage for sensitivity work);
+    that path is read if present (raising on malformed/empty), else the embedded
+    series is returned and materialized there when `write_if_missing`."""
+    if path is None:
+        if write_if_missing:
+            write_wgc_csv(DEFAULT_WGC_CSV)  # refresh the regenerable mirror
+        return _embedded_series()
+
     if os.path.exists(path):
         df = pd.read_csv(path, comment="#")
         if "year" not in df.columns or "net_purchases_tonnes" not in df.columns:
@@ -128,9 +148,7 @@ def load_wgc_annual(path: str = DEFAULT_WGC_CSV, *, write_if_missing: bool = Tru
         return s
     if write_if_missing:
         write_wgc_csv(path)
-    return pd.Series(
-        {pd.Timestamp(f"{y}-12-31"): v for y, v in sorted(WGC_ANNUAL_TONNES.items())}
-    )
+    return _embedded_series()
 
 
 # ── monthly interpolation + signal construction ────────────────────────────
@@ -143,29 +161,30 @@ def _annual_to_monthly_flow(
     """Spread each annual flow evenly across its 12 calendar months ("均摊"),
     returning a month-end Series of tonnes/month.
 
-    The latest year in `annual` may be a partial/incomplete year (e.g. 2026 at
-    run time). If `end` extends past the last annual label and
-    `carry_forward_partial=True`, the most recent annual pace is carried forward
-    to fill months up to `end` (a flagged assumption — see module docstring);
-    otherwise the signal simply stops at the last full year."""
+    `end` (when given) is a **hard upper bound** (month-end normalized): the grid
+    never runs past it, so a partial/incomplete trailing year already present in
+    `annual` (e.g. a 2026 row) cannot leak future months into the signal (codex
+    PR#10 P2). With `carry_forward_partial=True` the latest annual pace is carried
+    forward to *fill up to* `end` (a flagged assumption — see module docstring);
+    with `end=None` it buffers one extra year (the current incomplete year) so a
+    downstream panel whose gold index runs past the last full WGC year still gets
+    a value. With `carry_forward_partial=False` the signal stops at the last full
+    annual year (still capped by `end`)."""
     annual = annual.dropna().sort_index()
     if annual.empty:
         return pd.Series(dtype="float64")
     years = sorted(annual.index.year.unique())
     last_year = years[-1]
     last_month = pd.Timestamp(f"{last_year}-12-31")
-    grid_end = last_month
-    if carry_forward_partial:
-        # carry the latest annual pace forward to cover the partial/future year.
-        # When an explicit `end` is given, extend to it; otherwise buffer one
-        # extra year (the current incomplete year) so a downstream panel whose
-        # gold index runs past the last full WGC year still gets a flow value.
-        if end is not None:
-            target = pd.Timestamp(end).to_period("M").to_timestamp("M")
-        else:
-            target = pd.Timestamp(f"{last_year + 1}-12-31")
-        grid_end = max(last_month, target)
-    idx = pd.date_range(f"{years[0]}-01-31", grid_end, freq="ME")
+    if end is not None:
+        target = pd.Timestamp(end).to_period("M").to_timestamp("M")
+        # hard cap at `end`; extend to it only when carrying forward.
+        grid_end = target if carry_forward_partial else min(last_month, target)
+    else:
+        grid_end = pd.Timestamp(f"{last_year + 1}-12-31") if carry_forward_partial else last_month
+    if grid_end < pd.Timestamp(f"{years[0]}-01-31"):
+        return pd.Series(dtype="float64")
+    idx = pd.date_range(f"{years[0]}-01-31", grid_end, freq=pd.offsets.MonthEnd())
     monthly = pd.Series(index=idx, dtype="float64")
     for ts in idx:
         y = ts.year
@@ -225,13 +244,14 @@ def make_wgc_fn(
     *,
     signal: str = DEFAULT_SIGNAL,
     baseline: float = BASELINE_TONNES,
-    path: str = DEFAULT_WGC_CSV,
+    path: Optional[str] = None,
     carry_forward_partial: bool = True,
 ) -> Callable[[str, Optional[str]], pd.Series]:
     """Build a `wgc_fn(start, end)` for `build_attribution_panel(wgc_fn=...)`.
 
-    Returns a closure that loads the annual WGC series and emits the chosen
-    monthly `signal`. `end` (the panel's requested end) drives the partial-year
+    Returns a closure that loads the annual WGC series (embedded-authoritative on
+    the default `path=None` — see `load_wgc_annual`) and emits the chosen monthly
+    `signal`. `end` (the panel's requested end) drives the partial-year
     carry-forward so the signal reaches the decomposition endpoint."""
 
     def wgc_fn(start: str, end: Optional[str] = None) -> pd.Series:

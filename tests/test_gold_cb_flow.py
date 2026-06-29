@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+import lib.gold_cb_flow as gcf
 from lib.gold_cb_flow import (
     BASELINE_TONNES,
     DEFAULT_SIGNAL,
@@ -35,6 +36,14 @@ from lib.gold_credit_spread_attribution import (
     decompose_period,
     fit_attribution,
 )
+
+
+def _embedded_annual():
+    """Embedded annual series, built locally so signal tests stay pure/offline
+    (no read of the workspace data/ CSV)."""
+    return pd.Series(
+        {pd.Timestamp(f"{y}-12-31"): v for y, v in sorted(WGC_ANNUAL_TONNES.items())}
+    )
 
 
 # ── 1. CSV materialization + load ────────────────────────────────────────
@@ -81,8 +90,8 @@ def test_baseline_matches_brief():
 
 
 # ── 2. annual→monthly interpolation ──────────────────────────────────────
-def test_monthly_flow_sums_to_annual():
-    s = load_wgc_annual(write_if_missing=False)
+def test_flow_signal_holds_annualized_rate_within_year():
+    s = _embedded_annual()
     flow = build_flow_signal(s, signal="flow", carry_forward_partial=False)
     # 'flow' signal is the annualized rate held flat within a year; the 12
     # monthly values of 2022 each equal the 2022 annual flow.
@@ -92,7 +101,7 @@ def test_monthly_flow_sums_to_annual():
 
 
 def test_cum_stock_is_cumulative_tonnes():
-    s = load_wgc_annual(write_if_missing=False)
+    s = _embedded_annual()
     cum = build_flow_signal(s, signal="cum_stock", carry_forward_partial=False)
     # final cumulative ≈ sum of all annual flows (months spread then summed)
     assert float(cum.iloc[-1]) == pytest.approx(sum(WGC_ANNUAL_TONNES.values()), rel=1e-9)
@@ -100,7 +109,7 @@ def test_cum_stock_is_cumulative_tonnes():
 
 
 def test_cum_excess_subtracts_baseline():
-    s = load_wgc_annual(write_if_missing=False)
+    s = _embedded_annual()
     cum_stock = build_flow_signal(s, signal="cum_stock", carry_forward_partial=False)
     cum_excess = build_flow_signal(s, signal="cum_excess", carry_forward_partial=False)
     n = len(cum_stock)
@@ -110,13 +119,13 @@ def test_cum_excess_subtracts_baseline():
 
 
 def test_invalid_signal_raises():
-    s = load_wgc_annual(write_if_missing=False)
+    s = _embedded_annual()
     with pytest.raises(ValueError, match="signal must be one of"):
         build_flow_signal(s, signal="bogus")
 
 
 def test_all_signals_nonempty():
-    s = load_wgc_annual(write_if_missing=False)
+    s = _embedded_annual()
     for sig in VALID_SIGNALS:
         assert len(build_flow_signal(s, signal=sig, carry_forward_partial=False)) > 0
 
@@ -125,7 +134,7 @@ def test_all_signals_nonempty():
 def test_carry_forward_extends_past_last_full_year():
     """With carry_forward, requesting end in 2026 extends the monthly grid using
     the latest annual pace (2025); the cumulative signal reaches 2026."""
-    s = load_wgc_annual(write_if_missing=False)  # last full year 2025
+    s = _embedded_annual()  # last full year 2025
     flow = build_flow_signal(s, signal="flow", end=pd.Timestamp("2026-03-31"),
                              carry_forward_partial=True)
     mar26 = flow[flow.index == pd.Timestamp("2026-03-31")]
@@ -137,27 +146,65 @@ def test_carry_forward_extends_past_last_full_year():
 def test_no_carry_stops_at_last_full_year():
     """缺 2026 数据回退:carry_forward_partial=False stops cleanly at the last
     full annual year rather than fabricating future months."""
-    s = load_wgc_annual(write_if_missing=False)
+    s = _embedded_annual()
     flow = build_flow_signal(s, signal="cum_excess", end=pd.Timestamp("2026-03-31"),
                              carry_forward_partial=False)
     assert flow.index.max() == pd.Timestamp("2025-12-31")
 
 
-def test_missing_2026_row_still_runs_via_fallback():
-    """A CSV that ends at 2025 (no 2026 row) still yields a signal reaching the
-    2026 decomposition endpoint through carry-forward — the data-gap fallback."""
-    s = load_wgc_annual(write_if_missing=False)
+def test_missing_2026_row_still_runs_via_fallback(tmp_path):
+    """A source that ends at 2025 (no 2026 row) still yields a signal reaching the
+    2026 decomposition endpoint through carry-forward — the data-gap fallback.
+    Uses a tmp path so the closure never touches the workspace data/."""
+    s = _embedded_annual()
     assert 2026 not in s.index.year  # precondition: no 2026 in source
-    fn = make_wgc_fn(signal="cum_excess")
+    fn = make_wgc_fn(signal="cum_excess", path=str(tmp_path / "w.csv"))
     out = fn("2010-01-01", "2026-03-31")
     assert out.index.max() >= pd.Timestamp("2026-03-31")
+
+
+def test_default_path_ignores_stale_csv(tmp_path, monkeypatch):
+    """codex PR#10 P1: on the default path the embedded series is authoritative —
+    a stale/edited data/ CSV is ignored (and overwritten), so a run can never
+    silently depend on leftover machine state."""
+    stale = tmp_path / "wgc_cb_purchases.csv"
+    stale.write_text("year,net_purchases_tonnes\n2022,9999\n")  # bogus
+    monkeypatch.setattr(gcf, "DEFAULT_WGC_CSV", str(stale))
+    s = load_wgc_annual()  # default path
+    assert float(s.loc[pd.Timestamp("2022-12-31")]) == pytest.approx(1082.0)  # embedded wins
+    # the stale mirror was refreshed to the embedded values
+    refreshed = load_wgc_annual(str(stale))
+    assert float(refreshed.loc[pd.Timestamp("2022-12-31")]) == pytest.approx(1082.0)
+
+
+def test_custom_path_csv_override_is_honoured(tmp_path):
+    """A vintage CSV at an explicit custom path IS honoured (override allowed),
+    so sensitivity work with an alternative series still works."""
+    p = tmp_path / "vintage.csv"
+    p.write_text("year,net_purchases_tonnes\n2022,1200\n2023,900\n")
+    s = load_wgc_annual(str(p))
+    assert float(s.loc[pd.Timestamp("2022-12-31")]) == pytest.approx(1200.0)
+
+
+def test_end_is_hard_upper_bound_no_future_leak():
+    """codex PR#10 P2: when `annual` already contains a partial trailing year
+    (e.g. 2026), an `end` inside that year must NOT leak later months."""
+    s = _embedded_annual()
+    s.loc[pd.Timestamp("2026-12-31")] = 300.0  # a partial/early-reported 2026 row
+    flow = build_flow_signal(s, signal="flow", end=pd.Timestamp("2026-03-31"),
+                             carry_forward_partial=True)
+    assert flow.index.max() == pd.Timestamp("2026-03-31")
+    # and no-carry path is likewise capped (and never past last full year)
+    flow2 = build_flow_signal(s, signal="flow", end=pd.Timestamp("2026-03-31"),
+                              carry_forward_partial=False)
+    assert flow2.index.max() <= pd.Timestamp("2026-03-31")
 
 
 # ── 4. end-to-end injection into the PR #9 panel ─────────────────────────
 def _anchor_and_fetch(n=320, seed=11):
     """Synthetic anchor + fetch covering 2003+ (so ③ custody is present) through
     ~2029, matching the PR #9 offline test harness."""
-    idx = pd.date_range("2003-01-31", periods=n, freq="ME")
+    idx = pd.date_range("2003-01-31", periods=n, freq=pd.offsets.MonthEnd())
     rng = np.random.RandomState(seed)
     gold = pd.Series(np.exp(np.cumsum(rng.randn(n) * 0.02) + 6.0), index=idx)
     debt_gdp = pd.Series(np.linspace(0.55, 1.25, n) + rng.randn(n) * 0.01, index=idx)
@@ -180,11 +227,12 @@ def _anchor_and_fetch(n=320, seed=11):
     return anchor, fetch_fn
 
 
-def test_injected_flow_layer_keeps_exact_identity():
+def test_injected_flow_layer_keeps_exact_identity(tmp_path):
     anchor, fetch_fn = _anchor_and_fetch()
     panel = build_attribution_panel(
         start="2003-01-01", fetch_fn=fetch_fn,
-        anchor_fn=lambda *a, **k: anchor, wgc_fn=make_wgc_fn(signal="cum_excess"),
+        anchor_fn=lambda *a, **k: anchor,
+        wgc_fn=make_wgc_fn(signal="cum_excess", path=str(tmp_path / "w.csv")),
     )
     # ⑤ flow now present and an included design layer
     assert panel.data["wgc_flow"].notna().any()

@@ -8,7 +8,7 @@ series (via `lib.gold_cb_flow.make_wgc_fn`) into PR #9's `wgc_fn` seam, turning 
 from a residual into an explicit regressor, and asks:
 
   (a) does ⑤ flow become the largest *positive* contributor to 2022→2026?
-  (b) how far does the residual shrink from +127%?
+  (b) how far does the residual shrink from PR#9's (~+127%) baseline?
   (c) is it the ⑤ central-bank *flow* (not the ③ debt/GDP+custody spread proxy)
       that explains the move after the real-rate anchor broke?
 
@@ -145,8 +145,9 @@ def main() -> None:
                   r_id, r_free, d_id, d_free, v_id, v_free, sens, decomp_csv, sens_csv)
 
     res_after = _contrib(d_id, "flow_resid", "contribution_pct_of_total")
+    res_before = _contrib(d_base, "flow_resid", "contribution_pct_of_total")
     flow_pct = _contrib(d_id, "flow", "contribution_pct_of_total")
-    print(f"\nflow claims {flow_pct:+.1f}% of move; residual {127.0:.0f}%→{res_after:+.1f}%; "
+    print(f"\nflow claims {flow_pct:+.1f}% of move; residual {res_before:+.1f}%→{res_after:+.1f}%; "
           f"⑤ top={v_id['top_layer']=='flow'}")
     print(f"report → {md}\ncsv    → {decomp_csv}\ncsv    → {sens_csv}\ncsv    → {csv_path}")
 
@@ -175,12 +176,12 @@ def _write_report(path, args, date, csv_path, panel, r_base, d_base, r_base10,
     annual_tbl = " ".join(f"{y}:{int(v)}" for y, v in sorted(WGC_ANNUAL_TONNES.items()))
 
     # primary ruling
-    if flow_top and resid_after < resid_base / 2:
+    if flow_top and abs(resid_after) < abs(resid_base) / 2:
         ruling = (
             f"**裁决:成立(定量支持「2022 起央行购金/去美元化顶价」假说)。**\n\n"
             f"接入 WGC 央行净购金后,⑤流量层成为 {t0}→{t1} 金价涨幅的**最大单一正贡献**"
             f"(Δln={flow_ln:+.4f},占总涨幅 **{_fmt_pct(flow_pct)}**;事实),原本无法归因的 "
-            f"ε_flow 残差从 PR#9 的 **+127%** 塌缩到 **{_fmt_pct(resid_after)}**(事实)——"
+            f"ε_flow 残差从 PR#9 基线的 **{_fmt_pct(resid_base)}** 塌缩到 **{_fmt_pct(resid_after)}**(事实)——"
             f"即央行流量**认领了残差的主体**。与此同时 ②实利率层仍为**负贡献**"
             f"({_fmt_pct(real_pct)};事实):2022-23 实利率大幅*上行*本应压制金价,"
             f"金价反而创新高——旧「金价≈−实利率」锚确已断裂(推理),而断裂后的解释力"
@@ -192,7 +193,7 @@ def _write_report(path, args, date, csv_path, panel, r_base, d_base, r_base10,
     elif flow_top:
         ruling = (
             f"**裁决:部分成立。** ⑤流量是最大正贡献({_fmt_pct(flow_pct)}),但残差仅从 "
-            f"+127% 降到 {_fmt_pct(resid_after)},央行流量只认领了一部分;其余仍未归因。"
+            f"{_fmt_pct(resid_base)} 降到 {_fmt_pct(resid_after)},央行流量只认领了一部分;其余仍未归因。"
         )
     else:
         ruling = (
@@ -202,7 +203,7 @@ def _write_report(path, args, date, csv_path, panel, r_base, d_base, r_base10,
         )
 
     lines = [
-        f"# 黄金归因补全:WGC 央行购金认领 PR#9 的 +127% 流量残差 (PR #10)",
+        f"# 黄金归因补全:WGC 央行购金认领 PR#9 的流量残差 (PR #10)",
         "",
         f"_生成于 {date}(本地日期)· 数据起点 {args.start} · 归因窗口 {t0}→{t1} · "
         f"主信号 `{args.signal}`_",
@@ -210,7 +211,7 @@ def _write_report(path, args, date, csv_path, panel, r_base, d_base, r_base10,
         "## 0. 一句话结论",
         "",
         f"{('✅' if flow_top else '❌')} 接入 WGC 央行净购金后,⑤流量层贡献 "
-        f"**{_fmt_pct(flow_pct)}**,PR#9 的 **+127%** 不可归因残差塌缩到 "
+        f"**{_fmt_pct(flow_pct)}**,PR#9 基线的 **{_fmt_pct(resid_base)}** 不可归因残差塌缩到 "
         f"**{_fmt_pct(resid_after)}**(R² {r_base10.r2:.2f}→{r_id.r2:.2f})。",
         "",
         "本 PR 是 **ex-post 方差归因**(解释*已实现*涨幅由哪一层co-move承载),"
