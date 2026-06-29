@@ -198,6 +198,40 @@ def test_build_series_rejects_missing_current_credit(monkeypatch):
         lm.build_series()
 
 
+def test_layer_status_aggregation():
+    assert lm._layer_status([{"status": "green"}, {"status": "red"}, {"status": "muted"}]) == "red"
+    assert lm._layer_status([{"status": "green"}, {"status": "amber"}]) == "amber"
+    assert lm._layer_status([{"status": "green"}, {"status": "muted"}]) == "green"
+    assert lm._layer_status([{"status": "muted"}, {"status": "muted"}]) == "muted"
+
+
+def test_layer_status_matches_items(signals):
+    for layer in signals["layers"]:
+        assert layer["status"] == lm._layer_status(layer["items"])
+
+
+def test_finra_monitor_text_tracks_latest_month(signals):
+    # First monitor name should reference latest_month + 1, not a hardcoded "6月".
+    latest = pd.Period(signals["latest"]["ym"], freq="M")
+    pend = latest + 1
+    assert f"{pend.year}-{pend.month:02d}" in signals["monitors"][0]["name"]
+
+
+def test_select_finra_columns_by_header_keyword():
+    df = pd.DataFrame({
+        "Year-Month": ["2020-01"],
+        "Note": ["x"],                                   # inserted junk column
+        "Debit Balances in Margin Accounts": [500000],
+        "Free Credit Balances in Cash Accounts": [100000],
+        "Free Credit Balances in Margin Accounts": [50000],
+    })
+    out = lm._select_finra_columns(df)
+    assert list(out.columns) == ["ym", "debit_M", "cash_credit_M", "margin_credit_M"]
+    assert out["ym"].iloc[0] == "2020-01"
+    assert out["debit_M"].iloc[0] == 500000
+    assert out["cash_credit_M"].iloc[0] == 100000
+
+
 @pytest.mark.filterwarnings("ignore:Could not infer format")
 def test_fetch_finra_rejects_layout_drift(monkeypatch):
     import io as _io

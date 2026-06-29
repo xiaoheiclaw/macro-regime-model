@@ -67,22 +67,22 @@ def _get(url: str, timeout: int = 60, retries: int = 3) -> bytes:
             return urllib.request.urlopen(req, timeout=timeout).read()
         except Exception as e:  # network hiccup / proxy jitter — retry
             last = e
-            print(f"    (retry {i+1}/{retries} {type(e).__name__}: {url[:60]})")
-            time.sleep(2 * (i + 1))
-    raise RuntimeError(f"GET failed after {retries} retries: {url}") from last
+            print(f"    (attempt {i+1}/{retries} failed {type(e).__name__}: {url[:60]})")
+            if i < retries - 1:                # don't sleep after the final attempt
+                time.sleep(2 * (i + 1))
+    raise RuntimeError(f"GET failed after {retries} attempts: {url}") from last
 
 
 def fetch_finra() -> pd.DataFrame:
     """FINRA Customer Margin Balances. Returns ym-indexed: debit, cash_credit, margin_credit (in $M)."""
     raw = _get("https://www.finra.org/sites/default/files/2021-03/margin-statistics.xlsx")
     df = pd.read_excel(io.BytesIO(raw), sheet_name=0)
-    # Be resilient to layout drift (added blurb/blank columns): drop all-empty
-    # columns and take the first 4 meaningful ones (date, debit, cash, margin).
     df = df.dropna(how="all", axis=1)
     if df.shape[1] < 4:
         raise ValueError(f"Unexpected FINRA sheet shape {df.shape}: need ≥4 columns")
-    df = df.iloc[:, :4].copy()
-    df.columns = ["ym", "debit_M", "cash_credit_M", "margin_credit_M"]
+    # Prefer matching columns BY HEADER KEYWORD (robust to inserted columns);
+    # fall back to first-4-positional if the headers aren't recognizable.
+    df = _select_finra_columns(df)
     df = df.dropna(subset=["debit_M"]).copy()
     # Validate column SEMANTICS, not just count — guards against layout drift
     # silently feeding a wrong (e.g. text-blurb) column in as debit_M.
@@ -96,6 +96,31 @@ def fetch_finra() -> pd.DataFrame:
     # ym normalization (→ 'YYYY-MM') is the transform path's job (build_series);
     # fetch_finra only validates schema/types and returns the raw-ish frame.
     return df
+
+
+def _select_finra_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Map FINRA columns to [ym, debit_M, cash_credit_M, margin_credit_M] by header
+    keyword (robust to inserted columns); fall back to the first 4 columns."""
+    low = {c: str(c).lower() for c in df.columns}
+
+    def find(*keys, exclude=()):
+        for c in df.columns:
+            t = low[c]
+            if all(k in t for k in keys) and not any(x in t for x in exclude):
+                return c
+        return None
+
+    date_c = find("month") or find("date") or find("year")
+    debit_c = find("debit")
+    cash_c = find("cash")                                # "...in Cash Accounts"
+    margin_c = find("margin", exclude=("debit",))        # "...in Margin Accounts"
+    picked = [date_c, debit_c, cash_c, margin_c]
+    if all(c is not None for c in picked) and len(set(picked)) == 4:
+        out = df[picked].copy()
+    else:
+        out = df.iloc[:, :4].copy()                      # positional fallback
+    out.columns = ["ym", "debit_M", "cash_credit_M", "margin_credit_M"]
+    return out
 
 
 def _to_ym(s: pd.Series) -> pd.Series:
@@ -204,6 +229,20 @@ def pct(df: pd.DataFrame, col: str, val: float) -> float:
     return float((df[col] <= val).mean() * 100)
 
 
+def _layer_status(items: list[dict]) -> str:
+    """Aggregate a layer's status from its items so the summary can't drift from
+    the (possibly stale-degraded) per-item statuses. Worst non-muted wins;
+    all-muted → muted."""
+    statuses = [it.get("status") for it in items]
+    if "red" in statuses:
+        return "red"
+    if "amber" in statuses or "watch" in statuses:
+        return "amber"
+    if "green" in statuses:
+        return "green"
+    return "muted"
+
+
 def _record_high_streak(s: pd.Series) -> int:
     """Number of most-recent consecutive months that each set a new all-time
     high (strictly above every prior month). 0 if the latest is not a record."""
@@ -261,60 +300,57 @@ def compute(df: pd.DataFrame) -> dict:
         debt_note = "史上最高（本月创新高）"
     else:
         debt_note = "高位"
-    l1 = {
-        "name": "燃料 (Fuel) — 干柴多干",
-        "status": "red",
-        "items": [
-            {"label": "Gross margin debt 绝对水平", "value": f"${cur['gross_B']:,.0f}B",
-             "status": "red" if debt_at_high else "amber",
-             "note": debt_note},
-            {"label": "净新增 (mom)", "value": f"{(cur['gross_B']/prev['gross_B']-1)*100:+.1f}%",
-             "status": "red" if (cur['gross_B'] > prev['gross_B']) else "green",
-             "note": "二阶导：仍在加速"},
-            {"label": "同比 (yoy)", "value": f"{yoy:+.0f}%" if yoy is not None else "n/a",
-             "status": "red" if (yoy and yoy > 20) else "amber", "note": "vs 一年前"},
-            {"label": "net/gross 硬度", "value": f"{cur['net_gross']:.2f}",
-             "status": "red" if cur['net_gross'] > 0.6 else ("amber" if cur['net_gross'] > net_med else "green"),
-             "note": f"中位 {net_med:.2f}；越高=现金缓冲越少=越脆"},
-            {"label": "debt÷S&P价格指数(代理) ratio 百分位", "value": f"{pct(df,'ratio',cur['ratio']):.0f}%",
-             "status": "muted", "note": "⚠ 分母是S&P价格指数(非真实市值)，分母污染、顶部失真，仅作背景——不据此判断风险"},
-        ],
-    }
+    l1_items = [
+        {"label": "Gross margin debt 绝对水平", "value": f"${cur['gross_B']:,.0f}B",
+         "status": "red" if debt_at_high else "amber",
+         "note": debt_note},
+        {"label": "净新增 (mom)", "value": f"{(cur['gross_B']/prev['gross_B']-1)*100:+.1f}%",
+         "status": "red" if (cur['gross_B'] > prev['gross_B']) else "green",
+         "note": "二阶导：仍在加速"},
+        {"label": "同比 (yoy)", "value": f"{yoy:+.0f}%" if yoy is not None else "n/a",
+         "status": "red" if (yoy and yoy > 20) else "amber", "note": "vs 一年前"},
+        {"label": "net/gross 硬度", "value": f"{cur['net_gross']:.2f}",
+         "status": "red" if cur['net_gross'] > 0.6 else ("amber" if cur['net_gross'] > net_med else "green"),
+         "note": f"中位 {net_med:.2f}；越高=现金缓冲越少=越脆"},
+        {"label": "debt÷S&P价格指数(代理) ratio 百分位", "value": f"{pct(df,'ratio',cur['ratio']):.0f}%",
+         "status": "muted", "note": "⚠ 分母是S&P价格指数(非真实市值)，分母污染、顶部失真，仅作背景——不据此判断风险"},
+    ]
+    l1 = {"name": "燃料 (Fuel) — 干柴多干", "items": l1_items, "status": _layer_status(l1_items)}
 
     # L2 amplifier (partly semi-auto / manual snapshot)
-    l2 = {
-        "name": "放大器 (Amplifier) — 弹药与传导",
-        "status": "amber",
-        "items": [
-            _mark_stale({"label": "杠杆 ETF AUM (TQQQ/SOXL/UPRO 等)", "value": "~$247B",
-             "status": "amber", "avail": "semi", "asof": "2026-06-26",
-             "note": "JPM 6/26，集中科技；半自动（周度抓发行商）"}, today),
-            _mark_stale({"label": "融资成本 AXW 期货利差", "value": "+140bp",
-             "status": "red", "avail": "manual", "asof": "2026-06-16",
-             "note": "大摩 6/16，除年末外史上最高；🔴 研报级，手工录入"}, today),
-            {"label": "半导体 realized vol", "value": "待接入",
-             "status": "muted", "avail": "todo", "note": "MVP 待加：SOXX/费半日价格→vol"},
-            _mark_stale({"label": "交易商股权回购敞口", "value": "$2230B",
-             "status": "red", "avail": "manual", "asof": "2026-06-16",
-             "note": "大摩 6/16 史上最高；🔴 研报级，手工录入"}, today),
-        ],
-    }
+    l2_items = [
+        _mark_stale({"label": "杠杆 ETF AUM (TQQQ/SOXL/UPRO 等)", "value": "~$247B",
+         "status": "amber", "avail": "semi", "asof": "2026-06-26",
+         "note": "JPM 6/26，集中科技；半自动（周度抓发行商）"}, today),
+        _mark_stale({"label": "融资成本 AXW 期货利差", "value": "+140bp",
+         "status": "red", "avail": "manual", "asof": "2026-06-16",
+         "note": "大摩 6/16，除年末外史上最高；🔴 研报级，手工录入"}, today),
+        {"label": "半导体 realized vol", "value": "待接入",
+         "status": "muted", "avail": "todo", "note": "MVP 待加：SOXX/费半日价格→vol"},
+        _mark_stale({"label": "交易商股权回购敞口", "value": "$2230B",
+         "status": "red", "avail": "manual", "asof": "2026-06-16",
+         "note": "大摩 6/16 史上最高；🔴 研报级，手工录入"}, today),
+    ]
+    l2 = {"name": "放大器 (Amplifier) — 弹药与传导", "items": l2_items, "status": _layer_status(l2_items)}
 
     # L3 ignition
-    l3 = {
-        "name": "启动 (Ignition) — 火花+点火",
-        "status": "green",
-        "items": [
-            {"label": "三联启动信号", "value": "未触发",
-             "status": "green",
-             "note": "半导体vol跳 + 杠杆ETF尾盘流量激增 + 广度塌缩，三者同现才算点火"},
-            {"label": "下一高脆弱窗口", "value": "NVDA FY27 Q2 ~8月底",
-             "status": "amber", "note": "广度最窄+AI最拥挤，财报/指引 miss 风险最高"},
-        ],
-    }
+    l3_items = [
+        {"label": "三联启动信号", "value": "未触发",
+         "status": "green",
+         "note": "半导体vol跳 + 杠杆ETF尾盘流量激增 + 广度塌缩，三者同现才算点火"},
+        {"label": "下一高脆弱窗口", "value": "NVDA FY27 Q2 ~8月底",
+         "status": "amber", "note": "广度最窄+AI最拥挤，财报/指引 miss 风险最高"},
+    ]
+    l3 = {"name": "启动 (Ignition) — 火花+点火", "items": l3_items, "status": _layer_status(l3_items)}
 
+    # FINRA publishes a month's balances ~end of the following month; the next
+    # pending month is cur+1, expected ~end of cur+2. Derived from latest data.
+    pend = cur["dt"] + pd.DateOffset(months=1)
+    rel = cur["dt"] + pd.DateOffset(months=2)
     monitors = [
-        {"name": "FINRA gross margin debt (6月值)", "current": "待 7月底发布", "threshold": "续创新高=压力续增；掉头=拐点", "status": "watch", "source": "FINRA", "avail": "auto"},
+        {"name": f"FINRA gross margin debt ({pend.year}-{pend.month:02d} 值)",
+         "current": f"待发布（约 {rel.year}-{rel.month:02d} 下旬）",
+         "threshold": "续创新高=压力续增；掉头=拐点", "status": "watch", "source": "FINRA", "avail": "auto"},
         _mark_stale({"name": "AXW 期货利差", "current": "+140bp", "threshold": "回落=缓解；续升=临界", "status": "red", "source": "大摩研报", "avail": "manual", "note": "", "asof": "2026-06-16"}, today),
         _mark_stale({"name": "市场广度 (>5 行业跑赢)", "current": "仅信息技术 1 个", "threshold": "扩散=健康；持续仅科技=脆弱", "status": "red", "source": "大摩/JPM", "avail": "semi", "note": "", "asof": "2026-06-26"}, today),
         {"name": "半导体 realized vol + ETF 流量", "current": "待接入", "threshold": "vol跳+流量激增=点火", "status": "watch", "source": "价格估算", "avail": "todo"},
