@@ -95,8 +95,11 @@ def _wf_extreme_caveat(rc, cond_wf) -> str:
     run (NOT hardcoded to a particular vintage; codex PR#15 P2). Reports the date
     span of the ex-ante-extreme months and the observable N per horizon."""
     ep = rc.episodes
-    wf_ext = ep[ep.get("wf_extreme", False) == True] if not ep.empty else ep  # noqa: E712
-    if wf_ext is None or wf_ext.empty:
+    if ep.empty or "wf_extreme" not in ep.columns:
+        wf_ext = ep.iloc[0:0]
+    else:
+        wf_ext = ep[ep["wf_extreme"].astype(bool)]
+    if wf_ext.empty:
         span = "无 ex-ante 极端月"
     else:
         d = pd.to_datetime(wf_ext["date"])
@@ -181,6 +184,15 @@ def main() -> None:
     ap.add_argument("--include-dxy", action="store_true")
     ap.add_argument("--out-dir", default=ANALYSIS_DIR)
     args = ap.parse_args()
+
+    # fail fast on bad CLI args — BEFORE building the panel/DI/regression (codex
+    # PR#15 R3 P3). Mirrors the lib-level guards so the error is immediate.
+    if args.warmup < 2:
+        ap.error("--warmup must be >= 2")
+    if not 0.0 < args.top_q < 1.0:
+        ap.error("--top-q must be in (0, 1)")
+    if args.reg_window < 3:
+        ap.error("--reg-window must be >= 3")
 
     now = datetime.now().astimezone()
     tzname = now.strftime("%Z") or "local"

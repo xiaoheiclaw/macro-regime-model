@@ -187,9 +187,12 @@ def full_percentile_series(s: pd.Series) -> pd.Series:
     (``pct_full_t = mean(all_history <= s_t)``). This is PR #14's descriptive,
     in-sample read applied across the trajectory — it 'peeks' at the entire sample
     (including each point's future) and is the line the expanding calibration is
-    measured against. NaN-preserving."""
+    measured against. Non-finite values (NaN AND ±inf) are excluded so this口径
+    matches the expanding calibrators' ``np.isfinite`` filter — otherwise an inf in
+    the residual would be ranked by full-sample but dropped by walk-forward, making
+    the two口径 inconsistent (codex PR#15 R3 P3)."""
     _require_time_sorted(s)
-    sv = s.dropna()
+    sv = s[np.isfinite(s.astype(float))]
     if sv.empty:
         return pd.Series(np.nan, index=s.index, name="pct_full")
     arr = sv.to_numpy()

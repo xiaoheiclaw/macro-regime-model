@@ -182,6 +182,24 @@ def test_full_percentile_series_matches_pointwise_full_percentile():
             fps.loc[ts], full_percentile(s, float(s.loc[ts])), atol=1e-12)
 
 
+def test_full_percentile_series_excludes_nonfinite_like_expanding():
+    """full_percentile_series and the expanding calibrator must filter non-finite
+    values the same way (both drop ±inf), so the two口径 stay consistent on a
+    residual containing an inf (codex PR#15 R3 P3)."""
+    n = 30
+    rng = np.random.RandomState(77)
+    s = pd.Series(rng.randn(n), index=_me_index(n))
+    s.iloc[15] = np.inf
+    fps = full_percentile_series(s)
+    # the inf row itself is excluded (NaN), and the finite rows are ranked over the
+    # finite-only baseline — matching expanding_percentile's isfinite filter.
+    assert np.isnan(fps.iloc[15])
+    finite_vals = s[np.isfinite(s)].to_numpy()
+    ts = s.index[10]
+    np.testing.assert_allclose(
+        fps.loc[ts], float((finite_vals <= s.loc[ts]).mean()), atol=1e-12)
+
+
 def test_expanding_zscore_constant_window_is_nan():
     s = pd.Series(np.full(20, 3.0), index=_me_index(20))
     z = expanding_zscore(s, min_periods=5)
