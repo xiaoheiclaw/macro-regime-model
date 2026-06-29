@@ -121,6 +121,10 @@ def build_dispersion_panel(
     df = base[["gold_nominal", "debt_gdp", "m2_gdp", "real_rate_10y"]].copy()
     idx = df.index
 
+    # The extra pulls use the same 2-arg `fetch_fn(series_id, start)` contract as
+    # the anchor panel — fetch_fred_series takes NO `end`, so these read from
+    # `start` to today; the `.reindex(idx)` then truncates to the base panel's
+    # window (dropping anything past `end` / outside it), keeping the sample honest.
     cpi = _to_monthly_mean(fetch_fn(cpi_id, start)).reindex(idx)
     oil = _to_monthly_mean(fetch_fn(oil_id, start)).reindex(idx)
     copper = _to_monthly_mean(fetch_fn(copper_id, start)).reindex(idx)
@@ -370,6 +374,9 @@ def s4_dispersion(
 
     Warm-up stays NaN until BOTH S1's trend/vol window and the dispersion-rank
     window have filled, so `run_backtest` trims those months (no cash stub)."""
-    base = s1_trend(panel, lookbacks, target_vol, vol_window)  # [0,1], NaN warm-up
+    base = s1_trend(panel, lookbacks=lookbacks, target_vol=target_vol,
+                    vol_window=vol_window)  # [0,1], NaN warm-up — keyword to match
+    # the shared PR#5 API (positional would break if s1_trend goes keyword-only /
+    # gains a param), the way every other caller in the repo invokes it.
     f = _dispersion_weight(disp_rank.reindex(panel.index), mode, tiers)  # [0,1]
     return (base * f).clip(lower=0.0, upper=1.0)
