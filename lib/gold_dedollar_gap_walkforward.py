@@ -29,23 +29,29 @@ What an expanding window can and cannot fix
 A structural fact to read before quoting the "current" number
 -------------------------------------------------------------
 The *latest* month is the **end** of the expanding window, so "expanding up to now"
-== "full sample" there. With ``include_current=True`` the current percentile/z are
-therefore **identical** to PR #14's by construction (removing the single newest
-point under ``exclude_current=True`` moves them only by O(1/N)). **The headline
-current reading is thus NOT where look-ahead can hide** — it is the *historical*
-percentile assignments (used to call past episodes "extreme") that an expanding
-window actually corrects. The verdict is adjudicated on those, not on a
-manufactured move in today's number.
+== "full sample" there. With the default ``exclude_current=False`` (include-current)
+the current percentile/z are therefore **identical** to PR #14's by construction.
+Dropping the single newest point under ``exclude_current=True`` moves the
+**percentile** only by O(1/N) — but **NOT necessarily the z-score**: the newest
+point is part of the mean/variance it is being standardized against, so removing it
+can shift ``z_wf_excl`` materially (or to NaN if the prior window is near-constant)
+when the latest residual is itself extreme. Report ``z_wf_excl − z_full`` directly
+rather than assuming it is ~O(1/N). **The headline current reading is still NOT
+where look-ahead can hide** — it is the *historical* percentile assignments (used
+to call past episodes "extreme") that an expanding window actually corrects. The
+verdict is adjudicated on those, not on a manufactured move in today's number.
 
 Two calibration conventions (both reported)
 -------------------------------------------
-* ``include_current=False`` default in the trajectory frame mirrors PR #14's
+* ``exclude_current=False`` (default, "include-current") mirrors PR #14's
   descriptive ``full_percentile`` (value ranked **within** its own history,
   ``<=`` including itself) — the apples-to-apples expanding analogue. At the final
-  month it coincides with the full-sample read.
-* ``exclude_current=True`` is the stricter *ex-ante* stance: rank today only
-  against history **strictly before** today (the baseline that already existed).
-  Used for the real-time "would I have called this extreme then?" episode reread.
+  month it coincides with the full-sample read. **The report's §3/§4 historical
+  reread use this口径.**
+* ``exclude_current=True`` ("strict ex-ante") ranks today only against history
+  **strictly before** today (the baseline that already existed). **The report's §1
+  current-verdict number shows this口径** as the more conservative read. Both
+  conventions are leak-free (neither uses the future); strict is just stricter.
 
 Everything is computed with explicit loops over only data ``<= t`` so the
 leak-free property is transparent (and unit-tested): truncating the future leaves
@@ -86,12 +92,19 @@ def _require_time_sorted(s: pd.Series) -> None:
     """The expanding calibrators iterate in positional order and treat earlier
     positions as 'history'. A non-time-sorted index would let a future month sit
     in an earlier position and leak into a past calibration — silently breaking the
-    no-look-ahead contract (codex PR#15 P2). Reject it loudly instead."""
+    no-look-ahead contract (codex PR#15 P2). A duplicate timestamp is just as bad:
+    ``full_percentile_series`` would dict-collapse same-index rows and
+    ``current_walk_forward_reading`` would crash on a non-scalar ``.loc[asof]``
+    (codex PR#15 R2 P2). Reject both loudly instead."""
     if not s.index.is_monotonic_increasing:
         raise ValueError(
             "series index must be monotonic increasing for walk-forward "
             "calibration (sort_index() first); positional iteration treats earlier "
             "rows as history, so an out-of-order index would leak the future.")
+    if not s.index.is_unique:
+        raise ValueError(
+            "series index must be unique for walk-forward calibration; duplicate "
+            "timestamps collapse the percentile baseline and break the asof read.")
 
 
 def expanding_zscore(
@@ -175,6 +188,7 @@ def full_percentile_series(s: pd.Series) -> pd.Series:
     in-sample read applied across the trajectory — it 'peeks' at the entire sample
     (including each point's future) and is the line the expanding calibration is
     measured against. NaN-preserving."""
+    _require_time_sorted(s)
     sv = s.dropna()
     if sv.empty:
         return pd.Series(np.nan, index=s.index, name="pct_full")
@@ -244,9 +258,12 @@ def current_walk_forward_reading(
 
     Honest structural note baked into the dataclass docstring/usage: (a) and (b)
     coincide at the final month by construction (the window ends *now*); (c) drops
-    only the single newest point, so it moves the rank by ~1/N. A *large* gap here
-    would be surprising — the look-ahead this PR really corrects lives in the
-    historical episode reread, not in today's number."""
+    only the single newest point, so its **percentile** moves by ~1/N — but its
+    **z-score** can move more (the dropped point was in the mean/variance it is
+    standardized against), so ``z_wf_excl`` is reported directly, not assumed small.
+    A *large* percentile gap would be surprising — the look-ahead this PR really
+    corrects lives in the historical episode reread, not in today's number."""
+    _require_time_sorted(resid)
     rv = resid.dropna()
     if rv.empty:
         return WalkForwardReading(

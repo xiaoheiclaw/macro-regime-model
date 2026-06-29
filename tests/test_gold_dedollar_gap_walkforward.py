@@ -277,7 +277,7 @@ def test_walk_forward_conditional_table_rejects_bad_q():
         walk_forward_conditional_table(resid, price, top_q=1.0)
 
 
-# ── 6. monotonic-index (no-lookahead) guard ──────────────────────────────
+# ── 6. monotonic / unique index (no-lookahead) guard ─────────────────────
 def test_expanding_rejects_non_monotonic_index():
     """An out-of-order index would let a future month sit in an earlier position
     and leak into a past calibration → must raise (codex PR#15 P2)."""
@@ -288,6 +288,21 @@ def test_expanding_rejects_non_monotonic_index():
         expanding_zscore(s, min_periods=3)
     with pytest.raises(ValueError):
         expanding_percentile(s, min_periods=3)
+
+
+def test_calibrators_reject_duplicate_index():
+    """A duplicate timestamp collapses the percentile baseline and breaks the asof
+    read → every entry point must raise (codex PR#15 R2 P2)."""
+    idx = _me_index(10)
+    dup = idx[[0, 1, 2, 2, 3, 4, 5, 6, 7, 8]]  # sorted but index[3] duplicates [2]
+    s = pd.Series(np.arange(10.0), index=dup)
+    for fn in (expanding_zscore, expanding_percentile):
+        with pytest.raises(ValueError):
+            fn(s, min_periods=3)
+    with pytest.raises(ValueError):
+        full_percentile_series(s)
+    with pytest.raises(ValueError):
+        current_walk_forward_reading(s, warmup=3)
 
 
 def test_warmup_sensitivity_table():
@@ -334,6 +349,25 @@ def test_verdict_not_robust_without_evaluable_extreme():
     assert not np.isfinite(rc.summary["agreement_rate"])
     label, _ = script._verdict(rd, rc, None)
     assert label != "ROBUST"
+    assert label == "UNKNOWN"
+
+
+def test_verdict_unknown_when_strict_excl_current_undefined():
+    """If the verdict口径 (strict exclude-current) current pct is NaN — e.g.
+    warmup == n_resid leaves include-current defined but exclude-current not — we
+    must NOT fall through to ROBUST even when agreement is high (codex PR#15 R2 P2)."""
+    from lib.gold_dedollar_gap_walkforward import (
+        ExtremeReclassification, WalkForwardReading)
+    script = _load_script_module()
+    rd = WalkForwardReading(
+        asof=pd.Timestamp("2026-05-31"), z_full=1.1, pct_full=0.9,
+        z_wf_incl=1.1, pct_wf_incl=0.9, z_wf_excl=np.nan, pct_wf_excl=np.nan,
+        n_resid=40, n_wf=40, warmup=40)
+    rc = ExtremeReclassification(
+        summary={"n_full_extreme": 10, "n_wf_extreme": 10, "n_warmup": 0,
+                 "n_evaluable": 10, "agreement_rate": 1.0},
+        episodes=pd.DataFrame())
+    label, _ = script._verdict(rd, rc, None)
     assert label == "UNKNOWN"
 
 

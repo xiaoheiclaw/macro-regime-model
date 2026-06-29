@@ -130,7 +130,15 @@ def _verdict(rd, rc, cond_wf=None) -> tuple[str, str]:
     n_eval = rc.summary.get("n_evaluable", 0)
     if not np.isfinite(pct_full):
         return "UNKNOWN", "无可定义的当前偏离读数,无法裁决。"
-    drop = pct_full - pct_wf if np.isfinite(pct_wf) else 0.0
+    if not np.isfinite(pct_wf):
+        # the verdict口径 is strict exclude-current; if it is undefined (e.g.
+        # warmup == n_resid → include-current defined but exclude-current is not)
+        # we cannot certify on it. Don't fall through to ROBUST (codex PR#15 R2 P2).
+        return ("UNKNOWN",
+                f"strict ex-ante 当前分位不可用(warm-up={rd.warmup} 相对残差样本 "
+                f"n={rd.n_resid} 过大,exclude-current baseline 不足),无法以该口径裁决;"
+                f"仅 include-current 当前分位 = {_fmt_pct(rd.pct_wf_incl)}(与全样本恒等)。")
+    drop = pct_full - pct_wf
     if np.isfinite(pct_wf) and drop > 0.15:
         return ("DOWNGRADE",
                 f"当前分位在 walk-forward(strict ex-ante)下从 {_fmt_pct(pct_full)} "
@@ -234,7 +242,10 @@ def main() -> None:
     P.append("### ⚠️ 一个必须先读的结构性事实\n")
     P.append("当前月是 expanding 窗口的**终点**,故「截至当下的 expanding 窗口」== "
              "「全样本」。因此 **include-current 口径下当前分位/ z 与 PR#14 完全相等"
-             "(数学恒等),exclude-current 仅去掉最新一点、移动约 1/N**。"
+             "(数学恒等)**。exclude-current 去掉最新一点:**分位**移动约 1/N;但 **z-score "
+             "不一定**——最新点本身在它被标准化所用的均值/方差里,若最新残差极端、或前序"
+             "窗口方差很小,`z_wf_excl` 可大幅变化甚至变 NaN,故直接报 `z_wf_excl − z_full`"
+             f"(本次 = {_fmt(rd.z_wf_excl - rd.z_full)})。"
              "→ **今天的读数不是 look-ahead 能藏身之处**;真正被 expanding 窗口纠正的是"
              "**历史**月份的分位标定(用来称过去某月为「极端」时,偷看了该月之后的数据)。"
              "裁决因此落在历史极端重判上,而非today的数字上。\n")
