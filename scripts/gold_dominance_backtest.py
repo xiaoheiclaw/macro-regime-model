@@ -267,17 +267,25 @@ def main() -> None:
         # window's later warm-up does not mix a moving sample start into the band.
         sens_start = max(s for s, _ in sens_spans.values())
         sens_end = min(e for _, e in sens_spans.values())
-        for w, bt_w in sens_bts.items():
-            lo, hi = sens_spans[w]
-            # a window whose own span doesn't cover [sens_start, sens_end] can't
-            # be scored on the shared window — flag it skipped rather than emit a
-            # misleading all-NaN table (matters under a short sample / large window).
-            if lo > sens_start or hi < sens_end:
-                sens_skipped.append(f"{w}m: span {lo:%Y-%m}–{hi:%Y-%m} doesn't "
-                                    f"cover the shared band {sens_start:%Y-%m}–{sens_end:%Y-%m}")
-                continue
-            m = metrics_table(bt_w, sens_start, sens_end).loc[["S1_blend", "SD_blend"]]
-            sens_windows[w] = m[["sharpe", "calmar", "cagr", "max_dd", "n_months"]]
+        if sens_start > sens_end:
+            # the per-window spans don't share a common month (short sample /
+            # large --corr-window) — there is NO shared investable window, so the
+            # whole band is skipped rather than emitting empty/all-NaN tables.
+            sens_skipped.append(f"no shared investable span across corr windows "
+                                f"(latest start {sens_start:%Y-%m} after earliest "
+                                f"end {sens_end:%Y-%m})")
+        else:
+            for w, bt_w in sens_bts.items():
+                lo, hi = sens_spans[w]
+                # a window whose own span doesn't cover [sens_start, sens_end] can't
+                # be scored on the shared window — flag it skipped rather than emit a
+                # misleading all-NaN table (matters under a short sample / large window).
+                if lo > sens_start or hi < sens_end:
+                    sens_skipped.append(f"{w}m: span {lo:%Y-%m}–{hi:%Y-%m} doesn't "
+                                        f"cover the shared band {sens_start:%Y-%m}–{sens_end:%Y-%m}")
+                    continue
+                m = metrics_table(bt_w, sens_start, sens_end).loc[["S1_blend", "SD_blend"]]
+                sens_windows[w] = m[["sharpe", "calmar", "cagr", "max_dd", "n_months"]]
 
     # ── cost sensitivity {0, 10, 20} bps ──
     sens_cost: Dict[float, pd.DataFrame] = {}
@@ -316,8 +324,10 @@ def main() -> None:
     parts.append(_fmt(full))
     parts.append("")
     # mean regime probability over the common investable window — describes the
-    # actual smooth blend in the mechanism note (the (1-prob)/prob weighting).
-    mean_prob = float(prob.loc[cstart:cend].dropna().mean())
+    # actual smooth blend in the mechanism note. shift(1) because month-m's HELD
+    # position was decided at m-1 (run_backtest applies .shift(1)), so the blend
+    # in force over the traded window is prob.shift(1), not the un-shifted prob.
+    mean_prob = float(prob.shift(1).loc[cstart:cend].dropna().mean())
     parts.append(verdict(full, mean_prob))
     parts.append("")
 

@@ -518,6 +518,32 @@ def test_cb_non_month_end_timestamps_are_normalized_not_dropped():
     assert (late_cb >= late_base + 0.5).all()                   # normalized → fires
 
 
+def test_cb_quarterly_period_index_lands_at_quarter_end_no_lookahead():
+    """P2 regression: a quarterly PeriodIndex CB feed (2022Q1) must land at its
+    QUARTER END (Mar 31), not the period start (Jan 31). The old to_timestamp
+    ("M") default used the start → with cb_lag_months=1 a Q1 reading was usable
+    in Feb, before the quarter closed — a look-ahead. Now a quarter's reading
+    cannot affect any probability at or before (quarter_end + cb_lag_months)."""
+    n = 120
+    idx = pd.date_range("1985-01-31", periods=n, freq="ME")
+    dg = np.linspace(0.005, 0.02, n)
+    gold = pd.Series(np.exp(np.cumsum(dg)), index=idx)
+    rr = pd.Series(np.cumsum(-dg * 10.0), index=idx)            # real-rate-dominant
+    # quarterly PeriodIndex: one positive reading in 1986Q1 (Jan-Mar), rest NaN
+    cb = pd.Series(np.nan, index=pd.period_range("1985Q1", periods=40, freq="Q"))
+    cb.loc["1986Q1"] = 5.0
+    lag = 1
+    with_cb = dominance_probability(gold, rr, window=12, cb_demand=cb, cb_lag_months=lag)
+    # 1986Q1 ends 1986-03-31; with a 1-month publication lag it is usable only
+    # from 1986-04-30 onward. Every month ≤ 1986-03-31 must be UNAFFECTED (equal
+    # to the no-cb base) — the reading is not known there.
+    base = dominance_probability(gold, rr, window=12)
+    pre = with_cb.index <= pd.Timestamp("1986-03-31")
+    a, b = base[pre].to_numpy(), with_cb[pre].to_numpy()
+    mask = ~(np.isnan(a) | np.isnan(b))
+    np.testing.assert_allclose(a[mask], b[mask])
+
+
 def test_regime_label_and_timeline():
     idx = pd.date_range("2000-01-31", periods=60, freq="ME")
     prob = pd.Series(np.nan, index=idx, dtype=float)

@@ -261,7 +261,12 @@ def dominance_probability(
         # any intra-month points to their month-end via resample("ME").last().
         cb = cb_demand.sort_index().copy()
         if isinstance(cb.index, pd.PeriodIndex):
-            cb.index = cb.index.to_timestamp("M")
+            # how="end": a quarterly Period 2022Q1 must land at its END
+            # (2022-03-31), NOT its start (2022-01-31). The default "start"
+            # mapping is a look-ahead — Q1's reading would be usable in Feb,
+            # before the quarter closes. normalize() strips the 23:59:59 so
+            # resample("ME").last() collapses cleanly to the month-end.
+            cb.index = cb.index.to_timestamp("M", how="end").normalize()
         cb = cb.resample("ME").last()
         cb_raw = cb.reindex(gold_nominal.index).shift(cb_lag_months)
         # forward-fill so a (quarterly) reading carries through the inter-report
