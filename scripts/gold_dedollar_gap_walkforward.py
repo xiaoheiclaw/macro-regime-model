@@ -118,7 +118,7 @@ def _wf_extreme_caveat(rc, cond_wf) -> str:
                        for _, r in ext.iterrows())
     else:
         ns = "n/a"
-    return f"{span};walk-forward 极端旗标各 horizon 可观测前瞻 N({ns})"
+    return f"{span}; walk-forward 极端旗标各 horizon 可观测前瞻 N({ns})"
 
 
 def _verdict(rd, rc, cond_wf=None) -> tuple[str, str]:

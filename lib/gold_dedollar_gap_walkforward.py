@@ -113,8 +113,11 @@ def _finite_series(s: pd.Series) -> pd.Series:
     reading's sample/degeneracy checks, the expanding calibrators, and the
     forward-return summary — agrees on which residuals count.
     Otherwise an inf in the residual would be ranked by one口径 and dropped by
-    another, making the current verdict internally inconsistent."""
-    return s[np.isfinite(s.astype(float))]
+    another, making the current verdict internally inconsistent. Returns a numeric
+    (float) series, so an object/string-number input is also coerced — 'finite-only'
+    guarantees numeric dtype downstream, not just NaN/inf removal."""
+    sf = s.astype(float)
+    return sf[np.isfinite(sf)]
 
 
 def expanding_zscore(
