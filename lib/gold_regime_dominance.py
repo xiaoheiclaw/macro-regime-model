@@ -21,7 +21,7 @@ data ≤ t only):
                            negative relation breaking down), OR sustained net
                            central-bank buying. An optional cb_demand proxy
                            (WGC net official purchases / TIC foreign-official
-                           flows) is a THIRD, co-equal disjunct (NOT a mere
+                           flows) is a FOURTH, co-equal disjunct (NOT a mere
                            confirm): publication-lagged, sparse feeds forward-
                            filled to monthly, and firing only when a majority of
                            the window's available readings are positive.
@@ -153,7 +153,13 @@ def level_divergence(
     rr_up = real_rate - real_rate.shift(window)  # trailing real-rate change
     both = (gold_up > 0) & (rr_up > 0)
     out = both.astype(float)
-    out[gold_up.isna() | rr_up.isna()] = np.nan  # warm-up → NaN (no default)
+    # the level signal uses only the two endpoints (t, t-window); a missing
+    # observation INSIDE the window would otherwise be invisible, letting a
+    # level read fire on an incomplete window. Require every month in
+    # [t-window, t] to have BOTH series present.
+    valid = gold_nominal.notna() & real_rate.notna()
+    complete = valid.rolling(window + 1, min_periods=window + 1).sum().eq(window + 1)
+    out[gold_up.isna() | rr_up.isna() | ~complete.fillna(False)] = np.nan
     return out
 
 
@@ -186,7 +192,7 @@ def dominance_probability(
                because the monthly co-movement stayed negative even as the
                levels pulled apart.
       cb_demand (optional): a net-buying proxy (WGC quarterly central-bank
-               purchases, TIC foreign-official flows, …) treated as a THIRD,
+               purchases, TIC foreign-official flows, …) treated as a FOURTH,
                co-equal de-dollarization fingerprint — the spec's third
                disjunct "central-bank net buying picking up" (the fingerprint is
                an OR: corr-breakdown ∨ divergence ∨ CB-buying). Sustained net
@@ -248,11 +254,18 @@ def dominance_probability(
     if cb_demand is not None:
         # shift forward by the publication lag so the month-t figure is only
         # used cb_lag_months later (WGC data is released with a quarter+ delay).
-        cb_raw = cb_demand.reindex(gold_nominal.index).shift(cb_lag_months)
-        # CB feeds (WGC quarterly) are sparse vs a monthly panel; forward-fill
-        # each observation to its next month so a quarterly reading carries
-        # through the inter-report months, then rolling over the (now gap-free)
-        # monthly signal. min_periods=window still requires `window` post-fill
+        # CB feeds land on arbitrary timestamps (quarter-end, mid-month release,
+        # PeriodIndex) — reindexing them directly onto the month-end panel would
+        # silently drop every non-month-end point (→ all-NaN → never fires).
+        # Normalize to month-end FIRST: PeriodIndex → timestamp, then collapse
+        # any intra-month points to their month-end via resample("ME").last().
+        cb = cb_demand.sort_index().copy()
+        if isinstance(cb.index, pd.PeriodIndex):
+            cb.index = cb.index.to_timestamp("M")
+        cb = cb.resample("ME").last()
+        cb_raw = cb.reindex(gold_nominal.index).shift(cb_lag_months)
+        # forward-fill so a (quarterly) reading carries through the inter-report
+        # months; rolling min_periods=window still needs `window` post-fill
         # months, so coverage is auditable rather than silently never-firing.
         cb = cb_raw.ffill()
         n_avail = cb.rolling(window, min_periods=window).count()
@@ -264,7 +277,7 @@ def dominance_probability(
             share = n_pos / n_avail
         cb_pos = (share >= cb_min_share).astype(float)
         cb_pos[n_avail.isna()] = np.nan
-        # CB buying is a THIRD co-equal de-dollarization fingerprint (spec's ∨):
+        # CB buying is a FOURTH co-equal de-dollarization fingerprint (spec's ∨):
         # combined by the same element-wise max, so it raises p even where the
         # rate relation alone reads real-rate-dominant. Masked to NaN wherever
         # base p is NaN, so it never fabricates a regime with no underlying panel

@@ -194,6 +194,34 @@ def test_level_divergence_warmup_and_no_lookahead():
     np.testing.assert_allclose(a[mask], b[mask])
 
 
+def test_level_divergence_interior_gap_yields_nan():
+    """P2 regression: level_divergence reads only the two endpoints, so a real-
+    rate gap INSIDE the window would otherwise be invisible and let it fire on
+    an incomplete window. Now the whole window must be present → NaN at/after a
+    mid-window hole, and so must the combined probability."""
+    n = 60
+    idx = pd.date_range("2000-01-31", periods=n, freq="ME")
+    gold = pd.Series(np.exp(np.cumsum(np.full(n, 0.01))), index=idx)
+    rr = pd.Series(np.cumsum(np.full(n, 0.02)), index=idx)
+    window = 12
+    # punch a hole at month 30 — the windows ending at 30..(30+window-1) straddle it
+    rr_hole = rr.copy()
+    rr_hole.iloc[30] = np.nan
+    lvl = level_divergence(gold, rr_hole, window=window)
+    full = level_divergence(gold, rr, window=window)
+    # months whose [t-window, t] contains index 30 must be NaN, not a fake 0/1
+    affected = lvl.index[30: 30 + window]
+    assert lvl.loc[affected].isna().all()
+    # unaffected months (whose window avoids the hole) agree with the complete case
+    clean = lvl.index[window + 1: 30]
+    np.testing.assert_array_equal(np.isnan(lvl.loc[clean].to_numpy()),
+                                  np.isnan(full.loc[clean].to_numpy()))
+    # the hole also propagates to the combined probability (no fabricated regime)
+    p_hole = dominance_probability(gold, rr_hole, window=window)
+    p_full = dominance_probability(gold, rr, window=window)
+    assert p_hole.loc[affected].isna().all()
+
+
 def test_nan_in_one_subsignal_does_not_blank_valid_signal():
     """P1-2 regression: a NaN in one sub-signal must NOT wipe out the others. A
     perfectly FLAT real rate makes Δreal_rate exactly 0 → zero variance → rolling
@@ -468,6 +496,26 @@ def test_cb_quarterly_sparse_feed_is_forward_filled_and_fires():
     late_base = base.iloc[-20:].dropna()
     late_cb = with_cb.loc[late_base.index]
     assert (late_cb >= late_base + 0.5).all()
+
+
+def test_cb_non_month_end_timestamps_are_normalized_not_dropped():
+    """P2 regression: a CB feed on quarter-end / mid-month release dates (not the
+    panel's month-end timestamps) used to be silently dropped by reindex → all
+    NaN → never fires. The feed is now resampled to month-end first, so a
+    sustained positive non-month-end feed still lifts the probability."""
+    n = 120
+    idx = pd.date_range("1985-01-31", periods=n, freq="ME")
+    dg = np.linspace(0.005, 0.02, n)
+    gold = pd.Series(np.exp(np.cumsum(dg)), index=idx)
+    rr = pd.Series(np.cumsum(-dg * 10.0), index=idx)            # real-rate-dominant
+    base = dominance_probability(gold, rr, window=36)
+    # CB readings on the 15th of every month (NOT month-end) — all positive
+    cb_idx = pd.date_range("1985-01-15", periods=n, freq="MS") + pd.Timedelta(days=14)
+    cb = pd.Series(5.0, index=cb_idx)
+    with_cb = dominance_probability(gold, rr, window=36, cb_demand=cb, cb_lag_months=0)
+    late_base = base.iloc[-20:].dropna()
+    late_cb = with_cb.loc[late_base.index]
+    assert (late_cb >= late_base + 0.5).all()                   # normalized → fires
 
 
 def test_regime_label_and_timeline():

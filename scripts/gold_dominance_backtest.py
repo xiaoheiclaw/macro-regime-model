@@ -155,16 +155,28 @@ def verdict(full: pd.DataFrame, mean_prob: float = float("nan")) -> str:
             dd_clause = (f"with a comparable/shallower drawdown (SD max_dd {sd['max_dd']:.1%} "
                          f"vs S1 {s1['max_dd']:.1%}), so the shortfall is on risk-adjusted "
                          f"return, not tail risk")
-        lines.append("_Mechanism: SD blends the real-rate signal (weight "
-                     f"{1 - mean_p:.0%}) and the trend signal (weight {mean_p:.0%}) by the "
-                     "regime probability — a SMOOTH handoff, not a hard switch. Because the "
-                     "blend is never fully trend (mean prob < 1), SD stays partly anchored to "
-                     "the real-rate 'not rising' signal, which lags pure price trend "
-                     f"{dd_clause}. SD does not beat S1 on both decisive metrics (Sharpe "
-                     "AND Calmar). The classifier can correctly flip to de-dollarization "
-                     "post-2022 (see the timeline) yet still not help, precisely because "
-                     "'follow price when de-dollarization dominates' is what S1 already "
-                     "does everywhere._")
+        # branch the mechanism on the actual blend weight so the note never
+        # contradicts the figures: at mean_prob≈1 SD is just S1 (no real-rate
+        # anchor to blame); only below ~1 does the real-rate leg drag.
+        if pd.notna(mean_p) and mean_p >= 0.999:
+            lines.append("_Mechanism: the mean regime probability is ~1.0, so SD is "
+                         "EFFECTIVELY pure trend — it duplicates S1 rather than lagging "
+                         "it, and the strict `>` kill simply records no INCREMENTAL edge. "
+                         "The classifier can correctly flip to de-dollarization post-2022 "
+                         "(see the timeline) yet still not add anything, precisely because "
+                         "'follow price when de-dollarization dominates' is what S1 already "
+                         "does everywhere._")
+        else:
+            lines.append("_Mechanism: SD blends the real-rate signal (weight "
+                         f"{1 - mean_p:.0%}) and the trend signal (weight {mean_p:.0%}) by "
+                         "the regime probability — a SMOOTH handoff, not a hard switch. "
+                         "Because the blend is never fully trend (mean prob < 1), SD stays "
+                         "partly anchored to the real-rate 'not rising' signal, which lags "
+                         f"pure price trend {dd_clause}. SD does not beat S1 on both "
+                         "decisive metrics (Sharpe AND Calmar). The classifier can correctly "
+                         "flip to de-dollarization post-2022 (see the timeline) yet still "
+                         "not help, precisely because 'follow price when de-dollarization "
+                         "dominates' is what S1 already does everywhere._")
     return "\n".join(lines)
 
 
@@ -291,7 +303,7 @@ def main() -> None:
         "whatever factor is in charge and the explicit classifier is redundant.\n"
     )
     parts.append(f"Panel: {panel.index.min():%Y-%m} → {panel.index.max():%Y-%m} "
-                 f"({len(panel)} months). Trading cost: {args.cost_bps:.0f} bps/rebalance. "
+                 f"({len(panel)} months). Trading cost: {args.cost_bps:g} bps/rebalance. "
                  f"Long-only 0↔100%, cash leg = 3m T-bill. corr window = {args.corr_window}m.\n")
     parts.append(f"All metrics on the **common investable window** {cstart:%Y-%m}–"
                  f"{cend:%Y-%m} (after warm-up) so S0/S1/SD share the same months.\n")
@@ -345,21 +357,26 @@ def main() -> None:
     pmin, pmax = panel.index.min(), panel.index.max()
     min_seg_months = 12
     for name, s, e in DEFAULT_SEGMENTS:
-        lo, hi = max(pd.Timestamp(s), pmin), min(pd.Timestamp(e), pmax)
-        if lo > hi:
+        # score window = segment ∩ common investable window (cstart..cend). Score
+        # on THIS window and show THIS window in the title, so the dates a reader
+        # sees match the months actually scored (metrics_table otherwise trims
+        # silently to the common window, making e.g. 1968-2000 misleading).
+        score_lo = max(cstart, pd.Timestamp(s))
+        score_hi = min(cend, pd.Timestamp(e))
+        if pd.Timestamp(s) > pmax or pd.Timestamp(e) < pmin:
             parts.append(f"### {name}\n_(skipped: no overlap with sample)_\n")
             continue
-        m = metrics_table(backtests, s, e)
+        m = metrics_table(backtests, score_lo, score_hi)
         # gate on *investable* months (after the common-window warm-up), not the
         # raw panel count: a long --corr-window or a tight --start/--end can leave
         # a segment with enough panel months but too few tradeable ones, which
         # would otherwise print a near-empty / all-NaN table (and int(NaN) crash).
         n_tradeable = segment_investable_months(m)
-        if n_tradeable < min_seg_months:
+        if score_lo > score_hi or n_tradeable < min_seg_months:
             parts.append(f"### {name}\n_(skipped: only {n_tradeable} investable "
-                         f"months after warm-up, <{min_seg_months})_\n")
+                         f"months in {score_lo:%Y-%m}–{score_hi:%Y-%m}, <{min_seg_months})_\n")
             continue
-        parts.append(f"### {name} ({lo:%Y-%m}–{hi:%Y-%m})\n")
+        parts.append(f"### {name} ({score_lo:%Y-%m}–{score_hi:%Y-%m})\n")
         parts.append(_fmt(m))
         parts.append("")
 
