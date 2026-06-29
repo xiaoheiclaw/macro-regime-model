@@ -146,6 +146,7 @@ def build_attribution_panel(
     fetch_fn: Callable[[str, str], pd.Series] = fetch_fred_series,
     anchor_fn: Callable[..., object] = build_anchor_panel,
     wgc_fn: Optional[Callable[[str, Optional[str]], pd.Series]] = None,
+    allow_wgc_failure: bool = False,
     cpi_id: str = DEFAULT_CPI_ID,
     vix_id: str = DEFAULT_VIX_ID,
     credit_id: str = DEFAULT_CREDIT_ID,
@@ -157,7 +158,10 @@ def build_attribution_panel(
     Reuses `build_anchor_panel` for gold_nominal + debt_gdp + real_rate_10y
     (PR #1, not re-derived); adds CPI, VIX, credit spread, and the foreign-
     official custody share on the same month-end grid. `wgc_fn` (central-bank
-    net purchases) is optional: when None, layer ⑤ is reported unavailable.
+    net purchases) is optional: when None, layer ⑤ is reported unavailable. When
+    `wgc_fn` IS provided it is fail-fast — a raising/empty wgc_fn errors rather
+    than silently dropping the flow into ε_flow (which would pollute the verdict);
+    pass `allow_wgc_failure=True` to run a degraded (layer-⑤-skipped) attribution.
 
     Injection seams: `fetch_fn` covers all FRED pulls; `anchor_fn` is the panel
     builder (stub with an object exposing `.data`); `wgc_fn(start, end)` returns a
@@ -189,16 +193,29 @@ def build_attribution_panel(
     df["vix"] = _to_monthly_mean(fetch_fn(vix_id, start)).reindex(idx)
     df["credit_spread"] = _to_monthly_mean(fetch_fn(credit_id, start)).reindex(idx)
 
-    # ⑤ flow: WGC central-bank net purchases (injected; quarterly→ME ffill)
+    # ⑤ flow: WGC central-bank net purchases (injected). The raw WGC series is a
+    #    quarterly *flow* (tonnes/qtr); since decompose_period() uses the endpoint
+    #    DIFFERENCE proxy[t1]−proxy[t0], we accumulate it into the CUMULATIVE net-
+    #    purchase *state* (cumsum) before the monthly ffill, so the endpoint diff
+    #    equals total net purchases over the window (a constant positive buy-rate
+    #    then yields a strictly rising state, not a ~0 endpoint diff).
+    df["wgc_flow"] = np.nan
     if wgc_fn is not None:
         try:
-            flow = wgc_fn(start, end)
-            df["wgc_flow"] = _to_monthly_ffill(pd.Series(flow)).reindex(idx)
-        except Exception as e:  # pragma: no cover - defensive
+            flow = pd.Series(wgc_fn(start, end)).sort_index()
+            if flow.dropna().empty:
+                raise ValueError("wgc_fn returned an empty series")
+            cum = flow.cumsum()  # quarterly net-purchase flow → cumulative state
+            df["wgc_flow"] = _to_monthly_ffill(cum).reindex(idx)
+        except Exception as e:
+            if not allow_wgc_failure:
+                raise RuntimeError(
+                    f"wgc_fn was provided but failed ({type(e).__name__}: {e}); "
+                    "central-bank flow would be silently dropped into the ε_flow "
+                    "residual and pollute the verdict. Pass allow_wgc_failure=True "
+                    "to explicitly run a degraded (layer-⑤-skipped) attribution."
+                ) from e
             notes["wgc_error"] = f"{type(e).__name__}: {e}"
-            df["wgc_flow"] = np.nan
-    else:
-        df["wgc_flow"] = np.nan
 
     if end is not None:
         df = df[df.index <= pd.Period(end, freq="M").to_timestamp("M")]
@@ -224,11 +241,23 @@ def build_attribution_panel(
         "Fed custody ÷ total federal debt). WMTSECL1 starts 2002-12, so layer ③'s "
         "de-dollarisation component is a post-2003 proxy."
     )
-    notes["wgc_flow"] = (
-        "central-bank net gold purchases (WGC quarterly, 2010+) have no FRED feed; "
-        "inject via wgc_fn. Absent here → layer ⑤ folded into the ε_flow residual."
-        if wgc_fn is None else "WGC flow injected via wgc_fn."
-    )
+    if wgc_fn is None:
+        notes["wgc_flow"] = (
+            "central-bank net gold purchases (WGC quarterly, 2010+) have no FRED "
+            "feed; inject via wgc_fn. Absent here → layer ⑤ folded into the ε_flow "
+            "residual."
+        )
+    elif df["wgc_flow"].notna().any():
+        notes["wgc_flow"] = (
+            "WGC flow injected via wgc_fn → accumulated to CUMULATIVE net-purchase "
+            "state (cumsum) so the endpoint-diff decomposition reflects window total."
+        )
+    else:
+        notes["wgc_flow"] = (
+            "wgc_fn provided but produced no usable data "
+            f"({notes.get('wgc_error', 'empty')}) → layer ⑤ DEGRADED/skipped, folded "
+            "into the ε_flow residual (allow_wgc_failure=True)."
+        )
     notes["ex_post_boundary"] = (
         "EX-POST attribution only: the OLS fit uses the full sample to *describe* "
         "which layer co-moved with realised gold; it is NOT a forecast and runs no "
@@ -545,10 +574,17 @@ def stacked_contribution_path(
     area chart. Column sum (+ residual) equals cumulative Δln(gold) at every t."""
     design = result.design
     d0 = _nearest_row(design.ln_gold, t0, "start")
-    mask = design.X.index >= d0
-    if t1:
-        mask &= design.X.index <= _nearest_row(design.ln_gold, t1, "end")
-    idx = design.X.index[mask]
+    d1 = _nearest_row(design.ln_gold, t1, "end") if t1 else design.ln_gold.dropna().index[-1]
+    if d0 >= d1:
+        raise ValueError(
+            f"empty/reversed window: resolved start {d0.date()} >= end {d1.date()} "
+            f"(requested t0={t0!r}, t1={t1!r})"
+        )
+    idx = design.X.index[(design.X.index >= d0) & (design.X.index <= d1)]
+    if idx.empty:
+        raise ValueError(
+            f"no rows in window [{d0.date()}, {d1.date()}] (t0={t0!r}, t1={t1!r})"
+        )
 
     out = pd.DataFrame(index=idx)
     cum_expl = pd.Series(0.0, index=idx)
@@ -590,6 +626,14 @@ def rolling_coefs(
         reg_layers = list(design.layers)
     keys = [l.key for l in reg_layers]
     idx = design.X.index
+    # window must give a determined fit (window > regressors+const) and fit inside
+    # the sample, else the "instability evidence" is empty/degenerate (codex P2).
+    min_window = len(keys) + 2
+    if window < min_window or window > len(idx):
+        raise ValueError(
+            f"rolling window={window} invalid: need {min_window} <= window <= "
+            f"{len(idx)} (regressors={len(keys)}+const, sample rows={len(idx)})."
+        )
     rows = {}
     for i in range(window - 1, len(idx)):
         sl = slice(i - window + 1, i + 1)

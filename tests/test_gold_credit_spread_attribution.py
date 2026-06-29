@@ -17,7 +17,6 @@ import pandas as pd
 import pytest
 
 from lib.gold_credit_spread_attribution import (
-    LAYERS,
     build_attribution_panel,
     build_design,
     decompose_period,
@@ -258,7 +257,67 @@ def test_wgc_flow_layer_included_when_injected():
     assert parts == pytest.approx(total, abs=1e-9)
 
 
+def test_wgc_constant_buying_is_cumulative_not_zero():
+    """A constant positive per-quarter buy-rate must produce a strictly RISING
+    cumulative state (so the endpoint-diff contribution is non-zero), not a
+    flat level whose endpoints cancel (codex P2)."""
+    anchor, fetch_fn, idx = _anchor_and_fetch()
+    flow = pd.Series(100.0, index=idx)  # constant +100/period net purchases
+
+    panel = build_attribution_panel(
+        start="1999-01-01", fetch_fn=fetch_fn,
+        anchor_fn=lambda *a, **k: anchor, wgc_fn=lambda s, e=None: flow,
+    )
+    w = panel.data["wgc_flow"].dropna()
+    assert (w.diff().dropna() > 0).all()           # cumulative ⇒ monotone up
+    res = fit_attribution(panel, cpi_mode="identity")
+    decomp = decompose_period(res, t0="2005-01")
+    flow_row = decomp[decomp["layer"] == "flow"]
+    assert not flow_row.empty
+    assert abs(float(flow_row["delta_proxy"].iloc[0])) > 0   # window flow != 0
+    assert "cumsum" in panel.notes["wgc_flow"].lower() or "CUMULATIVE" in panel.notes["wgc_flow"]
+
+
+def test_wgc_failure_is_fail_fast_by_default():
+    """An explicitly-provided wgc_fn that raises/empties must error (not silently
+    fold the flow into the residual); allow_wgc_failure=True degrades instead."""
+    anchor, fetch_fn, _ = _anchor_and_fetch()
+
+    def boom(start, end=None):
+        raise RuntimeError("WGC fetch down")
+
+    with pytest.raises(RuntimeError, match="wgc_fn was provided but failed"):
+        build_attribution_panel(start="1999-01-01", fetch_fn=fetch_fn,
+                                anchor_fn=lambda *a, **k: anchor, wgc_fn=boom)
+    # degraded path: no raise, layer ⑤ skipped, note records the failure
+    panel = build_attribution_panel(
+        start="1999-01-01", fetch_fn=fetch_fn, anchor_fn=lambda *a, **k: anchor,
+        wgc_fn=boom, allow_wgc_failure=True,
+    )
+    assert panel.data["wgc_flow"].isna().all()
+    assert "DEGRADED" in panel.notes["wgc_flow"]
+
+
 # ── 5. rolling coefficients + verdict plumbing ───────────────────────────
+def test_rolling_window_validation_raises():
+    """window outside [regressors+2, sample] raises rather than emitting an empty
+    / degenerate 'instability' table (codex P2)."""
+    panel, _ = _panel()
+    with pytest.raises(ValueError, match="rolling window"):
+        rolling_coefs(panel, window=100000, cpi_mode="identity")   # > sample
+    with pytest.raises(ValueError, match="rolling window"):
+        rolling_coefs(panel, window=3, cpi_mode="identity")        # < regressors+2
+
+
+def test_stacked_reversed_window_raises():
+    """stacked_contribution_path rejects a reversed in-sample window (codex P2)."""
+    panel, _ = _panel()
+    res = fit_attribution(panel, cpi_mode="identity")
+    with pytest.raises(ValueError, match="empty/reversed window"):
+        stacked_contribution_path(res, t0="2010-01", t1="2008-01")
+
+
+
 def test_rolling_coefs_shape():
     panel, _ = _panel()
     rc = rolling_coefs(panel, window=60, cpi_mode="identity")
