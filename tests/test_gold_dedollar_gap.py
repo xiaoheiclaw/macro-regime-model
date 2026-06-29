@@ -191,6 +191,34 @@ def test_rolling_resid_rejects_misaligned_index():
         rolling_ols_resid(y, x, 6)
 
 
+def test_rolling_resid_requires_full_window_by_default():
+    """Default min_obs == window: a gap inside the trailing window blanks that fit
+    (codex PR#14 P2 — the 'trailing window regression' contract). Relaxing min_obs
+    re-enables the fit."""
+    n, w = 40, 12
+    idx = pd.date_range("2010-01-31", periods=n, freq="ME")
+    rng = np.random.RandomState(17)
+    x = pd.Series(np.linspace(0, 4, n), index=idx)
+    y = pd.Series(1.0 + 2.0 * x.to_numpy() + rng.randn(n) * 0.01, index=idx)
+    y2 = y.copy()
+    y2.iloc[20] = np.nan  # a hole inside several trailing windows
+    strict = rolling_ols_resid(y2, x, w)              # default min_obs = window
+    # every window covering index 20 (t in 20..31) must be NaN under the full-window rule
+    assert strict.iloc[20:32].isna().all()
+    relaxed = rolling_ols_resid(y2, x, w, min_obs=w - 1)  # tolerate the 1 gap
+    assert relaxed.iloc[20:32].notna().any()
+
+
+def test_rolling_resid_rejects_bad_min_obs():
+    idx = pd.date_range("2010-01-31", periods=20, freq="ME")
+    y = pd.Series(np.arange(20.0), index=idx)
+    x = pd.Series(np.linspace(0, 1, 20), index=idx)
+    with pytest.raises(ValueError):
+        rolling_ols_resid(y, x, 12, min_obs=2)   # < 3
+    with pytest.raises(ValueError):
+        rolling_ols_resid(y, x, 12, min_obs=13)  # > window
+
+
 def test_rolling_resid_constant_x_window_is_nan():
     n, w = 50, 24
     idx = pd.date_range("2010-01-31", periods=n, freq="ME")
@@ -337,6 +365,22 @@ def test_current_reading_fields():
     assert cr.asof is not None
     assert 0.0 <= cr.gap_pct_full <= 1.0
     assert 0.0 <= cr.di_pct_full <= 1.0
+
+
+def test_current_reading_is_asof_aligned():
+    """Every 'current' field is read at the SAME asof (codex PR#14 P2): the DI
+    percentile uses DI's value at asof, not the latest DI; the rolling percentile
+    is taken at asof (NaN there, not a stale earlier month)."""
+    from lib.gold_dedollar_gap import full_percentile, rolling_percentile
+    dev, di = _dev_with_latest_pct()
+    cr = current_reading(dev, di, roll_window=36)
+    asof = cr.asof
+    di_hist = di.dropna()
+    expected_di_pct = full_percentile(di_hist, float(di.reindex([asof]).iloc[0]))
+    np.testing.assert_allclose(cr.di_pct_full, expected_di_pct, atol=1e-12)
+    pr = rolling_percentile(dev.resid, 36).reindex([asof]).iloc[0]
+    if np.isfinite(pr):
+        np.testing.assert_allclose(cr.gap_pct_roll, pr, atol=1e-12)
 
 
 def test_adjudicate_labels():

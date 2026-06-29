@@ -32,7 +32,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Dict, List
 
 import numpy as np
@@ -99,8 +99,12 @@ def main() -> None:
     ap.add_argument("--out-dir", default=ANALYSIS_DIR)
     args = ap.parse_args()
 
-    now = datetime.now(timezone.utc)
-    stamp = now.strftime("%Y-%m-%d")
+    # local-timezone wall clock for the human-facing report date, so a run near
+    # the UTC day boundary is not stamped "yesterday" (codex PR#14 P3). The "截至
+    # <asof>" data date below is always the panel's own date, independent of this.
+    now = datetime.now().astimezone()
+    tzname = now.strftime("%Z") or "local"
+    stamp = f"{now.strftime('%Y-%m-%d')} {tzname}"
     file_stamp = now.strftime("%Y-%m-%d_%H%M%S_%f")
 
     print("building gap panel (gold + CPI + cb_cum_excess + custody_share"

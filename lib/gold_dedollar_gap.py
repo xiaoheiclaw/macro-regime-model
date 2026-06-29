@@ -394,11 +394,20 @@ def build_di(
 
 
 # ── deviation (gold vs DI) ──────────────────────────────────────────────────
-def rolling_ols_resid(y: pd.Series, x: pd.Series, window: int) -> pd.Series:
+def rolling_ols_resid(
+    y: pd.Series, x: pd.Series, window: int, *, min_obs: Optional[int] = None
+) -> pd.Series:
     """Residual of a *rolling* OLS ``y ~ a + b·x`` over the trailing `window`,
     evaluated at the window's last point: resid_t = y_t − (â + b̂·x_t), with
-    (â, b̂) fit on [t-window+1, t]. Uses only data ≤ t → ex-ante. NaN in warm-up,
-    where either input is NaN, or where the window's x is constant (b unidentified).
+    (â, b̂) fit on [t-window+1, t]. Uses only data ≤ t → ex-ante.
+
+    A window is only fit when it has at least ``min_obs`` finite (y, x) pairs
+    (default ``min_obs = window`` → the **full** window must be present, matching
+    the "trailing window regression" contract; codex PR#14 P2). Pass a smaller
+    ``min_obs`` to tolerate gaps explicitly — then a 60-month window may be fit on
+    as few as ``min_obs`` points, which the caller has opted into. NaN in warm-up,
+    where fewer than ``min_obs`` pairs are present, where the evaluation point
+    (y_t, x_t) is itself NaN, or where the window's x is constant (b unidentified).
 
     A LOCAL residual (not a single full-sample levels fit) is the deliberate guard
     against the spurious-trend regression the repo's PR #11 placebo flagged: two
@@ -407,6 +416,11 @@ def rolling_ols_resid(y: pd.Series, x: pd.Series, window: int) -> pd.Series:
     relationship."""
     if window < 3:
         raise ValueError(f"window must be >= 3 (need slope + intercept), got {window}")
+    if min_obs is None:
+        min_obs = window
+    if not (3 <= min_obs <= window):
+        raise ValueError(
+            f"min_obs must be in [3, window={window}], got {min_obs}")
     if not y.index.equals(x.index):
         # the function reads y/x positionally; a misaligned index would silently
         # pair the wrong rows (codex PR#14 P3). Callers must align first.
@@ -424,7 +438,7 @@ def rolling_ols_resid(y: pd.Series, x: pd.Series, window: int) -> pd.Series:
         yi = yvals[sl]
         xi = xvals[sl]
         ok = np.isfinite(yi) & np.isfinite(xi)
-        if ok.sum() < 3:
+        if ok.sum() < min_obs:
             continue
         yo = yi[ok]
         xo = xi[ok]
@@ -454,15 +468,21 @@ def compute_deviation(
     di: pd.Series,
     *,
     window: int = DEFAULT_REG_WINDOW,
+    min_obs: Optional[int] = None,
 ) -> DeviationResult:
     """Gold-vs-DI deviation for a given log-price leg `y` (ln_gold or ln_gold_real):
     rolling-OLS residual, plus its trailing rolling z-score (ex-ante) and its
     full-sample z-score (descriptive 'vs whole history'). Positive = gold above
-    its DI-implied level (running ahead of the fundamentals)."""
+    its DI-implied level (running ahead of the fundamentals).
+
+    ``min_obs`` (default = ``window``, the full trailing window) is forwarded to
+    ``rolling_ols_resid``; the gold/DI common window is contiguous monthly so the
+    full-window default rarely drops a fit, but a caller can relax it to tolerate
+    gaps explicitly."""
     common = y.dropna().index.intersection(di.dropna().index)
     yc = y.reindex(common)
     dc = di.reindex(common)
-    resid = rolling_ols_resid(yc, dc, window).reindex(y.index)
+    resid = rolling_ols_resid(yc, dc, window, min_obs=min_obs).reindex(y.index)
     return DeviationResult(
         resid=resid,
         gap_z_roll=rolling_zscore(resid, window).reindex(y.index),
@@ -558,18 +578,29 @@ def current_reading(
     roll_window: int = DEFAULT_REG_WINDOW,
 ) -> CurrentReading:
     """Latest deviation positioning: full-sample z + percentile of the latest
-    residual, the leak-free trailing percentile, and where DI itself sits."""
+    residual, the leak-free trailing percentile, and where DI itself sits.
+
+    Every field is read **at the same `asof`** (the last month with a defined
+    residual) so the "current" reading never mixes dates (codex PR#14 P2): the
+    rolling percentile is taken at `asof` (NaN if undefined there, not the last
+    non-NaN month before it), and the DI percentile uses DI's value at `asof`
+    within the full DI history."""
     resid = dev.resid.dropna()
     asof = resid.index.max() if not resid.empty else None
-    latest = float(resid.iloc[-1]) if not resid.empty else np.nan
-    pct_roll = rolling_percentile(dev.resid, roll_window)
-    pct_roll_latest = float(pct_roll.dropna().iloc[-1]) if pct_roll.notna().any() else np.nan
+    di_hist = di.dropna()
+    if asof is None:
+        return CurrentReading(asof=None, gap_z_full=np.nan, gap_pct_full=np.nan,
+                              gap_pct_roll=np.nan, di_pct_full=np.nan)
+    latest = float(resid.loc[asof])
+    pct_roll = rolling_percentile(dev.resid, roll_window).reindex([asof]).iloc[0]
+    di_at_asof = di.reindex([asof]).iloc[0]
     return CurrentReading(
         asof=asof,
-        gap_z_full=float(dev.gap_z_full.reindex([asof]).iloc[0]) if asof is not None else np.nan,
+        gap_z_full=float(dev.gap_z_full.reindex([asof]).iloc[0]),
         gap_pct_full=full_percentile(resid, latest),
-        gap_pct_roll=pct_roll_latest,
-        di_pct_full=full_percentile(di.dropna()),
+        gap_pct_roll=float(pct_roll) if np.isfinite(pct_roll) else np.nan,
+        di_pct_full=(full_percentile(di_hist, float(di_at_asof))
+                     if np.isfinite(di_at_asof) else np.nan),
     )
 
 
