@@ -30,6 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from lib.gold_s1_subperiod import (  # noqa: E402
     COST_GRID,
+    PAIRED_DISPLAY_COST,
     POST2000_SEGMENT,
     PRIMARY_LABEL,
     S0_LABEL,
@@ -254,8 +255,9 @@ def main() -> None:
 
     # Paired significance.
     parts.append("## Paired in-sample significance — S1 primary − S0, post-2000\n")
-    _pj0 = paired_by_cost[10.0]
+    _pj0 = paired_by_cost[PAIRED_DISPLAY_COST]
     parts.append(
+        f"Method params shown at the {PAIRED_DISPLAY_COST:.0f}bps display cost. "
         "Monthly net-return difference treated as the time series it is (NOT IID): "
         f"**Newey-West HAC** t-stat (Bartlett kernel, lag≈n^⅓={_pj0.get('hac_lag', 0)}) and a "
         f"**moving-block bootstrap** 95% CI (block≈√n={_pj0.get('block_len', 0)}, 2000 paths, "

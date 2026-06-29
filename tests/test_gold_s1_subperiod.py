@@ -165,24 +165,36 @@ def _synth_panel(n=80, seed=7):
 
 def test_majority_vote_binary_and_bounded():
     panel = _synth_panel()
-    vote = s1_majority_vote(panel, lookbacks=(3, 6, 12))
+    # vol_window=3 < the 12m trend lookback so the trend warm-up is the binding
+    # one; asserting against the function's own first_valid_index keeps this
+    # robust to DEFAULT_VOL_WINDOW changes (codex P2).
+    vote = s1_majority_vote(panel, lookbacks=(3, 6, 12), vol_window=3)
     sized = vote.dropna()
+    assert len(sized) > 0
     assert sized.between(0.0, 1.0).all()
-    # warm-up before the 12m lookback is NaN, not 0 (so run_backtest trims it)
+    # warm-up is contiguous NaN then no holes: once valid, valid to the end
+    fv = vote.first_valid_index()
+    assert fv is not None
+    assert vote.loc[:fv].iloc[:-1].isna().all()   # everything before first-valid is NaN
+    assert vote.loc[fv:].notna().all()            # no interior NaN after warm-up
+    # trend warm-up must be ≥ the longest lookback (12) — never full exposure early
     assert vote.iloc[:12].isna().all()
-    assert vote.iloc[12:].notna().all()
 
 
 def test_majority_vote_all_rising_is_full_when_vol_low():
-    # strictly rising price + tiny vol → unanimous long, vol-scale ~1 → ~full
-    idx = _midx(20, start="1990-01-31")
-    price = pd.Series(100 * np.cumprod(np.r_[[1.0], np.full(19, 1.005)]), index=idx)
+    # strictly rising price + tiny vol → unanimous long, vol-scale ~1 → ~full.
+    # Longer sample + short vol_window so a valid tail is guaranteed (no empty
+    # dropna()).
+    idx = _midx(30, start="1990-01-31")
+    price = pd.Series(100 * np.cumprod(np.r_[[1.0], np.full(29, 1.005)]), index=idx)
     panel = pd.DataFrame({
         "gold_nominal": price,
         "gold_ret": price.pct_change(fill_method=None),
     })
-    vote = s1_majority_vote(panel, lookbacks=(3, 6, 12), target_vol=10.0)  # huge target → vs capped 1
-    assert vote.dropna().iloc[-1] == pytest.approx(1.0)
+    vote = s1_majority_vote(panel, lookbacks=(3, 6, 12), target_vol=10.0, vol_window=3)
+    sized = vote.dropna()
+    assert len(sized) > 0
+    assert sized.iloc[-1] == pytest.approx(1.0)  # huge target → vs capped 1, unanimous long
 
 
 def test_variant_position_dispatch_and_bad_kind():
@@ -441,9 +453,9 @@ def _seg_by_cost(s0_10, s1_10, s0_25, s1_25):
     }
 
 
-def _paired(ann_mean, ci_lo, ci_hi):
+def _paired(ann_mean, ci_lo, ci_hi, n=200):
     excl = ci_lo > 0 or ci_hi < 0
-    return {10.0: {"ann_mean": ann_mean, "t_stat": 1.0, "ci_lo": ci_lo,
+    return {10.0: {"n": n, "ann_mean": ann_mean, "t_stat": 1.0, "ci_lo": ci_lo,
                    "ci_hi": ci_hi, "ci_excludes_zero": excl,
                    "block_len": 5, "hac_lag": 3}}
 
@@ -512,6 +524,19 @@ def test_verdict_guards_nan_at_25bps_not_silent_decay():
     bad25c = {"sharpe": 0.9, "calmar": 0.7, "cagr": float("nan"), "max_dd": -0.2}
     out2 = verdict(_seg_by_cost(s0, good, s0, bad25c), _paired(0.02, 0.005, 0.04))
     assert "cannot adjudicate" in out2.lower()
+
+
+def test_verdict_guards_short_or_nan_paired_sample():
+    # The paired stats drive the significance branch — a degenerate paired sample
+    # (n<2 or NaN mean/CI) must yield "cannot adjudicate", not a "leans/mixed"
+    # conclusion built on NaN comparisons (codex P2).
+    s0 = {"sharpe": 0.74, "calmar": 0.28, "cagr": 0.111, "max_dd": -0.39}
+    s1 = {"sharpe": 0.86, "calmar": 0.51, "cagr": 0.095, "max_dd": -0.19}
+    out_short = verdict(_seg_by_cost(s0, s1, s0, s1), _paired(-0.019, -0.045, 0.007, n=1))
+    assert "cannot adjudicate" in out_short.lower()
+    nan = float("nan")
+    out_nan = verdict(_seg_by_cost(s0, s1, s0, s1), _paired(nan, nan, nan))
+    assert "cannot adjudicate" in out_nan.lower()
 
 
 def test_default_cost_is_a_grid_point():

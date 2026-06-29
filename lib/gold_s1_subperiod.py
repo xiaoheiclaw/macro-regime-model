@@ -76,6 +76,11 @@ POST2000_SEGMENT = "2000-2026"
 # Cost grid (bps per rebalance) for the sensitivity sweep.
 COST_GRID: Tuple[float, ...] = (0.0, 10.0, 25.0, 50.0, 100.0)
 
+# The "realistic" cost at which the paired significance is read/displayed, and
+# the "punitive" cost the verdict also requires a win at. Both must be grid pts.
+PAIRED_DISPLAY_COST: float = 10.0
+PUNITIVE_COST: float = 25.0
+
 # S1 variants for the robustness panel: (label, kind, lookbacks).
 #   kind "blend" → equal-weight average of the per-lookback on/off signals
 #                  (a single-element tuple reproduces a pure single-window S1);
@@ -434,16 +439,16 @@ def verdict(
     # non-NaN — otherwise a missing 25bps row would make comparisons silently
     # False and masquerade as a "DECAYED" kill rather than "cannot adjudicate".
     try:
-        s1_10 = row(10.0, PRIMARY_LABEL)
-        s0_10 = row(10.0, S0_LABEL)
-        s1_25 = row(25.0, PRIMARY_LABEL)
-        s0_25 = row(25.0, S0_LABEL)
-        pj = paired_by_cost[10.0]  # also required — guard it in the same try
+        s1_10 = row(PAIRED_DISPLAY_COST, PRIMARY_LABEL)
+        s0_10 = row(PAIRED_DISPLAY_COST, S0_LABEL)
+        s1_25 = row(PUNITIVE_COST, PRIMARY_LABEL)
+        s0_25 = row(PUNITIVE_COST, S0_LABEL)
+        pj = paired_by_cost[PAIRED_DISPLAY_COST]  # also required — guard in same try
     except KeyError:
         return ("## Verdict\n\n**Cannot adjudicate: post-2000 window or paired "
                 "10bps stats missing from results.**")
     needed = ("sharpe", "calmar", "cagr")
-    pj_keys = ("ann_mean", "ci_excludes_zero")
+    pj_keys = ("n", "ann_mean", "ci_lo", "ci_hi", "ci_excludes_zero")
     if not all(pd.notna(r[k]) for r in (s1_10, s0_10, s1_25, s0_25) for k in needed):
         return ("## Verdict\n\n**Insufficient sample on the post-2000 window "
                 "(NaN Sharpe/Calmar/CAGR at 10 or 25bps) — cannot adjudicate. "
@@ -451,6 +456,13 @@ def verdict(
     if not all(k in pj for k in pj_keys):
         return ("## Verdict\n\n**Cannot adjudicate: paired 10bps stats are missing "
                 f"required keys {pj_keys}.**")
+    # The paired excess drives the significance branch — it must be a real,
+    # non-degenerate sample (n≥2) with finite mean/CI, else the "leans positive /
+    # mixed" wording would be built on NaN comparisons silently resolving False.
+    if (pj["n"] < 2 or not pd.notna(pj["ann_mean"])
+            or not (pd.notna(pj["ci_lo"]) and pd.notna(pj["ci_hi"]))):
+        return ("## Verdict\n\n**Cannot adjudicate: paired post-2000 net-diff sample "
+                "is too short / NaN (n<2 or undefined mean/CI). Widen the data.**")
 
     def risk_adj_beats(s1, s0):  # PR#5 caliber: Sharpe AND Calmar
         return (s1["sharpe"] > s0["sharpe"]) and (s1["calmar"] > s0["calmar"])
@@ -464,7 +476,7 @@ def verdict(
     ci_negative = bool(pj["ci_excludes_zero"]) and pj["ann_mean"] < 0
 
     # robustness across variants @10bps (risk-adjusted)
-    tbl10 = seg_by_cost[10.0][post]
+    tbl10 = seg_by_cost[PAIRED_DISPLAY_COST][post]
     variant_labels = [f"S1_{lbl}" for lbl, _, _ in S1_VARIANTS]
     n_beat = sum(
         1 for v in variant_labels
