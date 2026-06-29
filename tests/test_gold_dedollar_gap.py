@@ -1,4 +1,4 @@
-"""Tests for the gold vs de-dollarization deviation monitor (PR #13).
+"""Tests for the gold vs de-dollarization deviation monitor.
 
 Offline by construction: all panels/series are synthetic (no network/FRED).
 Covers (per the task spec):
@@ -146,6 +146,18 @@ def test_di_min_present_out_of_range_raises():
         build_di(df, min_present=0)
     with pytest.raises(ValueError):
         build_di(df, min_present=3)  # only 2 components present
+
+
+def test_di_zero_weight_component_does_not_gate():
+    """A zero-weight component must not participate in DI — its missing month must
+    NOT NaN the DI (codex R5 P2). DI must equal the active (CB) leg throughout."""
+    df = _panel(n=40)
+    df.loc[df.index[7], "custody_share"] = np.nan  # hole in the zero-weight leg
+    res = build_di(df, weights={"cb_cum_excess": 1.0, "custody_share": 0.0})
+    # DI defined at the custody-hole month (custody is inactive)
+    assert np.isfinite(res.di.loc[df.index[7]])
+    # DI equals the CB signed-z everywhere (the only active leg)
+    _close_equal_nan(res.di, res.components["cb_cum_excess"])
 
 
 def test_di_all_components_missing_raises():
@@ -491,6 +503,21 @@ def test_adjudicate_labels():
     assert adjudicate(normal)[0] == "NORMAL"
     assert adjudicate(elevated)[0] == "ELEVATED"
     assert adjudicate(unknown)[0] == "UNKNOWN"
+
+
+def test_flat_residual_is_not_extreme():
+    """A constant (no-information) residual must NOT read as EXTREME (codex R5 P2):
+    full_percentile would return 1.0 on it, so current_reading must blank the gap
+    fields → adjudicate UNKNOWN."""
+    from lib.gold_dedollar_gap import DeviationResult
+    idx = pd.date_range("2010-01-31", periods=80, freq=pd.offsets.MonthEnd())
+    resid = pd.Series(2.0, index=idx)                 # perfectly flat
+    dev = DeviationResult(resid=resid, gap_z_roll=full_zscore(resid),
+                          gap_z_full=full_zscore(resid), window=36)
+    di = pd.Series(np.arange(80, dtype=float), index=idx)
+    cr = current_reading(dev, di, roll_window=36)
+    assert not np.isfinite(cr.gap_pct_full)            # blanked
+    assert adjudicate(cr, min_n=1)[0] == "UNKNOWN"     # not EXTREME despite pct→1
 
 
 def test_adjudicate_thin_history_is_unknown():

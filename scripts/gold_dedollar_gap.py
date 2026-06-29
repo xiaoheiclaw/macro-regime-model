@@ -1,4 +1,4 @@
-"""Gold vs de-dollarization fundamentals — deviation / valuation monitor (PR #13).
+"""Gold vs de-dollarization fundamentals — deviation / valuation monitor.
 
 Answers the user's worry: **has gold run far ahead of the de-dollarization
 fundamentals it is supposed to track, and is the 2025-2026 hedge being put on at

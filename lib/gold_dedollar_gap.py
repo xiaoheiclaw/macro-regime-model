@@ -1,4 +1,4 @@
-"""Gold vs de-dollarization fundamentals — *deviation / valuation monitor* (PR #13).
+"""Gold vs de-dollarization fundamentals — *deviation / valuation monitor*.
 
 The user's worry (verbatim framing): **has gold run far ahead of the de-
 dollarization fundamentals it is supposed to track?** i.e. relative to the
@@ -334,21 +334,7 @@ def build_di(
             f"no usable components (all of {[c for c, _ in components]} are "
             "absent or all-NaN)")
 
-    # common eligible window = months where EVERY present component is observed.
-    common_idx: Optional[pd.Index] = None
-    for c in present:
-        vi = panel[c].dropna().index
-        common_idx = vi if common_idx is None else common_idx.intersection(vi)
-    if common_idx is not None and len(common_idx) == 0:
-        common_idx = None  # no overlap → fall back to own-coverage z-score
-    z_base = ("common-coverage" if common_idx is not None
-              else "own-coverage (no common window)")
-
-    sign_map = {c: s for c, s in components}
-    signed: Dict[str, pd.Series] = {
-        c: zscore_over(panel[c], common_idx) * float(sign_map[c]) for c in present
-    }
-
+    # ── weights (over present), then derive the ACTIVE (positive-weight) set ──
     if weights is None:
         w = {c: 1.0 for c in present}
     else:
@@ -377,22 +363,43 @@ def build_di(
     wsum = sum(w.values())
     w = {c: v / wsum for c, v in w.items()}  # renormalize over present
 
+    # active = positive-weight components. A zero-weight leg is reported in the
+    # weights/components for transparency but must NOT participate in DI — neither
+    # in the common window, the row-presence gate, nor the weighted sum (codex
+    # PR#14 R5 P2). Otherwise a 0-weight leg's missing month would still NaN DI.
+    active = [c for c in present if w[c] > 0]
+
+    # common eligible window = months where every ACTIVE component is observed.
+    common_idx: Optional[pd.Index] = None
+    for c in active:
+        vi = panel[c].dropna().index
+        common_idx = vi if common_idx is None else common_idx.intersection(vi)
+    if common_idx is not None and len(common_idx) == 0:
+        common_idx = None  # no overlap → fall back to own-coverage z-score
+    z_base = ("common-coverage" if common_idx is not None
+              else "own-coverage (no common window)")
+
+    sign_map = {c: s for c, s in components}
+    signed: Dict[str, pd.Series] = {
+        c: zscore_over(panel[c], common_idx) * float(sign_map[c]) for c in present
+    }
     comp_df = pd.DataFrame(signed)
+
     if min_present is None:
-        min_present = len(present)
-    if not (1 <= min_present <= len(present)):
+        min_present = len(active)
+    if not (1 <= min_present <= len(active)):
         # silent clamping hides a misconfiguration (codex PR#14 R3 P3).
         raise ValueError(
-            f"min_present must be in [1, n_present={len(present)}], got {min_present}")
+            f"min_present must be in [1, n_active={len(active)}], got {min_present}")
 
-    # per-row weighted mean over present components, renormalizing the weights of
-    # the components that are non-NaN at that row.
-    wvec = pd.Series(w)
-    mask = comp_df.notna()
-    n_present = mask.sum(axis=1)
-    wmat = mask.mul(wvec, axis=1)               # weight where present, 0 where NaN
+    # per-row weighted mean over ACTIVE components, renormalizing the weights of
+    # the active components that are non-NaN at that row.
+    wvec = pd.Series({c: w[c] for c in active})
+    amask = comp_df[active].notna()
+    n_present = amask.sum(axis=1)
+    wmat = amask.mul(wvec, axis=1)              # weight where present, 0 where NaN
     row_wsum = wmat.sum(axis=1)
-    weighted = (comp_df.fillna(0.0) * wmat).sum(axis=1)
+    weighted = (comp_df[active].fillna(0.0) * wmat).sum(axis=1)
     di = (weighted / row_wsum.where(row_wsum > 0)).where(n_present >= min_present)
 
     notes = {
@@ -640,23 +647,34 @@ def current_reading(
     residual) so the "current" reading never mixes dates (codex PR#14 P2): the
     rolling percentile is taken at `asof` (NaN if undefined there, not the last
     non-NaN month before it), and the DI percentile uses DI's value at `asof`
-    within the full DI history."""
+    within the full DI history.
+
+    A **degenerate** residual (constant / fewer than 2 distinct values) carries no
+    deviation information, yet ``full_percentile`` would return 1.0 on it and
+    ``adjudicate`` would mislabel a flat series as EXTREME (codex PR#14 R5 P2). In
+    that case the gap fields are NaN so ``adjudicate`` returns UNKNOWN; ``asof`` /
+    ``n_resid`` / ``di_pct_full`` are still reported."""
     resid = dev.resid.dropna()
     asof = resid.index.max() if not resid.empty else None
     di_hist = di.dropna()
     if asof is None:
         return CurrentReading(asof=None, gap_z_full=np.nan, gap_pct_full=np.nan,
                               gap_pct_roll=np.nan, di_pct_full=np.nan, n_resid=0)
+    di_at_asof0 = di.reindex([asof]).iloc[0]
+    di_pct = (full_percentile(di_hist, float(di_at_asof0))
+              if np.isfinite(di_at_asof0) else np.nan)
+    if float(resid.std(ddof=0)) == 0.0 or resid.nunique() < 2:
+        return CurrentReading(asof=asof, gap_z_full=np.nan, gap_pct_full=np.nan,
+                              gap_pct_roll=np.nan, di_pct_full=di_pct,
+                              n_resid=int(len(resid)))
     latest = float(resid.loc[asof])
     pct_roll = rolling_percentile(dev.resid, roll_window).reindex([asof]).iloc[0]
-    di_at_asof = di.reindex([asof]).iloc[0]
     return CurrentReading(
         asof=asof,
         gap_z_full=float(dev.gap_z_full.reindex([asof]).iloc[0]),
         gap_pct_full=full_percentile(resid, latest),
         gap_pct_roll=float(pct_roll) if np.isfinite(pct_roll) else np.nan,
-        di_pct_full=(full_percentile(di_hist, float(di_at_asof))
-                     if np.isfinite(di_at_asof) else np.nan),
+        di_pct_full=di_pct,
         n_resid=int(len(resid)),
     )
 
