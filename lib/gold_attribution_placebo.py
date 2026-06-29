@@ -107,10 +107,20 @@ def wgc_cumulative_excess_annual(
 def annual_to_monthly(annual: pd.Series, idx: pd.DatetimeIndex) -> pd.Series:
     """Interpolate a year-end annual series onto a monthly index by time
     interpolation (linear in calendar time), then clip to `idx`. Coarse by
-    construction — central-bank stock is only known annually."""
+    construction — central-bank stock is only known annually.
+
+    NO extrapolation: `limit_area="inside"` fills only NaNs bracketed by two
+    real annual points, and the trailing `.where()` drops any month after the
+    last WGC year. Without this, pandas would flat-extrapolate past the final
+    annual point (e.g. 2026-* months after a 2025 endpoint), injecting fabricated
+    WGC observations that `common_window()` would then regress on (codex PR#12 P1).
+    """
     annual = annual.sort_index()
     union = annual.index.union(idx)
-    return annual.reindex(union).interpolate("time").reindex(idx)
+    out = (annual.reindex(union)
+                 .interpolate("time", limit_area="inside")
+                 .reindex(idx))
+    return out.where(out.index <= annual.index.max())
 
 
 # ── placebo series builders (all aligned to a monthly index) ─────────────
@@ -155,11 +165,17 @@ def make_placebos(
         )
 
     def _cum_log_change(s: Optional[pd.Series]) -> pd.Series:
-        # ln(level_t / level_first): cumulative log return. Level is a rising
-        # trend; Δ = monthly log change (stationary). Anchored at 0 on the first
-        # valid obs within idx.
+        # ln(level_t / level_first): cumulative log return anchored at 0 on the
+        # first valid obs within idx. Level is a rising trend; Δ = monthly log
+        # change (stationary). Internal/trailing source gaps are PRESERVED as NaN
+        # (not silently treated as 0 growth) so run_levels_fifth rejects an
+        # incomplete candidate rather than fitting a fabricated flat series
+        # (codex PR#12 P2).
         x = np.log(s.reindex(idx).astype(float))
-        return x.diff().fillna(0.0).cumsum()
+        valid = x.dropna()
+        if valid.empty:
+            return x
+        return x - valid.iloc[0]  # NaN where x is NaN, by construction
 
     if cpi is not None:
         out["cum_cpi"] = _cum_log_change(cpi)
@@ -262,10 +278,11 @@ def run_levels_fifth(
         )
     df["wgc_flow"] = fifth_w
     res = fit_attribution(df, cpi_mode=cpi_mode, min_obs=min_obs)
-    assert res.n == len(window), (
-        f"sample shrank from {len(window)} to {res.n} for {key!r} despite a "
-        "fully-present ⑤ — layers ①–④ have an internal NaN on this window."
-    )
+    if res.n != len(window):  # explicit (not assert: survives python -O)
+        raise ValueError(
+            f"sample shrank from {len(window)} to {res.n} for {key!r} despite a "
+            "fully-present ⑤ — layers ①–④ have an internal NaN on this window."
+        )
     dec = decompose_period(res, t0=t0, t1=t1)
     fl = dec[dec["layer"] == "flow"]
     rd = dec[dec["layer"] == "flow_resid"]
@@ -346,16 +363,32 @@ def _contiguous_monthly_diff(sub: pd.DataFrame) -> pd.DataFrame:
 
 
 def _diff_design(panel_df: pd.DataFrame, fifth: pd.Series,
-                 window: pd.DatetimeIndex, cpi_mode: str) -> "tuple":
+                 window: pd.DatetimeIndex, cpi_mode: str, *,
+                 min_obs: int = 24) -> "tuple":
     """First-difference design matching the levels five-layer spec.
 
     Composites ③ (debt/GDP ⊕ −custody) and ④ (VIX ⊕ credit) are built as the
     equal-weight mean of z-scored *differences* (mirrors the levels z-composite,
     just on Δ). LHS for cpi_mode='identity' is Δln(gold) − Δln(cpi); 'free' adds
     Δln(cpi) as a regressor. Differences are taken only across adjacent months
-    (gaps dropped). Returns (y, Xmat, names, idx, flow_identifiable)."""
+    (gaps dropped). Returns (y, Xmat, names, idx, flow_identifiable).
+
+    Enforces the same identical-sample contract as the levels path (codex PR#12
+    P2): ⑤ must be fully present on `window`, and the post-difference sample must
+    have ≥ min_obs rows and more rows than regressors — otherwise `ValueError`,
+    so `diff_singles_out_real` never compares t-stats fit on different samples."""
+    if cpi_mode not in ("identity", "free"):
+        raise ValueError(f"cpi_mode must be 'identity' or 'free', got {cpi_mode!r}")
     df = panel_df.loc[window].copy()
-    df["wgc_flow"] = fifth.reindex(window).astype(float)
+    fifth_w = fifth.reindex(window).astype(float)
+    if not fifth_w.notna().all():
+        n_missing = int(fifth_w.isna().sum())
+        raise ValueError(
+            f"⑤ candidate has {n_missing} NaN on the fixed window "
+            f"({window.min().date()}..{window.max().date()}); the difference "
+            "comparison requires it fully present (identical-sample contract)."
+        )
+    df["wgc_flow"] = fifth_w
     sub = df[ATTR_COLS].dropna()
     dd = _contiguous_monthly_diff(sub)
     real = dd["neg_real_rate"]
@@ -371,6 +404,12 @@ def _diff_design(panel_df: pd.DataFrame, fifth: pd.Series,
                 ("tail", tail), ("flow", flow)]
     names = ["const"] + [c[0] for c in cols]
     Xmat = np.column_stack([np.ones(len(y))] + [c[1].to_numpy() for c in cols])
+    if len(dd) < min_obs or len(dd) <= Xmat.shape[1]:
+        raise ValueError(
+            f"difference design has only {len(dd)} contiguous-month rows "
+            f"(need >= max({min_obs}, regressors+1={Xmat.shape[1] + 1})); window "
+            "too short or too gappy for a stable diff regression."
+        )
     # ⑤ identifiability: a differenced trend that is constant (e.g. Δ of a linear
     # time trend) is collinear with the intercept → its coefficient/t are not
     # identified. Flag it so adjudicate() can exclude it from the diff verdict.
@@ -421,6 +460,7 @@ def run_diff_fifth(
     key: str,
     window: pd.DatetimeIndex,
     cpi_mode: str = "identity",
+    min_obs: int = 24,
 ) -> DiffResult:
     """First-difference five-layer attribution. The arbiter: if ⑤ is real it
     survives here (Δ is stationary); if it was a level-trend artefact it dies.
@@ -429,7 +469,8 @@ def run_diff_fifth(
     P1 — e.g. Δ of a pure linear time trend), its coefficient is not identified;
     `pinv` would still emit a meaningless t. We flag `flow_identifiable=False` so
     `flow_t`/`flow_p` return NaN and the diff verdict excludes it."""
-    y, Xmat, names, _, flow_identifiable = _diff_design(panel_df, fifth, window, cpi_mode)
+    y, Xmat, names, _, flow_identifiable = _diff_design(
+        panel_df, fifth, window, cpi_mode, min_obs=min_obs)
     beta, tstat, pval, r2, _ = _ols(y, Xmat)
     return DiffResult(
         key=key, label=placebo_label(key), r2=float(r2), n=int(len(y)),

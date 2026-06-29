@@ -87,6 +87,31 @@ def test_annual_to_monthly_interpolation_on_grid():
     assert (seg.diff().dropna() >= -1e-9).all()
 
 
+def test_annual_to_monthly_no_tail_extrapolation():
+    """codex PR#12 P1: months after the last WGC annual point must be NaN, not
+    flat-extrapolated — else common_window() regresses on fabricated data."""
+    ann = wgc_cumulative_excess_annual()  # ends 2025-12-31
+    idx = pd.date_range("2010-12-31", "2026-03-31", freq="ME")
+    m = annual_to_monthly(ann, idx)
+    # 2026-* are beyond the last annual point → NaN
+    assert m[m.index > ann.index.max()].isna().all()
+    assert m.dropna().index.max() <= ann.index.max()
+    # leading months before the first annual point are also NaN (no back-extrap)
+    early = pd.date_range("2005-01-31", "2026-03-31", freq="ME")
+    m2 = annual_to_monthly(ann, early)
+    assert m2[m2.index < ann.index.min()].isna().all()
+
+
+def test_common_window_excludes_extrapolated_tail():
+    """With idx running past the last WGC year, common_window must stop at the
+    last real WGC month (codex PR#12 P1)."""
+    panel, idx = _panel(n=350)  # synthetic panel extends well past 2025
+    ann = wgc_cumulative_excess_annual()
+    wgc = annual_to_monthly(ann, panel.data.index)
+    win = common_window(panel.data, wgc)
+    assert win.max() <= ann.index.max()
+
+
 # ── 2. placebo construction ──────────────────────────────────────────────
 def test_make_placebos_keys_and_monotonicity():
     idx = pd.date_range("2010-12-31", periods=180, freq="ME")
@@ -255,6 +280,38 @@ def test_levels_fifth_rejects_nan_in_window():
     holed.loc[win[5]] = np.nan
     with pytest.raises(ValueError, match="NaN on the fixed window"):
         run_levels_fifth(panel.data, holed, key="holed", window=win, t0="2022-01")
+
+
+def test_diff_fifth_rejects_nan_in_window():
+    """codex PR#12 P2: the difference path enforces the same fixed-window ⑤
+    completeness contract as levels."""
+    panel, idx = _panel()
+    wgc = annual_to_monthly(wgc_cumulative_excess_annual(), idx)
+    win = common_window(panel.data, wgc)
+    holed = wgc.copy()
+    holed.loc[win[5]] = np.nan
+    with pytest.raises(ValueError, match="NaN on the fixed window"):
+        run_diff_fifth(panel.data, holed, key="holed", window=win)
+
+
+def test_diff_fifth_rejects_bad_cpi_mode():
+    """codex PR#12 P2: a typo'd cpi_mode must raise (matching fit_attribution's
+    public contract), not be silently treated as 'free'."""
+    panel, idx = _panel()
+    wgc = annual_to_monthly(wgc_cumulative_excess_annual(), idx)
+    win = common_window(panel.data, wgc)
+    with pytest.raises(ValueError, match="cpi_mode"):
+        run_diff_fifth(panel.data, wgc, key="REAL_WGC", window=win, cpi_mode="frees")
+
+
+def test_cum_placebo_preserves_internal_nan():
+    """codex PR#12 P2: a source-series gap must propagate as NaN (not be filled as
+    0 growth), so an incomplete candidate is rejected rather than fabricated."""
+    idx = pd.date_range("2010-12-31", periods=120, freq="ME")
+    cpi = pd.Series(np.linspace(200, 320, 120), index=idx)
+    cpi.iloc[50] = np.nan  # internal publication gap
+    p = make_placebos(idx, cpi=cpi)["cum_cpi"]
+    assert np.isnan(p.iloc[50])  # gap preserved, not silently bridged to 0
 
 
 # ── 5. stationarity + lead/lag tables ────────────────────────────────────

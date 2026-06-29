@@ -38,7 +38,6 @@ from lib.paths import ANALYSIS_DIR, DATA_DIR  # noqa: E402
 from lib.gold_anchor import fetch_fred_series  # noqa: E402
 from lib.gold_credit_spread_attribution import build_attribution_panel  # noqa: E402
 from lib.gold_attribution_placebo import (  # noqa: E402
-    WGC_BASELINE_T,
     WGC_SOURCE_NOTE,
     adjudicate,
     annual_to_monthly,
@@ -242,16 +241,22 @@ def _leadlag_reading(ll) -> str:
     pos_max = float(pos.max()) if len(pos) else np.nan
     neg_max = float(neg.max()) if len(neg) else np.nan
     c0 = float(contemp.iloc[0]) if len(contemp) else np.nan
+    max_abs = float(ll["corr"].abs().max()) if ll["corr"].notna().any() else np.nan
+    # describe the actual magnitude rather than hardcoding "<0.2" (codex P2)
+    mag = (f"相关系数最大绝对值仅 {max_abs:.3f}(弱)" if np.isfinite(max_abs) and max_abs < 0.2
+           else f"相关系数最大绝对值 {max_abs:.3f}" if np.isfinite(max_abs)
+           else "相关系数 n/a")
     if np.isfinite(pos_max) and np.isfinite(neg_max) and pos_max > neg_max:
         direction = (
             f"**实测(事实)**:正滞后侧(购金领先金价)相关更强(max corr={pos_max:+.3f})"
             f"且强于负滞后侧({neg_max:+.3f})与同期({c0:+.3f}) —— 方向上**轻微支持**「购金→金价」,"
-            "但相关系数全部 <0.2、且建立在平滑插值上,**不足以**支撑强因果(推理)。"
+            f"但{mag}、且建立在平滑插值上,**不足以**支撑强因果(推理)。"
         )
     else:
         direction = (
             f"**实测(事实)**:负滞后侧(金价领先购金)相关不弱于正滞后侧(neg max={neg_max:+.3f} "
-            f"vs pos max={pos_max:+.3f}) —— 提示金价与购金**互为内生**,削弱单向「购金顶价」叙事(推理)。"
+            f"vs pos max={pos_max:+.3f}),{mag} —— 提示金价与购金**互为内生**,削弱单向"
+            "「购金顶价」叙事(推理)。"
         )
     return direction
 
@@ -259,6 +264,13 @@ def _leadlag_reading(ll) -> str:
 def _write_report(path, args, date, panel, window, base, levels, diffs, stat, ll, v,
                   lv_csv, df_csv, st_csv, ll_csv) -> None:
     real = levels["REAL_WGC"]
+    monotone_keys = [k for k in levels if k not in ("REAL_WGC", "kink_2022")]
+    n_monotone = len(monotone_keys)
+    n_rand = sum(k.startswith("rand_") for k in monotone_keys)
+    kinds = [placebo_label(k).split(" ")[0] for k in monotone_keys if not k.startswith("rand_")]
+    if n_rand:
+        kinds.append(f"随机单调×{n_rand}")
+    mono_kinds = "、".join(kinds)
     verdict_head = {
         "spurious": "伪回归 (SPURIOUS) ❌",
         "mixed": "同期共振 / 形态拟合 — 从『顶价因果』降级 (MIXED) ◐",
@@ -355,8 +367,9 @@ def _write_report(path, args, date, panel, window, base, levels, diffs, stat, ll
         "",
         "## 6. 综合结论与边界",
         "",
-        f"1. **朴素「任意单调趋势都能骗」被部分证伪(事实)**:6 类纯单调 placebo 无一逼近真WGC "
-        f"(最高 R²={_fmt(v.best_placebo_r2,'.3f')} vs 真 {real.r2:.3f}),因为①–④已吸收平滑趋势。",
+        f"1. **朴素「任意单调趋势都能骗」被部分证伪(事实)**:{n_monotone} 条纯单调 placebo "
+        f"({mono_kinds})无一逼近真WGC (最高 R²={_fmt(v.best_placebo_r2,'.3f')} vs 真 {real.r2:.3f}),"
+        "因为①–④已吸收平滑趋势。",
         f"2. **但真WGC的水平拟合主要是『2022 制度拐点形态』(推理)**:零含义的拐点对照(g) "
         f"R²={_fmt(v.kink_r2,'.3f')} "
         + ("**≥**" if np.isfinite(v.kink_r2) and v.kink_r2 >= real.r2 - 0.05 else "<")
