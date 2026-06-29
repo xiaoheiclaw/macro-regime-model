@@ -13,6 +13,8 @@ All synthetic — no network.
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -136,6 +138,20 @@ def test_leading_warmup_nan_is_ok():
     # span starts at idx[1] (first non-NaN held); month-0 excluded, no raise
     assert bt.index[0] == idx[1]
     assert not bt["net_ret"].isna().any()
+
+
+def test_run_backtest_rejects_out_of_range_weights():
+    idx = _midx(4)
+    gold_ret = pd.Series([0.01, 0.02, 0.0, 0.01], index=idx)
+    tbill = pd.Series(0.0, index=idx)
+    # held = pos.shift(1) → leverage >1 inside the span
+    over = pd.Series([0.0, 1.5, 1.5, 1.5], index=idx)
+    with pytest.raises(ValueError, match=r"\[0, 1\]"):
+        run_backtest(over, gold_ret, tbill, cost_bps=0.0)
+    # negative (short) weight
+    short = pd.Series([0.0, -0.3, -0.3, -0.3], index=idx)
+    with pytest.raises(ValueError, match=r"\[0, 1\]"):
+        run_backtest(short, gold_ret, tbill, cost_bps=0.0)
 
 
 def test_cost_zero_bps_is_costless():
@@ -394,3 +410,52 @@ def test_trend_exposure_empty_lookbacks_raises():
     price = pd.Series([100.0, 101.0], index=_midx(2))
     with pytest.raises(ValueError, match="non-empty"):
         trend_exposure(price, [])
+
+
+# ── script-level: common_span / metrics_table robustness ───────────────
+import importlib.util as _ilu  # noqa: E402
+
+_spec = _ilu.spec_from_file_location(
+    "gold_trend_backtest",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                 "scripts", "gold_trend_backtest.py"),
+)
+gtb = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(gtb)
+
+
+def _bt(idx_dates):
+    idx = pd.DatetimeIndex(idx_dates)
+    return pd.DataFrame({"net_ret": pd.Series(0.01, index=idx),
+                         "tbill_ret": pd.Series(0.0, index=idx),
+                         "turnover": pd.Series(0.0, index=idx)})
+
+
+def test_common_span_none_when_a_strategy_is_empty():
+    full = _bt(pd.date_range("2000-01-31", periods=12, freq="ME"))
+    empty = full.iloc[0:0]
+    cstart, cend = gtb.common_span({"S0": full, "S1": empty})
+    assert cstart is None and cend is None
+
+
+def test_common_span_none_when_no_overlap():
+    a = _bt(pd.date_range("2000-01-31", periods=6, freq="ME"))
+    b = _bt(pd.date_range("2010-01-31", periods=6, freq="ME"))  # disjoint
+    cstart, cend = gtb.common_span({"S0": a, "S1": b})
+    assert cstart is None and cend is None
+
+
+def test_metrics_table_all_nan_when_no_common_window():
+    a = _bt(pd.date_range("2000-01-31", periods=6, freq="ME"))
+    b = a.iloc[0:0]
+    tbl = gtb.metrics_table({"S0": a, "S1": b})
+    # no crash; every cell NaN for the key metrics
+    assert tbl["sharpe"].isna().all()
+
+
+def test_common_span_intersection_when_aligned():
+    a = _bt(pd.date_range("2000-01-31", periods=24, freq="ME"))
+    b = _bt(pd.date_range("2000-06-30", periods=24, freq="ME"))
+    cstart, cend = gtb.common_span({"S0": a, "S1": b})
+    assert cstart == pd.Timestamp("2000-06-30")
+    assert cend == pd.Timestamp("2001-12-31")

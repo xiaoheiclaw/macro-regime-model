@@ -31,9 +31,19 @@ from typing import Callable, Dict, List, Optional, Sequence
 import numpy as np
 import pandas as pd
 
-from lib.gold_anchor import _to_monthly, build_anchor_panel, fetch_fred_series
+from lib.gold_anchor import build_anchor_panel, fetch_fred_series
 
 ANNUAL = 12  # months per year
+
+
+def _to_monthly_mean(s: pd.Series) -> pd.Series:
+    """Resample a daily/monthly level series to a month-end (ME) mean. Local
+    helper for the FRED pulls this module owns (USD, T-bill) — avoids importing
+    gold_anchor's private `_to_monthly` and only needs the 'mean' flavour."""
+    s = s.sort_index()
+    if s.dropna().empty:
+        return pd.Series(dtype="float64")
+    return s.resample("ME").mean()
 
 # Default scanned trend lookbacks (months); "blend" = equal-weight of these.
 DEFAULT_LOOKBACKS: tuple[int, ...] = (3, 6, 12)
@@ -111,12 +121,12 @@ def build_timing_panel(
     df = base[["gold_nominal", "real_rate_10y"]].copy()
     idx = df.index
 
-    twex = _to_monthly(fetch_fn("TWEXBMTH", start), "mean")
-    dtwex = _to_monthly(fetch_fn("DTWEXBGS", start), "mean")
+    twex = _to_monthly_mean(fetch_fn("TWEXBMTH", start))
+    dtwex = _to_monthly_mean(fetch_fn("DTWEXBGS", start))
     usd = _splice_dollar(twex, dtwex)
     df["usd_broad"] = usd.reindex(idx)
 
-    tb = _to_monthly(fetch_fn("TB3MS", start), "mean").reindex(idx)
+    tb = _to_monthly_mean(fetch_fn("TB3MS", start)).reindex(idx)
     df["tbill_yield"] = tb
     # annual-percent yield → monthly simple return
     df["tbill_ret"] = (1.0 + tb / 100.0) ** (1.0 / ANNUAL) - 1.0
@@ -298,6 +308,15 @@ def run_backtest(
     held_s = held.loc[first:last]
     gold_s = gold_ret.loc[first:last]
     tbill_s = tbill_ret.loc[first:last]
+
+    # long-only 0–100% contract: reject implicit leverage / negative cash, which
+    # would otherwise silently feed `held*gold + (1-held)*tbill`.
+    if not held_s.between(0.0, 1.0).all():
+        bad = held_s[~held_s.between(0.0, 1.0)]
+        raise ValueError(
+            f"positions must be in [0, 1] (long-only 0–100%); got out-of-range "
+            f"weights, e.g. {list(bad.round(4).items())[:3]}"
+        )
 
     turnover = held_s.diff().abs()
     turnover.iloc[0] = abs(held_s.iloc[0])  # first entry: trade up from cash

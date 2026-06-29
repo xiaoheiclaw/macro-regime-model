@@ -72,21 +72,35 @@ def common_span(backtests: Dict[str, pd.DataFrame]):
     """The window over which *every* strategy is investable — the latest start
     and earliest end across all backtests. S1/S2 start after their trend/vol
     warm-up while S0 is invested from month 1, so a fair head-to-head must
-    evaluate them all on this shared window (else S0 gets free extra months)."""
-    spans = [(bt.index.min(), bt.index.max()) for bt in backtests.values() if len(bt)]
+    evaluate them all on this shared window (else S0 gets free extra months).
+
+    Returns ``(None, None)`` if there is no shared window: any empty strategy
+    (the 'every strategy investable' contract fails) or a start that lands after
+    the earliest end. Callers treat that as unadjudicable rather than comparing
+    on a window some strategy is absent from."""
+    spans = []
+    for bt in backtests.values():
+        if len(bt) == 0:
+            return None, None
+        spans.append((bt.index.min(), bt.index.max()))
     if not spans:
         return None, None
-    return max(s for s, _ in spans), min(e for _, e in spans)
+    cstart, cend = max(s for s, _ in spans), min(e for _, e in spans)
+    if cstart > cend:
+        return None, None
+    return cstart, cend
 
 
 def metrics_table(backtests: Dict[str, pd.DataFrame], start=None, end=None) -> pd.DataFrame:
     cstart, cend = common_span(backtests)
-    lo = cstart if start is None else (cstart if cstart is None else max(cstart, pd.Timestamp(start)))
-    hi = cend if end is None else (cend if cend is None else min(cend, pd.Timestamp(end)))
-    rows = {}
-    for label, bt in backtests.items():
-        seg = slice_segment(bt, lo, hi)
-        rows[label] = compute_metrics(seg)
+    if cstart is None or cend is None:
+        # No shared investable window → all-NaN table; the verdict guard / caller
+        # turns this into an explicit "cannot adjudicate" rather than a crash.
+        empty = {label: compute_metrics(bt.iloc[0:0]) for label, bt in backtests.items()}
+        return pd.DataFrame(empty).T[METRIC_COLS]
+    lo = cstart if start is None else max(cstart, pd.Timestamp(start))
+    hi = cend if end is None else min(cend, pd.Timestamp(end))
+    rows = {label: compute_metrics(slice_segment(bt, lo, hi)) for label, bt in backtests.items()}
     return pd.DataFrame(rows).T[METRIC_COLS]
 
 
@@ -181,6 +195,12 @@ def main() -> None:
 
     # Headline run at the default cost.
     backtests = run_all(panel, args.cost_bps)
+    cstart, cend = common_span(backtests)
+    if cstart is None or cend is None:
+        print("ERROR: no common investable window across strategies "
+              "(sample too short for the trend/vol warm-up). Widen --start/--end.",
+              file=sys.stderr)
+        raise SystemExit(2)
     full = metrics_table(backtests)
 
     # Cost sensitivity (0 / 20 bps) for the blend variants + S0.
@@ -198,7 +218,6 @@ def main() -> None:
     file_stamp = now.strftime("%Y-%m-%d_%H%M%S")
     report_path = os.path.join(args.out_dir, f"gold_trend_timing_{file_stamp}.md")
 
-    cstart, cend = common_span(backtests)
     parts: List[str] = []
     parts.append(f"# Gold long-only trend-timing backtest — {stamp}\n")
     parts.append(f"Panel: {panel.index.min():%Y-%m} → {panel.index.max():%Y-%m} "
