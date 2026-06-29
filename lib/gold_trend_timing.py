@@ -158,9 +158,14 @@ def vol_scale(
 def trend_exposure(price: pd.Series, lookbacks: Sequence[int]) -> pd.Series:
     """Equal-weight blend of the per-lookback on/off momentum signals.
     A single-element `lookbacks` reproduces a pure single-horizon trend.
-    Returns a value in [0, 1] (e.g. {0, 1/3, 2/3, 1} for the 3/6/12 blend)."""
+    Returns a value in [0, 1] (e.g. {0, 1/3, 2/3, 1} for the 3/6/12 blend).
+
+    Uses ``skipna=False`` so the blend stays NaN until *every* lookback has
+    enough history — otherwise during warm-up the longest-history (shortest)
+    lookback would drive the blend to a full 1.0 prematurely, which `s1_trend`
+    would then take as full exposure on too little evidence."""
     sigs = [momentum_signal(price, L) for L in lookbacks]
-    return pd.concat(sigs, axis=1).mean(axis=1)
+    return pd.concat(sigs, axis=1).mean(axis=1, skipna=False)
 
 
 def regime_gate(
@@ -233,16 +238,17 @@ def run_backtest(
     """
     pos = positions.reindex(gold_ret.index)
     held = pos.shift(1)
-    valid = held.notna() & gold_ret.notna() & tbill_ret.notna()
-    held = held.where(valid)
 
+    # Turnover is computed on the *full* intended-weight path before any
+    # validity masking, so a real position change is never silently zeroed just
+    # because an adjacent month's return happens to be missing (which would
+    # under-count trading cost). The first held weight is a trade from 0 (cash).
     turnover = held.diff().abs()
-    # first held weight is a trade from 0 (cash)
     first = held.first_valid_index()
     if first is not None:
         turnover.loc[first] = abs(held.loc[first])
-    turnover = turnover.where(valid)
 
+    valid = held.notna() & gold_ret.notna() & tbill_ret.notna()
     cost = turnover * (cost_bps / 1e4)
     gross = held * gold_ret + (1.0 - held) * tbill_ret
     net = gross - cost
@@ -263,9 +269,15 @@ def run_backtest(
 
 # ── Metrics ────────────────────────────────────────────────────────────
 def _max_drawdown(cum: pd.Series) -> float:
-    peak = cum.cummax()
-    dd = cum / peak - 1.0
-    return float(dd.min()) if len(dd) else float("nan")
+    """Max drawdown of a growth-of-$1 curve. `cum` starts *after* the first
+    month's return, so the implicit starting wealth of 1.0 must be prepended —
+    otherwise a drawdown from the opening month (peak still 1.0) is missed and
+    the figure is understated (or 0)."""
+    if len(cum) == 0:
+        return float("nan")
+    wealth = pd.concat([pd.Series([1.0]), pd.Series(cum.to_numpy())], ignore_index=True)
+    dd = wealth / wealth.cummax() - 1.0
+    return float(dd.min())
 
 
 def compute_metrics(
@@ -312,5 +324,15 @@ def equity_curve(bt: pd.DataFrame) -> pd.Series:
     return (1.0 + bt["net_ret"].dropna()).cumprod()
 
 
-def slice_segment(bt: pd.DataFrame, start: str, end: str) -> pd.DataFrame:
-    return bt.loc[(bt.index >= pd.Timestamp(start)) & (bt.index <= pd.Timestamp(end))]
+def slice_segment(
+    bt: pd.DataFrame,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+) -> pd.DataFrame:
+    """Inclusive date slice. Either bound may be None (open-ended on that side)."""
+    mask = pd.Series(True, index=bt.index)
+    if start is not None:
+        mask &= bt.index >= pd.Timestamp(start)
+    if end is not None:
+        mask &= bt.index <= pd.Timestamp(end)
+    return bt.loc[mask]

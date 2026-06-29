@@ -113,6 +113,21 @@ def test_cost_accounting_turnover():
     assert bt["net_ret"].loc[idx[2]] == pytest.approx(-10e-4)
 
 
+def test_turnover_survives_missing_intermediate_return():
+    # A real position change must still be charged even if an adjacent month's
+    # return is missing (regression: masking held first dropped the diff/cost).
+    idx = _midx(5)
+    gold_ret = pd.Series([0.0, 0.0, np.nan, 0.0, 0.0], index=idx)  # idx[2] missing
+    tbill = pd.Series(0.0, index=idx)
+    pos = pd.Series([0.0, 1.0, 0.0, 1.0, 0.0], index=idx)
+    bt = run_backtest(pos, gold_ret, tbill, cost_bps=10.0)
+    # idx[2] (held=1, return NaN) is dropped from output...
+    assert idx[2] not in bt.index
+    # ...but the trade into idx[3] (held 1→0) is still charged, not NaN-eaten.
+    assert bt["turnover"].loc[idx[3]] == pytest.approx(1.0)
+    assert bt["cost"].loc[idx[3]] == pytest.approx(10e-4)
+
+
 def test_cost_zero_bps_is_costless():
     idx = _midx(5)
     gold_ret = pd.Series([0.01, 0.02, -0.01, 0.03, 0.0], index=idx)
@@ -168,6 +183,17 @@ def test_metrics_max_drawdown():
     m = compute_metrics(bt)
     assert m["max_dd"] == pytest.approx(-0.5, abs=1e-9)
     assert m["calmar"] == pytest.approx(m["cagr"] / 0.5)
+
+
+def test_metrics_drawdown_from_opening_month():
+    # A drawdown that starts in the very first month must be captured against
+    # the implicit starting wealth of 1.0 (regression: was understated to 0).
+    idx = _midx(2)
+    net = pd.Series([-0.5, 0.0], index=idx)
+    bt = pd.DataFrame({"net_ret": net, "tbill_ret": pd.Series(0.0, index=idx),
+                       "turnover": pd.Series(0.0, index=idx)})
+    m = compute_metrics(bt)
+    assert m["max_dd"] == pytest.approx(-0.5, abs=1e-9)
 
 
 def test_metrics_sharpe_excess_over_rf():
@@ -272,6 +298,18 @@ def test_trend_exposure_blend_levels():
     # all rising → blend hits 1.0 once all lookbacks have history
     assert te.dropna().iloc[-1] == pytest.approx(1.0)
     assert te.dropna().between(0.0, 1.0).all()
+
+
+def test_trend_exposure_blend_warmup_is_nan():
+    # During warm-up (longest lookback not yet ready) the blend must be NaN,
+    # not driven to 1.0 by the short-lookback signal alone.
+    idx = _midx(14)
+    price = pd.Series(100 * np.cumprod(np.r_[[1.0], np.full(13, 1.01)]), index=idx)
+    te = trend_exposure(price, [3, 6, 12])
+    # at idx[11] the 12m signal has no t-12 reference → blend NaN
+    assert np.isnan(te.iloc[11])
+    # at idx[12] all three lookbacks are ready and rising → full 1.0
+    assert te.iloc[12] == pytest.approx(1.0)
 
 
 # ── dollar splice ──────────────────────────────────────────────────────

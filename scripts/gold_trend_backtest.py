@@ -71,7 +71,7 @@ def run_all(panel: pd.DataFrame, cost_bps: float) -> Dict[str, pd.DataFrame]:
 def metrics_table(backtests: Dict[str, pd.DataFrame], start=None, end=None) -> pd.DataFrame:
     rows = {}
     for label, bt in backtests.items():
-        seg = slice_segment(bt, start, end) if start else bt
+        seg = slice_segment(bt, start, end) if (start or end) else bt
         rows[label] = compute_metrics(seg)
     return pd.DataFrame(rows).T[METRIC_COLS]
 
@@ -91,10 +91,13 @@ def _md_table(df: pd.DataFrame) -> str:
 
 def _fmt(df: pd.DataFrame) -> str:
     show = df.copy()
-    for c in ["cagr", "ann_vol", "max_dd", "hit_rate", "ann_turnover"]:
+    for c in ["cagr", "ann_vol", "max_dd", "hit_rate"]:
         show[c] = (show[c] * 100).map(lambda v: f"{v:.1f}%" if pd.notna(v) else "n/a")
     for c in ["sharpe", "calmar"]:
         show[c] = show[c].map(lambda v: f"{v:.2f}" if pd.notna(v) else "n/a")
+    # ann_turnover is an annualised *turnover multiple* (not a percentage)
+    show["ann_turnover"] = show["ann_turnover"].map(
+        lambda v: f"{v:.2f}x" if pd.notna(v) else "n/a")
     show["n_months"] = show["n_months"].map(lambda v: f"{int(v):d}" if pd.notna(v) else "0")
     return _md_table(show)
 
