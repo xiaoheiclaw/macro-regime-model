@@ -1,0 +1,641 @@
+"""Tests for the gold vs de-dollarization deviation monitor.
+
+Offline by construction: all panels/series are synthetic (no network/FRED).
+Covers (per the task spec):
+  1. DI construction — signed z-scored composite, equal/custom weights,
+     missing-component fallback (drop & renormalize), min_present gating.
+  2. deviation — rolling-OLS residual is ex-ante (truncating the future leaves
+     past residuals unchanged); + = gold above its DI-implied level.
+  3. z-score / percentile — full + leak-free trailing percentile contracts.
+  4. historical forward-return bucketing — extreme-high vs rest, forward return
+     is genuinely forward (NaN tail), conditioning split is exhaustive.
+  5. stationarity handling — rolling local fit; first-difference helper.
+  6. missing-component / graceful fallback — DI with one leg all-NaN.
+"""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from lib.gold_dedollar_gap import (
+    adjudicate,
+    build_di,
+    build_gap_panel,
+    compute_deviation,
+    conditional_forward_table,
+    current_reading,
+    forward_log_return,
+    full_percentile,
+    full_zscore,
+    rolling_ols_resid,
+    rolling_percentile,
+    rolling_zscore,
+    zscore_over,
+)
+
+
+def _close_equal_nan(a: pd.Series, b: pd.Series, *, atol: float = 1e-9) -> None:
+    assert a.shape == b.shape
+    av, bv = a.to_numpy(), b.to_numpy()
+    np.testing.assert_array_equal(np.isnan(av), np.isnan(bv))
+    mask = ~(np.isnan(av) | np.isnan(bv))
+    np.testing.assert_allclose(av[mask], bv[mask], rtol=0, atol=atol)
+
+
+# ── 1. DI construction ───────────────────────────────────────────────────
+def _panel(n=120, seed=0):
+    idx = pd.date_range("2010-01-31", periods=n, freq=pd.offsets.MonthEnd())
+    rng = np.random.RandomState(seed)
+    cb = pd.Series(np.cumsum(np.abs(rng.randn(n))), index=idx)        # rising stock
+    share = pd.Series(0.30 - np.cumsum(np.abs(rng.randn(n))) * 1e-3, index=idx)  # falling
+    return pd.DataFrame({"cb_cum_excess": cb, "custody_share": share}, index=idx)
+
+
+def test_di_is_signed_zscore_composite():
+    df = _panel()
+    res = build_di(df)
+    # equal weight over 2 present components
+    assert set(res.weights) == {"cb_cum_excess", "custody_share"}
+    np.testing.assert_allclose(list(res.weights.values()), [0.5, 0.5])
+    # custody is negated: a falling share contributes POSITIVE de-dollarization,
+    # so its signed component should be (mostly) increasing → positive correlation
+    # with the rising cb component. DI should rise over time (both legs rise).
+    di = res.di.dropna()
+    assert di.iloc[-1] > di.iloc[0]
+    # DI equals the per-row mean of the two signed z components
+    manual = res.components.mean(axis=1)
+    _close_equal_nan(res.di, manual)
+
+
+def test_di_custom_weights_renormalize():
+    df = _panel()
+    res = build_di(df, weights={"cb_cum_excess": 3.0, "custody_share": 1.0})
+    np.testing.assert_allclose(res.weights["cb_cum_excess"], 0.75)
+    np.testing.assert_allclose(res.weights["custody_share"], 0.25)
+    manual = (0.75 * res.components["cb_cum_excess"]
+              + 0.25 * res.components["custody_share"])
+    _close_equal_nan(res.di, manual)
+
+
+def test_di_missing_component_fallback():
+    """A component that is entirely NaN is dropped and weights renormalize → DI
+    still computed from the remaining leg (graceful degradation)."""
+    df = _panel()
+    df["custody_share"] = np.nan
+    res = build_di(df)
+    assert res.dropped == ["custody_share"]
+    assert list(res.weights) == ["cb_cum_excess"]
+    np.testing.assert_allclose(res.weights["cb_cum_excess"], 1.0)
+    # DI == the single signed z component
+    _close_equal_nan(res.di, res.components["cb_cum_excess"])
+
+
+def test_di_rejects_negative_weights():
+    """A negative weight would invert a sign-oriented leg → reject (codex P2)."""
+    df = _panel()
+    with pytest.raises(ValueError):
+        build_di(df, weights={"cb_cum_excess": -1.0, "custody_share": 2.0})
+
+
+def test_di_zscore_over_common_window():
+    """Components are z-scored over their COMMON coverage, not each own coverage
+    (codex P2): a longer-history leg's out-of-common-window months must not shift
+    its mean/std used in DI."""
+    idx = pd.date_range("2002-12-31", periods=60, freq=pd.offsets.MonthEnd())
+    # custody present for the whole span; cb only from index 24 onward.
+    custody = pd.Series(np.linspace(0.30, 0.20, 60), index=idx)  # falling
+    cb = pd.Series(np.nan, index=idx)
+    cb.iloc[24:] = np.arange(36, dtype=float)
+    df = pd.DataFrame({"cb_cum_excess": cb, "custody_share": custody}, index=idx)
+    res = build_di(df)
+    common = idx[24:]
+    # custody's signed z in the result must equal a z computed on the COMMON window
+    expected = zscore_over(custody, common) * (-1.0)
+    _close_equal_nan(res.components["custody_share"], expected)
+    assert "common-coverage" in res.notes["z_base"]
+
+
+def test_zscore_over_uses_baseline_only():
+    s = pd.Series([1.0, 2.0, 3.0, 100.0],
+                  index=pd.date_range("2010-01-31", periods=4, freq=pd.offsets.MonthEnd()))
+    base = s.index[:3]
+    z = zscore_over(s, base)
+    # mean/std from first 3 (1,2,3): mean=2, std(ddof0)=0.8165
+    np.testing.assert_allclose(z.iloc[0], (1 - 2) / np.std([1, 2, 3]), atol=1e-9)
+    # the out-of-baseline outlier is standardized by the baseline scale, not its own
+    np.testing.assert_allclose(z.iloc[3], (100 - 2) / np.std([1, 2, 3]), atol=1e-9)
+
+
+def test_di_rejects_unknown_and_missing_weight_keys():
+    """A typo'd weight key (or omitting a present component) must raise, not
+    silently collapse DI to fewer factors (codex R3 P2)."""
+    df = _panel()
+    with pytest.raises(ValueError):  # typo: 'custdy_share'
+        build_di(df, weights={"cb_cum_excess": 0.5, "custdy_share": 0.5})
+    with pytest.raises(ValueError):  # omits custody_share entirely
+        build_di(df, weights={"cb_cum_excess": 1.0})
+
+
+def test_di_min_present_out_of_range_raises():
+    df = _panel()
+    with pytest.raises(ValueError):
+        build_di(df, min_present=0)
+    with pytest.raises(ValueError):
+        build_di(df, min_present=3)  # only 2 components present
+
+
+def test_di_zero_weight_component_does_not_gate():
+    """A zero-weight component must not participate in DI — its missing month must
+    NOT NaN the DI (codex R5 P2). DI must equal the active (CB) leg throughout."""
+    df = _panel(n=40)
+    df.loc[df.index[7], "custody_share"] = np.nan  # hole in the zero-weight leg
+    res = build_di(df, weights={"cb_cum_excess": 1.0, "custody_share": 0.0})
+    # DI defined at the custody-hole month (custody is inactive)
+    assert np.isfinite(res.di.loc[df.index[7]])
+    # DI equals the CB signed-z everywhere (the only active leg)
+    _close_equal_nan(res.di, res.components["cb_cum_excess"])
+
+
+def test_di_all_components_missing_raises():
+    idx = pd.date_range("2010-01-31", periods=12, freq=pd.offsets.MonthEnd())
+    df = pd.DataFrame({"cb_cum_excess": np.nan, "custody_share": np.nan}, index=idx)
+    with pytest.raises(ValueError):
+        build_di(df)
+
+
+def test_di_min_present_gates_partial_rows():
+    """With min_present = all, a row missing one leg → DI NaN; relaxing to 1 fills
+    it from the available leg."""
+    df = _panel(n=40)
+    df.loc[df.index[5], "custody_share"] = np.nan
+    strict = build_di(df)  # min_present defaults to all (2)
+    assert np.isnan(strict.di.loc[df.index[5]])
+    relaxed = build_di(df, min_present=1)
+    assert np.isfinite(relaxed.di.loc[df.index[5]])
+    # the relaxed value at that row equals just the cb signed-z (only leg present)
+    np.testing.assert_allclose(
+        relaxed.di.loc[df.index[5]],
+        relaxed.components["cb_cum_excess"].loc[df.index[5]])
+
+
+# ── 2. deviation: rolling-OLS residual is ex-ante ────────────────────────
+def test_rolling_resid_no_lookahead():
+    n, w = 120, 36
+    idx = pd.date_range("2010-01-31", periods=n, freq=pd.offsets.MonthEnd())
+    rng = np.random.RandomState(7)
+    di = pd.Series(np.cumsum(rng.randn(n)) * 0.1, index=idx)
+    y = pd.Series(2.0 + 1.5 * di.to_numpy() + rng.randn(n) * 0.05, index=idx)
+    full = rolling_ols_resid(y, di, w)
+    cut = 80
+    trunc = rolling_ols_resid(y.iloc[:cut], di.iloc[:cut], w)
+    _close_equal_nan(full.iloc[:cut], trunc, atol=1e-9)
+
+
+def test_rolling_resid_sign_positive_when_gold_above():
+    """If gold is bumped UP above the DI-implied line at the latest point, the
+    residual is positive (gold running ahead)."""
+    n, w = 60, 36
+    idx = pd.date_range("2010-01-31", periods=n, freq=pd.offsets.MonthEnd())
+    di = pd.Series(np.linspace(-1, 1, n), index=idx)
+    y = pd.Series(1.0 + 2.0 * di.to_numpy(), index=idx)  # perfect line → ~0 resid
+    resid0 = rolling_ols_resid(y, di, w)
+    assert abs(resid0.dropna().iloc[-1]) < 1e-6
+    y2 = y.copy()
+    y2.iloc[-1] += 0.5  # gold jumps above the fundamentals-implied level
+    resid1 = rolling_ols_resid(y2, di, w)
+    assert resid1.dropna().iloc[-1] > 0.4
+
+
+def test_rolling_resid_rejects_misaligned_index():
+    """y/x are read positionally → a mismatched index must raise (codex P3)."""
+    y = pd.Series(np.arange(10.0),
+                  index=pd.date_range("2010-01-31", periods=10, freq=pd.offsets.MonthEnd()))
+    x = pd.Series(np.arange(10.0),
+                  index=pd.date_range("2011-01-31", periods=10, freq=pd.offsets.MonthEnd()))
+    with pytest.raises(ValueError):
+        rolling_ols_resid(y, x, 6)
+
+
+def test_rolling_resid_requires_full_window_by_default():
+    """Default min_obs == window: a gap inside the trailing window blanks that fit
+    (codex PR#14 P2 — the 'trailing window regression' contract). Relaxing min_obs
+    re-enables the fit."""
+    n, w = 40, 12
+    idx = pd.date_range("2010-01-31", periods=n, freq=pd.offsets.MonthEnd())
+    rng = np.random.RandomState(17)
+    x = pd.Series(np.linspace(0, 4, n), index=idx)
+    y = pd.Series(1.0 + 2.0 * x.to_numpy() + rng.randn(n) * 0.01, index=idx)
+    y2 = y.copy()
+    y2.iloc[20] = np.nan  # a hole inside several trailing windows
+    strict = rolling_ols_resid(y2, x, w)              # default min_obs = window
+    # every window covering index 20 (t in 20..31) must be NaN under the full-window rule
+    assert strict.iloc[20:32].isna().all()
+    relaxed = rolling_ols_resid(y2, x, w, min_obs=w - 1)  # tolerate the 1 gap
+    assert relaxed.iloc[20:32].notna().any()
+
+
+def test_rolling_resid_rejects_bad_min_obs():
+    idx = pd.date_range("2010-01-31", periods=20, freq=pd.offsets.MonthEnd())
+    y = pd.Series(np.arange(20.0), index=idx)
+    x = pd.Series(np.linspace(0, 1, 20), index=idx)
+    with pytest.raises(ValueError):
+        rolling_ols_resid(y, x, 12, min_obs=2)   # < 3
+    with pytest.raises(ValueError):
+        rolling_ols_resid(y, x, 12, min_obs=13)  # > window
+
+
+def test_rolling_resid_constant_x_window_is_nan():
+    n, w = 50, 24
+    idx = pd.date_range("2010-01-31", periods=n, freq=pd.offsets.MonthEnd())
+    di = pd.Series(np.ones(n), index=idx)  # constant → slope unidentified
+    y = pd.Series(np.arange(n, dtype=float), index=idx)
+    resid = rolling_ols_resid(y, di, w)
+    assert resid.dropna().empty
+
+
+def test_compute_deviation_window_is_calendar_months_not_obs():
+    """A missing month inside the trailing window must blank that window's residual
+    (window = calendar months, not observations; codex R3 P2). The deviation runs
+    on a complete ME grid with gaps kept NaN."""
+    n, w = 80, 24
+    idx = pd.date_range("2010-01-31", periods=n, freq=pd.offsets.MonthEnd())
+    rng = np.random.RandomState(31)
+    di = pd.Series(np.cumsum(rng.randn(n)) * 0.1, index=idx)
+    y = pd.Series(1.0 + 1.0 * di.to_numpy() + rng.randn(n) * 0.02, index=idx)
+    # drop one interior month from BOTH inputs → a hole on the common grid
+    hole = idx[50]
+    y2 = y.drop(hole)
+    di2 = di.drop(hole)
+    dev = compute_deviation(y2, di2, window=w)  # default min_obs = window
+    # every window covering the hole (t from 50's grid pos .. +w-1) must be NaN
+    grid = pd.date_range(idx.min(), idx.max(), freq=pd.offsets.MonthEnd())
+    pos = grid.get_loc(hole)
+    affected = grid[pos:pos + w]
+    aff = dev.resid.reindex(affected)
+    assert aff.isna().all()
+
+
+def test_deviation_outputs_on_contiguous_grid_block_rolling_windows():
+    """resid, gap_z_roll AND gap_z_full all live on a contiguous month-end grid,
+    so a hole blocks the rolling z-score window too (codex R4 P2) — not just the
+    OLS fit."""
+    n, w = 80, 24
+    idx = pd.date_range("2010-01-31", periods=n, freq=pd.offsets.MonthEnd())
+    rng = np.random.RandomState(57)
+    di = pd.Series(np.cumsum(rng.randn(n)) * 0.1, index=idx)
+    y = pd.Series(1.0 + 1.0 * di.to_numpy() + rng.randn(n) * 0.02, index=idx)
+    hole = idx[50]
+    dev = compute_deviation(y.drop(hole), di.drop(hole), window=w)
+    # output index is the full contiguous grid (the hole month is present as NaN)
+    assert hole in dev.resid.index
+    assert pd.isna(dev.resid.loc[hole])
+    # gap_z_roll windows covering the hole are NaN (calendar-month window)
+    pos = dev.resid.index.get_loc(hole)
+    assert dev.gap_z_roll.iloc[pos:pos + w].isna().all()
+
+
+def test_forward_log_return_is_calendar_month_not_rows():
+    """A missing month must NOT let a 3m forward return span the gap (codex R4 P2):
+    the realized horizon stays 3 calendar months or the value is NaN."""
+    idx = pd.date_range("2010-01-31", periods=12, freq=pd.offsets.MonthEnd())
+    price = pd.Series(np.exp(np.arange(12) * 0.1), index=idx)  # +0.1 log/month
+    gap_month = idx[5]
+    price_gapped = price.drop(gap_month)
+    fwd = forward_log_return(price_gapped, 3)
+    # row-based shift would pair non-adjacent months at the gap; calendar-based
+    # gives exactly +0.3 where both endpoints exist, NaN where t or t+3 is missing.
+    observed = fwd.dropna()
+    np.testing.assert_allclose(observed.to_numpy(), [0.3] * len(observed), atol=1e-9)
+    # the months whose t or t+3 is the dropped month must be NaN
+    assert pd.isna(fwd.loc[idx[2]])  # t+3 == idx[5] (missing)
+
+
+def test_conditional_table_threshold_excludes_unobservable_tail():
+    """The top-decile cutoff and split are computed only on months whose forward
+    return is observable (codex R3 P2): a huge-but-unobservable tail spike must NOT
+    define the extreme group (which would then be empty after dropna)."""
+    n = 60
+    idx = pd.date_range("2010-01-31", periods=n, freq=pd.offsets.MonthEnd())
+    rng = np.random.RandomState(41)
+    gap = pd.Series(rng.randn(n), index=idx)
+    gap.iloc[-6:] = 100.0           # extreme ONLY in the last 6 (unobservable at 12m)
+    gap.iloc[10:14] = 50.0          # a genuine observable extreme mid-sample
+    price = pd.Series(np.exp(np.cumsum(rng.randn(n) * 0.02)), index=idx)
+    tbl = conditional_forward_table(gap, price, horizons=(12,), top_q=0.9)
+    ext = tbl[tbl["regime"] == "extreme_high"].iloc[0]
+    # extreme group is non-empty and drawn from the observable mid-sample spike,
+    # not the unobservable tail (which a full-sample threshold would have selected
+    # and then dropped → n=0).
+    assert int(ext["n"]) > 0
+
+
+def test_compute_deviation_reports_both_zscores():
+    n = 100
+    idx = pd.date_range("2010-01-31", periods=n, freq=pd.offsets.MonthEnd())
+    rng = np.random.RandomState(11)
+    di = pd.Series(np.cumsum(rng.randn(n)) * 0.1, index=idx)
+    y = pd.Series(2.0 + 1.2 * di.to_numpy() + rng.randn(n) * 0.1, index=idx)
+    dev = compute_deviation(y, di, window=36)
+    assert dev.resid.notna().sum() > 0
+    assert dev.gap_z_roll.notna().sum() > 0
+    assert dev.gap_z_full.notna().sum() > 0
+    # full z has ~zero mean / unit std over its support
+    z = dev.gap_z_full.dropna()
+    np.testing.assert_allclose(z.mean(), 0.0, atol=1e-9)
+    np.testing.assert_allclose(z.std(ddof=0), 1.0, atol=1e-9)
+
+
+# ── 3. z-score / percentile contracts ────────────────────────────────────
+def test_full_zscore_constant_is_zero():
+    s = pd.Series([3.0, 3.0, 3.0])
+    z = full_zscore(s)
+    np.testing.assert_allclose(z.to_numpy(), [0.0, 0.0, 0.0])
+
+
+def test_full_zscore_preserves_nan():
+    s = pd.Series([1.0, np.nan, 3.0, 5.0])
+    z = full_zscore(s)
+    assert np.isnan(z.iloc[1])
+    assert z.dropna().shape[0] == 3
+
+
+def test_rolling_zscore_trailing_no_lookahead():
+    n, w = 80, 24
+    idx = pd.date_range("2010-01-31", periods=n, freq=pd.offsets.MonthEnd())
+    rng = np.random.RandomState(3)
+    s = pd.Series(rng.randn(n), index=idx)
+    full = rolling_zscore(s, w)
+    cut = 60
+    trunc = rolling_zscore(s.iloc[:cut], w)
+    _close_equal_nan(full.iloc[:cut], trunc)
+
+
+def test_full_percentile_basic():
+    s = pd.Series([1.0, 2.0, 3.0, 4.0])
+    assert full_percentile(s) == 1.0           # latest (4) is the max
+    assert full_percentile(s, 2.0) == 0.5      # two of four <= 2
+    assert np.isnan(full_percentile(pd.Series([], dtype=float)))
+
+
+def test_rolling_percentile_leak_free_and_range():
+    n, w = 100, 36
+    idx = pd.date_range("2010-01-31", periods=n, freq=pd.offsets.MonthEnd())
+    rng = np.random.RandomState(5)
+    s = pd.Series(rng.randn(n), index=idx)
+    full = rolling_percentile(s, w)
+    cut = 70
+    trunc = rolling_percentile(s.iloc[:cut], w)
+    _close_equal_nan(full.iloc[:cut], trunc)
+    pv = full.dropna()
+    assert pv.min() >= 0.0 and pv.max() <= 1.0
+
+
+def test_rolling_percentile_tied_max_is_one():
+    """A current value equal to the window max returns 1.0 even under ties (codex
+    R6 P3); rank(method='min') would have floored it below 1.0."""
+    idx = pd.date_range("2010-01-31", periods=6, freq=pd.offsets.MonthEnd())
+    # window of 4: [1, 5, 5, 5] — current (last) ties the max → 1.0; min → 0.0
+    s = pd.Series([0.0, 1.0, 5.0, 5.0, 5.0, 0.0], index=idx)
+    pct = rolling_percentile(s, 4)
+    # at idx[4]: window [5,5,5,5]? no — window = s[1:5] = [1,5,5,5]; last=5=max → 1.0
+    np.testing.assert_allclose(pct.iloc[4], 1.0)
+    # at idx[5]: window = s[2:6] = [5,5,5,0]; last=0=min → 0.0
+    np.testing.assert_allclose(pct.iloc[5], 0.0)
+
+
+def test_rolling_percentile_flat_window_is_nan():
+    idx = pd.date_range("2010-01-31", periods=20, freq=pd.offsets.MonthEnd())
+    s = pd.Series(np.ones(20), index=idx)
+    assert rolling_percentile(s, 6).dropna().empty
+
+
+# ── 4. historical forward-return bucketing ───────────────────────────────
+def test_forward_log_return_is_forward():
+    idx = pd.date_range("2010-01-31", periods=10, freq=pd.offsets.MonthEnd())
+    price = pd.Series(np.exp(np.arange(10) * 0.1), index=idx)  # +0.1 log/mo
+    fwd = forward_log_return(price, 3)
+    # forward 3m log return is +0.3 everywhere observable; last 3 are NaN (forward)
+    np.testing.assert_allclose(fwd.dropna().to_numpy(), [0.3] * 7, atol=1e-9)
+    assert fwd.iloc[-3:].isna().all()
+
+
+def test_forward_log_return_rejects_nonpositive_horizon():
+    idx = pd.date_range("2010-01-31", periods=5, freq=pd.offsets.MonthEnd())
+    with pytest.raises(ValueError):
+        forward_log_return(pd.Series(np.arange(1, 6.0), index=idx), 0)
+
+
+def test_conditional_forward_table_splits_extreme_vs_rest():
+    n = 80
+    idx = pd.date_range("2010-01-31", periods=n, freq=pd.offsets.MonthEnd())
+    rng = np.random.RandomState(9)
+    # extremes mid-history (a spike) so forward returns are observable for them —
+    # a monotone gap would park all extremes at the unobservable tail.
+    gap = pd.Series(rng.randn(n), index=idx)
+    gap.iloc[20:28] = 5.0                                    # extreme-high block mid-sample
+    price = pd.Series(np.exp(np.cumsum(rng.randn(n) * 0.02)), index=idx)
+    tbl = conditional_forward_table(gap, price, horizons=(12,), top_q=0.9)
+    regimes = set(tbl["regime"])
+    assert regimes == {"extreme_high", "rest"}
+    ext_n = int(tbl[tbl["regime"] == "extreme_high"]["n"].iloc[0])
+    rest_n = int(tbl[tbl["regime"] == "rest"]["n"].iloc[0])
+    # extreme is the top decile of the conditioning months (n observed forward)
+    assert 0 < ext_n <= rest_n
+    # required summary columns present
+    for col in ("n", "mean", "median", "p25", "p75", "hit"):
+        assert col in tbl.columns
+
+
+def test_conditional_forward_table_empty_gap():
+    idx = pd.date_range("2010-01-31", periods=10, freq=pd.offsets.MonthEnd())
+    price = pd.Series(np.arange(1, 11.0), index=idx)
+    gap = pd.Series(np.nan, index=idx)
+    tbl = conditional_forward_table(gap, price, horizons=(12,))
+    assert tbl.empty
+
+
+def test_conditional_forward_table_rejects_bad_q():
+    idx = pd.date_range("2010-01-31", periods=10, freq=pd.offsets.MonthEnd())
+    price = pd.Series(np.arange(1, 11.0), index=idx)
+    gap = pd.Series(np.linspace(0, 1, 10), index=idx)
+    with pytest.raises(ValueError):
+        conditional_forward_table(gap, price, top_q=1.5)
+
+
+# ── 5. current reading + verdict ─────────────────────────────────────────
+def _dev_with_latest_pct():
+    n = 100
+    idx = pd.date_range("2010-01-31", periods=n, freq=pd.offsets.MonthEnd())
+    rng = np.random.RandomState(13)
+    di = pd.Series(np.cumsum(rng.randn(n)) * 0.1, index=idx)
+    y = pd.Series(1.0 + 1.0 * di.to_numpy() + rng.randn(n) * 0.05, index=idx)
+    dev = compute_deviation(y, di, window=36)
+    return dev, di
+
+
+def test_current_reading_fields():
+    dev, di = _dev_with_latest_pct()
+    cr = current_reading(dev, di, roll_window=36)
+    assert cr.asof is not None
+    assert 0.0 <= cr.gap_pct_full <= 1.0
+    assert 0.0 <= cr.di_pct_full <= 1.0
+
+
+def test_di_percentile_ignores_post_asof_months():
+    """di_pct_full uses DI history ≤ asof only — a post-asof spike must not move it
+    (codex R6 P2)."""
+    from lib.gold_dedollar_gap import DeviationResult
+    idx = pd.date_range("2010-01-31", periods=100, freq=pd.offsets.MonthEnd())
+    # residual defined only through month 60; DI extends to month 99 with a spike
+    resid = pd.Series(np.nan, index=idx)
+    rng = np.random.RandomState(71)
+    resid.iloc[:61] = rng.randn(61)
+    dev = DeviationResult(resid=resid, gap_z_roll=full_zscore(resid),
+                          gap_z_full=full_zscore(resid), window=36)
+    di = pd.Series(np.linspace(0.0, 1.0, 100), index=idx)  # rising
+    di_spiked = di.copy()
+    di_spiked.iloc[61:] = 1e6  # huge post-asof values
+    cr_a = current_reading(dev, di, roll_window=36)
+    cr_b = current_reading(dev, di_spiked, roll_window=36)
+    assert cr_a.asof == idx[60]
+    # DI percentile identical — post-asof spike ignored
+    np.testing.assert_allclose(cr_a.di_pct_full, cr_b.di_pct_full, atol=1e-12)
+    # and the asof DI value sits at the top of its ≤asof history (rising series)
+    assert cr_a.di_pct_full == 1.0
+
+
+def test_current_reading_is_asof_aligned():
+    """Every 'current' field is read at the SAME asof (codex PR#14 P2): the DI
+    percentile uses DI's value at asof, not the latest DI; the rolling percentile
+    is taken at asof (NaN there, not a stale earlier month)."""
+    from lib.gold_dedollar_gap import full_percentile, rolling_percentile
+    dev, di = _dev_with_latest_pct()
+    cr = current_reading(dev, di, roll_window=36)
+    asof = cr.asof
+    di_hist = di.dropna()
+    expected_di_pct = full_percentile(di_hist, float(di.reindex([asof]).iloc[0]))
+    np.testing.assert_allclose(cr.di_pct_full, expected_di_pct, atol=1e-12)
+    pr = rolling_percentile(dev.resid, 36).reindex([asof]).iloc[0]
+    if np.isfinite(pr):
+        np.testing.assert_allclose(cr.gap_pct_roll, pr, atol=1e-12)
+
+
+def test_adjudicate_labels():
+    from lib.gold_dedollar_gap import CurrentReading
+    ts = pd.Timestamp("2026-01-31")
+    extreme = CurrentReading(asof=ts, gap_z_full=2.5, gap_pct_full=0.97,
+                             gap_pct_roll=1.0, di_pct_full=0.9, n_resid=120)
+    normal = CurrentReading(asof=ts, gap_z_full=0.1, gap_pct_full=0.45,
+                            gap_pct_roll=0.5, di_pct_full=0.5, n_resid=120)
+    elevated = CurrentReading(asof=ts, gap_z_full=0.8, gap_pct_full=0.80,
+                              gap_pct_roll=0.8, di_pct_full=0.7, n_resid=120)
+    unknown = CurrentReading(asof=None, gap_z_full=np.nan, gap_pct_full=np.nan,
+                             gap_pct_roll=np.nan, di_pct_full=np.nan, n_resid=0)
+    assert adjudicate(extreme)[0] == "EXTREME"
+    assert adjudicate(normal)[0] == "NORMAL"
+    assert adjudicate(elevated)[0] == "ELEVATED"
+    assert adjudicate(unknown)[0] == "UNKNOWN"
+
+
+def test_flat_residual_is_not_extreme():
+    """A constant (no-information) residual must NOT read as EXTREME (codex R5 P2):
+    full_percentile would return 1.0 on it, so current_reading must blank the gap
+    fields → adjudicate UNKNOWN."""
+    from lib.gold_dedollar_gap import DeviationResult
+    idx = pd.date_range("2010-01-31", periods=80, freq=pd.offsets.MonthEnd())
+    resid = pd.Series(2.0, index=idx)                 # perfectly flat
+    dev = DeviationResult(resid=resid, gap_z_roll=full_zscore(resid),
+                          gap_z_full=full_zscore(resid), window=36)
+    di = pd.Series(np.arange(80, dtype=float), index=idx)
+    cr = current_reading(dev, di, roll_window=36)
+    assert not np.isfinite(cr.gap_pct_full)            # blanked
+    assert adjudicate(cr, min_n=1)[0] == "UNKNOWN"     # not EXTREME despite pct→1
+
+
+def test_adjudicate_thin_history_is_unknown():
+    """A thin sample must not produce a spurious EXTREME (codex R3 P2): even at the
+    100th percentile, too few residuals → UNKNOWN."""
+    from lib.gold_dedollar_gap import CurrentReading
+    ts = pd.Timestamp("2026-01-31")
+    thin = CurrentReading(asof=ts, gap_z_full=3.0, gap_pct_full=1.0,
+                          gap_pct_roll=1.0, di_pct_full=1.0, n_resid=5)
+    assert adjudicate(thin, min_n=36)[0] == "UNKNOWN"
+    # with the bar lowered it can resolve again
+    assert adjudicate(thin, min_n=4)[0] == "EXTREME"
+
+
+# ── 6. panel assembly with injected (offline) data ───────────────────────
+def test_build_gap_panel_offline_injection():
+    idx = pd.date_range("2010-01-31", periods=60, freq=pd.offsets.MonthEnd())
+    rng = np.random.RandomState(21)
+    gold = pd.Series(np.exp(np.cumsum(rng.randn(60) * 0.03) + 6.0), index=idx)
+    share = pd.Series(0.30 - np.cumsum(np.abs(rng.randn(60))) * 1e-3, index=idx)
+    base = pd.DataFrame({"gold_nominal": gold, "custody_share": share}, index=idx)
+    fake_dedollar = lambda **kw: SimpleNamespace(data=base, notes={"x": "synthetic"})
+
+    def fake_fetch(series_id, start):
+        # CPI: smooth rising index on a daily grid (resampled to ME inside)
+        di = pd.date_range("2009-12-31", periods=2000, freq="D")
+        return pd.Series(200.0 + np.arange(len(di)) * 0.01, index=di)
+
+    def fake_wgc(start, end):
+        return pd.Series(np.cumsum(np.abs(rng.randn(60))), index=idx)
+
+    panel = build_gap_panel(
+        start="2010-01", end="2014-12",
+        fetch_fn=fake_fetch, dedollar_fn=fake_dedollar, wgc_fn=fake_wgc,
+    )
+    df = panel.data
+    for col in ("gold_nominal", "custody_share", "cpi", "cb_cum_excess",
+                "ln_gold", "ln_gold_real"):
+        assert col in df.columns
+    assert df["cpi"].notna().any()
+    assert df["cb_cum_excess"].notna().any()
+    # ln_gold_real = ln(gold/cpi)
+    sample = df.dropna(subset=["gold_nominal", "cpi"]).index[0]
+    np.testing.assert_allclose(
+        df.loc[sample, "ln_gold_real"],
+        np.log(df.loc[sample, "gold_nominal"] / df.loc[sample, "cpi"]),
+        atol=1e-9)
+    # end-to-end DI + deviation runs on the assembled panel
+    di_res = build_di(df)
+    dev = compute_deviation(df["ln_gold"], di_res.di, window=24)
+    assert dev.resid.notna().any()
+
+
+def test_build_gap_panel_does_not_forward_fetch_fn_to_dedollar():
+    """fetch_fn (CPI/DXY) must NOT reach the dedollar panel; an explicit
+    dedollar_fetch_fn does (codex P2)."""
+    idx = pd.date_range("2010-01-31", periods=12, freq=pd.offsets.MonthEnd())
+    base = pd.DataFrame(
+        {"gold_nominal": pd.Series(np.exp(np.arange(12) * 0.01 + 6), index=idx),
+         "custody_share": pd.Series(np.linspace(0.3, 0.25, 12), index=idx)},
+        index=idx)
+    seen = {}
+
+    def fake_dedollar(**kw):
+        seen.update(kw)
+        return SimpleNamespace(data=base, notes={})
+
+    def fake_fetch(series_id, start):
+        di = pd.date_range("2009-12-31", periods=500, freq="D")
+        return pd.Series(200.0 + np.arange(len(di)) * 0.01, index=di)
+
+    def fake_wgc(start, end):
+        return pd.Series(np.arange(12.0), index=idx)
+
+    # default: fetch_fn is NOT forwarded
+    build_gap_panel(start="2010-01", end="2010-12", fetch_fn=fake_fetch,
+                    dedollar_fn=fake_dedollar, wgc_fn=fake_wgc)
+    assert "fetch_fn" not in seen
+
+    # explicit dedollar_fetch_fn IS forwarded
+    seen.clear()
+    build_gap_panel(start="2010-01", end="2010-12", fetch_fn=fake_fetch,
+                    dedollar_fetch_fn=fake_fetch, dedollar_fn=fake_dedollar,
+                    wgc_fn=fake_wgc)
+    assert seen.get("fetch_fn") is fake_fetch
